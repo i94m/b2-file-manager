@@ -71,14 +71,24 @@
       <hr class="my-4 border-gray-200">
 
       <form action="{{ url_for('url_upload', apikey=apikey) }}" method="post" class="space-y-3">
-        <p class="text-sm font-medium text-gray-700">③ 链接抓取（URL → Bucket）</p>
+        <p class="text-sm font-medium text-gray-700">③ 链接下载（输入 URL）</p>
         <input type="url" name="url" required
                placeholder="https://example.com/file.zip"
                class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm
                       focus:border-blue-500 focus:outline-none">
+        <select name="target" id="url_target"
+                class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm
+                       focus:border-blue-500 focus:outline-none">
+          <option value="bucket">下载到 Bucket</option>
+          <option value="server">下载到服务器</option>
+        </select>
         <input type="text" name="prefix" value="{{ default_prefix }}"
-               placeholder="目标前缀（可选），例如 mirrors/2026"
+               id="url_prefix" placeholder="目标前缀（可选），例如 mirrors/2026"
                class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm
+                      focus:border-blue-500 focus:outline-none">
+        <input type="text" name="destination" id="url_destination"
+               placeholder="服务器绝对路径，例如 /data/downloads/file.zip"
+               class="hidden w-full rounded-md border border-gray-300 px-3 py-2 text-sm
                       focus:border-blue-500 focus:outline-none">
         <button type="submit"
                 class="w-full rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white
@@ -381,6 +391,18 @@ function renderDownloads() {
 }
 
 const socket = io({transports: ['websocket'], query: {apikey}});
+
+const urlTarget = document.getElementById('url_target');
+const urlDestination = document.getElementById('url_destination');
+const urlPrefix = document.getElementById('url_prefix');
+function syncUrlTarget() {
+  const toServer = urlTarget.value === 'server';
+  urlDestination.classList.toggle('hidden', !toServer);
+  urlDestination.required = toServer;
+  urlPrefix.classList.toggle('hidden', toServer);
+}
+urlTarget.addEventListener('change', syncUrlTarget);
+syncUrlTarget();
 
 socket.on('connect', () => {
   jobsEl.innerHTML = '<p class="text-sm text-gray-500">已连接，等待任务…</p>';

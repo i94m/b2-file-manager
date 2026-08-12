@@ -13,6 +13,7 @@ import argparse
 import os
 import queue
 import secrets
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -360,9 +361,17 @@ def process_job(job_id: int) -> None:
             )
             if kind == "fetch":
                 source_path, size = fetch_url_to_temp(source, job_id)
+                if destination:
+                    dest = Path(destination)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(source_path), dest)
+                else:
+                    upload_to_bucket(source_path, object_key, job_id, size)
             elif source_path is None:
                 source_path = UPLOAD_DIR / f"{job_id}.part"
-            upload_to_bucket(source_path, object_key, job_id, size)
+                upload_to_bucket(source_path, object_key, job_id, size)
+            else:
+                upload_to_bucket(source_path, object_key, job_id, size)
             final_size = size
         with get_db() as conn:
             conn.execute(
@@ -706,24 +715,43 @@ def url_upload():
     if not url.startswith(("http://", "https://")):
         flash("请填写以 http:// 或 https:// 开头的链接。", "error")
         return redirect(url_for("index", apikey=apikey))
-    try:
-        prefix = clean_prefix(request.form.get("prefix") or os.environ.get("B2_PREFIX", ""))
-    except argparse.ArgumentTypeError as exc:
-        flash(str(exc), "error")
-        return redirect(url_for("index", apikey=apikey))
+
+    target = (request.form.get("target") or "bucket").strip()
+    destination = None
+    object_key = ""
+    if target == "server":
+        raw_destination = (request.form.get("destination") or "").strip()
+        destination = Path(raw_destination).expanduser()
+        if not raw_destination or not destination.is_absolute():
+            flash("下载到服务器时，请填写服务器上的绝对目标路径。", "error")
+            return redirect(url_for("index", apikey=apikey))
+        if destination.is_dir():
+            flash("目标路径是已存在的目录，请填写完整的文件路径。", "error")
+            return redirect(url_for("index", apikey=apikey))
+    else:
+        try:
+            prefix = clean_prefix(request.form.get("prefix") or os.environ.get("B2_PREFIX", ""))
+        except argparse.ArgumentTypeError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("index", apikey=apikey))
+        filename = PurePosixPath(urlparse(url).path).name or "download"
+        object_key = "/".join(part for part in (prefix, filename) if part)
 
     filename = PurePosixPath(urlparse(url).path).name or "download"
-    object_key = "/".join(part for part in (prefix, filename) if part)
     job_id = insert_job(
         kind="fetch",
         filename=filename,
         object_key=object_key,
         size=0,
         source=url,
+        destination=str(destination) if destination else None,
     )
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
-    flash(f"「{url}」抓取到 b2://{os.environ['B2_BUCKET']}/{object_key} 的任务已加入队列。", "ok")
+    if destination:
+        flash(f"「{url}」下载到 {destination} 的任务已加入队列。", "ok")
+    else:
+        flash(f"「{url}」抓取到 b2://{os.environ['B2_BUCKET']}/{object_key} 的任务已加入队列。", "ok")
     return redirect(url_for("index", apikey=apikey))
 
 
