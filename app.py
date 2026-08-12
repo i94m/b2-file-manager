@@ -15,12 +15,14 @@ import queue
 import secrets
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 import boto3
 from boto3.s3.transfer import TransferConfig
@@ -148,8 +150,11 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL DEFAULT 'upload',
                 filename TEXT NOT NULL,
                 object_key TEXT NOT NULL,
+                source TEXT,
+                destination TEXT,
                 size INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'queued',
                 progress INTEGER NOT NULL DEFAULT 0,
@@ -160,6 +165,15 @@ def init_db() -> None:
             )
             """
         )
+        # 兼容旧库：补齐新增列
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+        for name, definition in (
+            ("kind", "TEXT NOT NULL DEFAULT 'upload'"),
+            ("source", "TEXT"),
+            ("destination", "TEXT"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
 
 
 def recent_jobs(limit: int = MAX_JOBS_SHOWN) -> list[dict]:
@@ -170,11 +184,32 @@ def recent_jobs(limit: int = MAX_JOBS_SHOWN) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def insert_job(
+    *,
+    kind: str,
+    filename: str,
+    object_key: str,
+    size: int,
+    source: str | None = None,
+    destination: str | None = None,
+) -> int:
+    with get_db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO jobs (kind, filename, object_key, source, destination, size, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+            (kind, filename, object_key, source, destination, size, time.time()),
+        )
+        return cursor.lastrowid
+
+
 def job_payload(job: dict) -> dict:
     return {
         "id": job["id"],
+        "kind": job["kind"],
         "filename": job["filename"],
         "object_key": job["object_key"],
+        "source": job.get("source"),
+        "destination": job.get("destination"),
         "size": job["size"],
         "status": job["status"],
         "progress": job["progress"],
@@ -201,9 +236,12 @@ def make_progress(job_id: int, size: int):
 
     def callback(amount: int) -> None:
         with lock:
-            state["progress"] = min(size, state["progress"] + amount)
+            if size > 0:
+                state["progress"] = min(size, state["progress"] + amount)
+            else:
+                state["progress"] += amount
             now = time.monotonic()
-            if now - state["last"] >= 0.5 or state["progress"] >= size:
+            if now - state["last"] >= 0.5 or (size > 0 and state["progress"] >= size):
                 state["last"] = now
                 with get_db() as conn:
                     conn.execute(
@@ -215,8 +253,86 @@ def make_progress(job_id: int, size: int):
     return callback
 
 
-def process_job(job_id: int) -> None:
+def upload_to_bucket(source: Path, object_key: str, job_id: int, size: int) -> None:
+    get_client().upload_file(
+        str(source),
+        os.environ["B2_BUCKET"],
+        object_key,
+        Callback=make_progress(job_id, size),
+        Config=TRANSFER_CONFIG,
+    )
+
+
+def download_to_path(object_key: str, size: int, destination: Path, job_id: int) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".part", dir=str(destination.parent)
+    )
+    os.close(fd)
+    completed = False
+    try:
+        get_client().download_file(
+            os.environ["B2_BUCKET"],
+            object_key,
+            temporary_name,
+            Callback=make_progress(job_id, size),
+            Config=TRANSFER_CONFIG,
+        )
+        actual_size = os.path.getsize(temporary_name)
+        if actual_size != size:
+            raise OSError(f"文件大小校验失败：预期 {size}，实际 {actual_size}")
+        os.replace(temporary_name, destination)
+        completed = True
+    finally:
+        if not completed:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+
+
+def fetch_url_to_temp(url: str, job_id: int) -> tuple[Path, int]:
+    """从 URL 流式下载到临时文件，返回（临时路径, 文件大小）。"""
+    request = Request(url, headers={"User-Agent": "b2-file-manager/0.1"})
     temp_path = UPLOAD_DIR / f"{job_id}.part"
+    with urlopen(request, timeout=60) as response:
+        total = int(response.headers.get("Content-Length") or 0)
+        if total > 0:
+            with get_db() as conn:
+                conn.execute("UPDATE jobs SET size=? WHERE id=?", (total, job_id))
+            emit_job_update(job_id)
+        callback = make_progress(job_id, total)
+        with open(temp_path, "wb") as out:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                callback(len(chunk))
+    size = temp_path.stat().st_size
+    with get_db() as conn:
+        conn.execute("UPDATE jobs SET size=? WHERE id=?", (size, job_id))
+    emit_job_update(job_id)
+    return temp_path, size
+
+
+def cleanup_job_temp(job_id: int, kind: str, destination: str | None = None) -> None:
+    """清理任务产生的临时文件（服务器路径上传任务的源文件不属于临时文件）。"""
+    if kind == "download" and destination:
+        try:
+            dest = Path(destination)
+            for leftover in dest.parent.glob(f".{dest.name}.*.part"):
+                leftover.unlink(missing_ok=True)
+        except OSError:
+            pass
+    else:
+        try:
+            (UPLOAD_DIR / f"{job_id}.part").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def process_job(job_id: int) -> None:
     with get_db() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None or row["status"] != "queued":
@@ -225,25 +341,36 @@ def process_job(job_id: int) -> None:
             "UPDATE jobs SET status='uploading', started_at=? WHERE id=?",
             (time.time(), job_id),
         )
+        kind = row["kind"]
         object_key = row["object_key"]
         size = row["size"]
+        source = row["source"]
+        destination = row["destination"]
     emit_job_update(job_id)
 
     try:
-        get_client().upload_file(
-            str(temp_path),
-            os.environ["B2_BUCKET"],
-            object_key,
-            Callback=make_progress(job_id, size),
-            Config=TRANSFER_CONFIG,
-        )
+        if kind == "download":
+            download_to_path(object_key, size, Path(destination), job_id)
+            final_size = size
+        else:
+            source_path = (
+                Path(source)
+                if source and not source.startswith(("http://", "https://"))
+                else None
+            )
+            if kind == "fetch":
+                source_path, size = fetch_url_to_temp(source, job_id)
+            elif source_path is None:
+                source_path = UPLOAD_DIR / f"{job_id}.part"
+            upload_to_bucket(source_path, object_key, job_id, size)
+            final_size = size
         with get_db() as conn:
             conn.execute(
                 "UPDATE jobs SET status='done', progress=?, finished_at=? WHERE id=?",
-                (size, time.time(), job_id),
+                (final_size, time.time(), job_id),
             )
         emit_job_update(job_id)
-    except (BotoCoreError, ClientError, OSError) as exc:
+    except (BotoCoreError, ClientError, OSError, ValueError, TimeoutError, TypeError) as exc:
         with get_db() as conn:
             conn.execute(
                 "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
@@ -251,10 +378,7 @@ def process_job(job_id: int) -> None:
             )
         emit_job_update(job_id)
     finally:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        cleanup_job_temp(job_id, kind, destination)
 
 
 def worker_loop() -> None:
@@ -271,13 +395,13 @@ def worker_loop() -> None:
 
 
 def recover_jobs() -> None:
-    """重启恢复：上传中的任务标记失败并删除临时文件；排队中的任务继续处理。"""
+    """重启恢复：上传/下载中的任务标记失败并清理临时文件；排队中的任务继续处理。"""
     with get_db() as conn:
-        interrupted = conn.execute("SELECT id FROM jobs WHERE status='uploading'").fetchall()
+        interrupted = conn.execute("SELECT * FROM jobs WHERE status='uploading'").fetchall()
         for row in interrupted:
-            (UPLOAD_DIR / f"{row['id']}.part").unlink(missing_ok=True)
+            cleanup_job_temp(row["id"], row["kind"], row["destination"])
             conn.execute(
-                "UPDATE jobs SET status='failed', error='服务重启，上传中断，请重新上传', "
+                "UPDATE jobs SET status='failed', error='服务重启，任务中断，请重新提交', "
                 "finished_at=? WHERE id=?",
                 (time.time(), row["id"]),
             )
@@ -485,6 +609,121 @@ def upload():
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
     flash(f"「{filename}」已加入上传队列（{format_bytes(size)}）。", "ok")
+    return redirect(url_for("index", apikey=apikey))
+
+
+@app.post("/server-upload")
+def server_upload():
+    blocked = require_auth()
+    if blocked:
+        return blocked
+    apikey = request.args.get("apikey", "")
+    raw_path = (request.form.get("path") or "").strip()
+    try:
+        prefix = clean_prefix(request.form.get("prefix") or os.environ.get("B2_PREFIX", ""))
+    except argparse.ArgumentTypeError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("index", apikey=apikey))
+
+    source = Path(raw_path).expanduser()
+    if not raw_path or not source.is_absolute():
+        flash("请填写服务器上的绝对路径（例如 /data/backup/file.zip）。", "error")
+        return redirect(url_for("index", apikey=apikey))
+    if not source.is_file():
+        flash(f"路径不存在或不是普通文件: {source}", "error")
+        return redirect(url_for("index", apikey=apikey))
+
+    object_key = "/".join(part for part in (prefix, source.name) if part)
+    size = source.stat().st_size
+    job_id = insert_job(
+        kind="upload",
+        filename=source.name,
+        object_key=object_key,
+        size=size,
+        source=str(source),
+    )
+    JOB_QUEUE.put(job_id)
+    emit_job_update(job_id)
+    flash(f"「{source}」已加入上传队列（{format_bytes(size)}）。", "ok")
+    return redirect(url_for("index", apikey=apikey))
+
+
+@app.post("/server-download")
+def server_download():
+    blocked = require_auth()
+    if blocked:
+        return blocked
+    apikey = request.args.get("apikey", "")
+    key = (request.form.get("key") or "").strip().lstrip("/")
+    raw_destination = (request.form.get("destination") or "").strip()
+    destination = Path(raw_destination).expanduser()
+
+    if not key:
+        flash("请填写要下载的 bucket 对象名（key）。", "error")
+        return redirect(url_for("index", apikey=apikey))
+    if not raw_destination or not destination.is_absolute():
+        flash("请填写服务器上的绝对目标路径（例如 /data/downloads/file.zip）。", "error")
+        return redirect(url_for("index", apikey=apikey))
+    if destination.is_dir():
+        flash("目标路径是已存在的目录，请填写完整的文件路径。", "error")
+        return redirect(url_for("index", apikey=apikey))
+
+    try:
+        metadata = get_client().head_object(Bucket=os.environ["B2_BUCKET"], Key=key)
+        size = int(metadata["ContentLength"])
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in ("404", "NoSuchKey", "NotFound") or status == 404:
+            flash(f"对象不存在: {key}", "error")
+        else:
+            flash(f"查询对象失败: {exc}", "error")
+        return redirect(url_for("index", apikey=apikey))
+    except (BotoCoreError, OSError) as exc:
+        flash(f"查询对象失败: {exc}", "error")
+        return redirect(url_for("index", apikey=apikey))
+
+    job_id = insert_job(
+        kind="download",
+        filename=PurePosixPath(key).name or "download",
+        object_key=key,
+        size=size,
+        destination=str(destination),
+    )
+    JOB_QUEUE.put(job_id)
+    emit_job_update(job_id)
+    flash(f"「{key}」下载到 {destination} 的任务已加入队列。", "ok")
+    return redirect(url_for("index", apikey=apikey))
+
+
+@app.post("/url-upload")
+def url_upload():
+    blocked = require_auth()
+    if blocked:
+        return blocked
+    apikey = request.args.get("apikey", "")
+    url = (request.form.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        flash("请填写以 http:// 或 https:// 开头的链接。", "error")
+        return redirect(url_for("index", apikey=apikey))
+    try:
+        prefix = clean_prefix(request.form.get("prefix") or os.environ.get("B2_PREFIX", ""))
+    except argparse.ArgumentTypeError as exc:
+        flash(str(exc), "error")
+        return redirect(url_for("index", apikey=apikey))
+
+    filename = PurePosixPath(urlparse(url).path).name or "download"
+    object_key = "/".join(part for part in (prefix, filename) if part)
+    job_id = insert_job(
+        kind="fetch",
+        filename=filename,
+        object_key=object_key,
+        size=0,
+        source=url,
+    )
+    JOB_QUEUE.put(job_id)
+    emit_job_update(job_id)
+    flash(f"「{url}」抓取到 b2://{os.environ['B2_BUCKET']}/{object_key} 的任务已加入队列。", "ok")
     return redirect(url_for("index", apikey=apikey))
 
 
