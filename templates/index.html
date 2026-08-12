@@ -53,6 +53,13 @@
     {% endif %}
   {% endwith %}
 
+  {% if bucket_private is false %}
+    <div class="mb-6 flex items-start gap-2 rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800">
+      <span>⚠️</span>
+      <span>{{ bucket_private_note }}</span>
+    </div>
+  {% endif %}
+
   <!-- 上传：整行卡片 -->
   <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
     <div class="mb-6 flex items-center gap-3">
@@ -229,6 +236,48 @@
     </div>
   </section>
 
+  <!-- 已同步文件 -->
+  <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
+    <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+      <div class="flex flex-wrap items-center gap-2">
+        <h2 class="text-lg font-semibold">已同步文件</h2>
+        <span class="rounded-full bg-gray-100 dark:bg-gray-800 px-2.5 py-0.5 text-xs font-medium text-gray-500 dark:text-gray-400">{{ synced_files|length }} 条记录</span>
+      </div>
+      <span class="text-xs text-gray-400 dark:text-gray-500">md5 唯一性校验 · 最近 50 条</span>
+    </div>
+
+    {% if synced_files %}
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">
+              <th class="py-2.5 pr-4 font-medium">对象名</th>
+              <th class="py-2.5 pr-4 font-medium">MD5</th>
+              <th class="py-2.5 pr-4 text-right font-medium">大小</th>
+              <th class="py-2.5 pr-4 font-medium">同步时间</th>
+              <th class="py-2.5 font-medium">来源</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for f in synced_files %}
+            <tr class="border-b border-gray-50 dark:border-gray-800/60 transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800/60">
+              <td class="max-w-xs truncate py-2.5 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200" title="{{ f.object_key }}">{{ f.object_key }}</td>
+              <td class="py-2.5 pr-4 font-mono text-xs text-gray-500 dark:text-gray-400" title="{{ f.md5 }}">{{ f.md5[:8] }}…{{ f.md5[-6:] }}</td>
+              <td class="whitespace-nowrap py-2.5 pr-4 text-right text-gray-500 dark:text-gray-400">{{ format_bytes(f.size) }}</td>
+              <td class="whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400">{{ format_time(f.synced_at) }}</td>
+              <td class="max-w-xs truncate py-2.5 font-mono text-xs text-gray-400 dark:text-gray-500" title="{{ f.source_url or '' }}">{{ f.source_url or '—' }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="rounded-xl border-2 border-dashed border-gray-200 dark:border-gray-800 py-10 text-center text-sm text-gray-400 dark:text-gray-500">
+        还没有已同步的文件记录
+      </div>
+    {% endif %}
+  </section>
+
   <!-- 服务器文件列表 -->
   <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
     <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -358,7 +407,7 @@
   </section>
 
   <footer class="mt-10 text-center text-xs text-gray-400 dark:text-gray-500">
-    B2 文件管理 · WebSocket 实时同步 · 上传/下载状态自动刷新
+    B2 文件管理 · Bucket 保持私有，禁止公开链接 · md5 唯一性校验
   </footer>
 </main>
 
@@ -467,6 +516,12 @@ function renderJobs() {
       err.className = 'mt-1 max-w-xs text-xs text-red-600';
       err.textContent = job.error;
       tdStatus.appendChild(err);
+    }
+    if (job.note) {
+      const note = document.createElement('p');
+      note.className = 'mt-1 max-w-xs text-xs text-amber-600';
+      note.textContent = job.note;
+      tdStatus.appendChild(note);
     }
 
     const tdProg = document.createElement('td');

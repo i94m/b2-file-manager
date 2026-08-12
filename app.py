@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import queue
 import secrets
@@ -65,6 +66,8 @@ app.secret_key = secrets.token_hex(16)
 socketio = SocketIO(app, async_mode="threading")
 
 _CLIENT = None
+BUCKET_PRIVATE: bool | None = None
+BUCKET_PRIVATE_NOTE = ""
 
 
 def format_bytes(value: float) -> str:
@@ -219,9 +222,26 @@ def init_db() -> None:
             ("kind", "TEXT NOT NULL DEFAULT 'upload'"),
             ("source", "TEXT"),
             ("destination", "TEXT"),
+            ("note", "TEXT"),
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                object_key TEXT NOT NULL,
+                md5 TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                source_url TEXT,
+                status TEXT NOT NULL DEFAULT 'synced',
+                created_at REAL NOT NULL,
+                synced_at REAL,
+                error TEXT
+            )
+            """
+        )
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_md5 ON files(md5)")
 
 
 def recent_jobs(limit: int = MAX_JOBS_SHOWN) -> list[dict]:
@@ -258,6 +278,7 @@ def job_payload(job: dict) -> dict:
         "object_key": job["object_key"],
         "source": job.get("source"),
         "destination": job.get("destination"),
+        "note": job.get("note"),
         "size": job["size"],
         "status": job["status"],
         "progress": job["progress"],
@@ -339,10 +360,11 @@ def download_to_path(object_key: str, size: int, destination: Path, job_id: int)
                 pass
 
 
-def fetch_url_to_temp(url: str, job_id: int) -> tuple[Path, int]:
-    """从 URL 流式下载到临时文件，返回（临时路径, 文件大小）。"""
+def fetch_url_to_temp(url: str, job_id: int) -> tuple[Path, int, str]:
+    """从 URL 流式下载到临时文件，返回（临时路径, 文件大小, md5）。"""
     request = Request(url, headers={"User-Agent": "b2-file-manager/0.1"})
     temp_path = UPLOAD_DIR / f"{job_id}.part"
+    digest = hashlib.md5()
     with urlopen(request, timeout=60) as response:
         total = int(response.headers.get("Content-Length") or 0)
         if total > 0:
@@ -356,12 +378,68 @@ def fetch_url_to_temp(url: str, job_id: int) -> tuple[Path, int]:
                 if not chunk:
                     break
                 out.write(chunk)
+                digest.update(chunk)
                 callback(len(chunk))
     size = temp_path.stat().st_size
     with get_db() as conn:
         conn.execute("UPDATE jobs SET size=? WHERE id=?", (size, job_id))
     emit_job_update(job_id)
-    return temp_path, size
+    return temp_path, size, digest.hexdigest()
+
+
+def hash_file(path: Path) -> str:
+    """计算本地文件 md5。"""
+    digest = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ensure_unique_md5(md5: str, job_id: int) -> bool:
+    """md5 已存在时跳过上传并给任务加备注，返回是否为新文件。"""
+    with get_db() as conn:
+        row = conn.execute("SELECT object_key FROM files WHERE md5=?", (md5,)).fetchone()
+    if row is not None:
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET note=? WHERE id=?",
+                (f"md5 已存在，跳过上传（已存于 {row['object_key']}）", job_id),
+            )
+        emit_job_update(job_id)
+        return False
+    return True
+
+
+def verify_object(object_key: str, size: int) -> None:
+    meta = get_client().head_object(Bucket=os.environ["B2_BUCKET"], Key=object_key)
+    actual = int(meta["ContentLength"])
+    if actual != size:
+        raise OSError(f"上传校验失败：bucket 中 {actual} 字节，本地 {size} 字节")
+
+
+def insert_file_record(object_key: str, md5: str, size: int, source_url: str | None = None) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO files (object_key, md5, size, source_url, status, created_at, synced_at) "
+            "VALUES (?, ?, ?, ?, 'synced', ?, ?)",
+            (object_key, md5, size, source_url, time.time(), time.time()),
+        )
+
+
+def sync_to_bucket(
+    source_path: Path, object_key: str, job_id: int, size: int, md5: str, source_url: str | None = None
+) -> bool:
+    """上传到 bucket 并登记 files 记录；md5 重复时跳过，返回是否真正上传。"""
+    if not ensure_unique_md5(md5, job_id):
+        return False
+    upload_to_bucket(source_path, object_key, job_id, size)
+    verify_object(object_key, size)
+    insert_file_record(object_key, md5, size, source_url)
+    return True
 
 
 def cleanup_job_temp(job_id: int, kind: str, destination: str | None = None) -> None:
@@ -407,18 +485,18 @@ def process_job(job_id: int) -> None:
                 else None
             )
             if kind == "fetch":
-                source_path, size = fetch_url_to_temp(source, job_id)
+                source_path, size, md5 = fetch_url_to_temp(source, job_id)
                 if destination:
                     dest = Path(destination)
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(source_path), dest)
                 else:
-                    upload_to_bucket(source_path, object_key, job_id, size)
-            elif source_path is None:
-                source_path = UPLOAD_DIR / f"{job_id}.part"
-                upload_to_bucket(source_path, object_key, job_id, size)
+                    sync_to_bucket(source_path, object_key, job_id, size, md5, source)
             else:
-                upload_to_bucket(source_path, object_key, job_id, size)
+                if source_path is None:
+                    source_path = UPLOAD_DIR / f"{job_id}.part"
+                md5 = hash_file(source_path)
+                sync_to_bucket(source_path, object_key, job_id, size, md5)
             final_size = size
         with get_db() as conn:
             conn.execute(
@@ -491,6 +569,26 @@ def cleanup_stale_multipart(max_age_hours: float = 24.0) -> None:
             print(f"已清理 {count} 个超过 {max_age_hours:.0f} 小时未完成的分片上传。")
     except (BotoCoreError, ClientError) as exc:
         print(f"清理未完成分片上传失败（可忽略）: {exc}")
+
+
+def recent_files(limit: int = 50) -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM files ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def check_bucket_private() -> tuple[bool | None, str]:
+    """检测 bucket 是否私有：S3 ACL 中出现 AllUsers 公开读即视为公开。"""
+    try:
+        acl = get_client().get_bucket_acl(Bucket=os.environ["B2_BUCKET"])
+        for grant in acl.get("Grants", []):
+            grantee = grant.get("Grantee", {})
+            uri = grantee.get("URI", "") or ""
+            if "AllUsers" in uri:
+                return False, "bucket 检测为公开读（ACL 含 AllUsers），请关闭公开访问！"
+        return True, "bucket 为私有，禁止外部链接访问 ✓"
+    except (BotoCoreError, ClientError) as exc:
+        return None, f"无法检测 bucket 公开状态（{exc}）"
 
 
 # --------------------------------------------------------------------------
@@ -626,6 +724,9 @@ def index():
         list_error=list_error,
         server_root=server_root_text,
         server_files=server_files,
+        synced_files=recent_files(),
+        bucket_private=BUCKET_PRIVATE,
+        bucket_private_note=BUCKET_PRIVATE_NOTE,
         format_bytes=format_bytes,
         format_time=format_time,
     )
@@ -939,6 +1040,13 @@ def init_runtime() -> None:
     recover_jobs()
     cleanup_stale_multipart()
     threading.Thread(target=worker_loop, name="upload-worker", daemon=True).start()
+
+    global BUCKET_PRIVATE, BUCKET_PRIVATE_NOTE
+    BUCKET_PRIVATE, BUCKET_PRIVATE_NOTE = check_bucket_private()
+    if BUCKET_PRIVATE is False:
+        print(f"⚠️ 安全警告: {BUCKET_PRIVATE_NOTE}", file=sys.stderr)
+    else:
+        print(f"安全检测: {BUCKET_PRIVATE_NOTE}")
 
 
 if __name__ == "__main__":
