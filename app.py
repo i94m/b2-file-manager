@@ -689,7 +689,7 @@ def cleanup_stale_multipart(max_age_hours: float = 24.0) -> None:
         print(f"清理未完成分片上传失败（可忽略）: {exc}")
 
 
-def recent_files(limit: int = 50) -> list[dict]:
+def recent_files(limit: int = 500) -> list[dict]:
     with get_db() as conn:
         rows = conn.execute("SELECT * FROM files ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [dict(row) for row in rows]
