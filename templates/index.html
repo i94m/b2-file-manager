@@ -30,8 +30,9 @@
 
   <section class="mb-8 grid gap-6 md:grid-cols-2">
     <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
-      <h2 class="mb-1 text-lg font-semibold">从本地上传到 Bucket</h2>
-      <p class="mb-3 text-xs text-gray-400">从浏览器选择本机文件，上传到 Bucket</p>
+      <h2 class="mb-3 text-lg font-semibold">上传到 Bucket</h2>
+
+      <p class="mb-2 text-sm font-medium text-gray-700">从本地上传到 Bucket</p>
       <form action="{{ url_for('upload', apikey=apikey) }}" method="post"
             enctype="multipart/form-data" class="space-y-3">
         <input type="file" name="file" required
@@ -47,14 +48,13 @@
           上传
         </button>
       </form>
-    </div>
 
-    <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
-      <h2 class="mb-1 text-lg font-semibold">从服务器上传到 Bucket</h2>
-      <p class="mb-3 text-xs text-gray-400">填写服务器文件的绝对路径，上传到 Bucket</p>
+      <hr class="my-4 border-gray-200">
+
+      <p class="mb-2 text-sm font-medium text-gray-700">从服务器上传到 Bucket</p>
       <form action="{{ url_for('server_upload', apikey=apikey) }}" method="post" class="space-y-3">
         <input type="text" name="path" required
-               placeholder="例如 /data/backup/file.zip"
+               placeholder="服务器文件绝对路径，例如 /data/backup/file.zip"
                class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm
                       focus:border-blue-500 focus:outline-none">
         <input type="text" name="prefix" value="{{ default_prefix }}"
@@ -70,8 +70,9 @@
     </div>
 
     <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
-      <h2 class="mb-1 text-lg font-semibold">从链接下载到 Bucket/服务器</h2>
-      <p class="mb-3 text-xs text-gray-400">输入 URL，可选择下载到 Bucket 或服务器路径</p>
+      <h2 class="mb-3 text-lg font-semibold">下载</h2>
+
+      <p class="mb-2 text-sm font-medium text-gray-700">从链接下载到 Bucket/服务器</p>
       <form action="{{ url_for('url_upload', apikey=apikey) }}" method="post" class="space-y-3">
         <input type="url" name="url" required
                placeholder="https://example.com/file.zip"
@@ -97,11 +98,10 @@
           加入抓取队列
         </button>
       </form>
-    </div>
 
-    <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
-      <h2 class="mb-1 text-lg font-semibold">从 Bucket 下载到本地</h2>
-      <p class="mb-3 text-xs text-gray-400">输入对象 key，从 Bucket 下载到本机浏览器</p>
+      <hr class="my-4 border-gray-200">
+
+      <p class="mb-2 text-sm font-medium text-gray-700">从 Bucket 下载到本地</p>
       <form action="{{ url_for('download', apikey=apikey) }}" method="get" class="space-y-3">
         <input type="text" name="key" required
                placeholder="对象名（key），例如 backups/2026/report.pdf"
@@ -113,18 +113,17 @@
           下载
         </button>
       </form>
-    </div>
 
-    <div class="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
-      <h2 class="mb-1 text-lg font-semibold">从 Bucket 下载到服务器</h2>
-      <p class="mb-3 text-xs text-gray-400">输入对象 key 和绝对路径，从 Bucket 下载到服务器</p>
+      <hr class="my-4 border-gray-200">
+
+      <p class="mb-2 text-sm font-medium text-gray-700">从 Bucket 下载到服务器</p>
       <form action="{{ url_for('server_download', apikey=apikey) }}" method="post" class="space-y-3">
         <input type="text" name="key" required
                placeholder="对象名（key），例如 backups/2026/report.pdf"
                class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm
                       focus:border-blue-500 focus:outline-none">
         <input type="text" name="destination" required
-               placeholder="例如 /data/downloads/report.pdf"
+               placeholder="服务器绝对路径，例如 /data/downloads/report.pdf"
                class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm
                       focus:border-blue-500 focus:outline-none">
         <button type="submit"
