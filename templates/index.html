@@ -39,6 +39,34 @@
     </p>
   </header>
 
+  <!-- 快速录入 -->
+  <section class="mb-6 rounded-2xl border border-blue-200 dark:border-blue-900/50 bg-blue-50/60 dark:bg-blue-950/30 p-6 shadow-sm sm:p-7">
+    <div class="mb-3 flex items-center gap-2">
+      <span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-600 text-base text-white">⚡</span>
+      <div>
+        <h2 class="text-lg font-semibold leading-tight">快速录入链接</h2>
+        <p class="text-xs text-gray-500 dark:text-gray-400">粘贴客户下载链接，自动抓取并同步到私有 Bucket，同时登记到文件库</p>
+      </div>
+    </div>
+    <form action="{{ url_for('url_upload', apikey=apikey) }}" method="post"
+          class="flex flex-col gap-3 md:flex-row">
+      <input type="hidden" name="target" value="bucket">
+      <input type="url" name="url" required
+             placeholder="粘贴链接，例如 https://download.example.com/file.zip"
+             class="flex-1 rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
+                    focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+      <input type="text" name="prefix" value="{{ default_prefix }}"
+             placeholder="前缀（可选）"
+             class="md:w-48 rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
+                    focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+      <button type="submit"
+              class="inline-flex items-center justify-center rounded-lg bg-blue-600 px-6 py-2 text-sm font-semibold text-white shadow-sm transition
+                     hover:bg-blue-700 active:scale-[0.99]">
+        录入
+      </button>
+    </form>
+  </section>
+
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
       <div class="mb-6 space-y-2">
