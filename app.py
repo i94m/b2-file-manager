@@ -831,6 +831,14 @@ def api_jobs():
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="启动 B2 文件管理（开发模式）")
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="文件变更时自动重启（热加载），仅用于开发",
+    )
+    args = parser.parse_args()
+
     config_error = validate_config()
     if config_error:
         print(f"配置错误: {config_error}", file=sys.stderr)
@@ -841,7 +849,7 @@ def main() -> int:
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5000"))
     print(f"B2 文件管理已启动: http://{host}:{port}/?apikey=<APP_API_KEY>")
-    socketio.run(app, host=host, port=port)
+    socketio.run(app, host=host, port=port, use_reloader=args.reload)
     return 0
 
 
