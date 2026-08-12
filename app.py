@@ -830,6 +830,23 @@ def api_jobs():
     return jsonify([job_payload(job) for job in recent_jobs()])
 
 
+@app.get("/api/objects")
+def api_objects():
+    blocked = require_auth()
+    if blocked:
+        return blocked
+    raw_prefix = request.args.get("prefix", "") or os.environ.get("B2_PREFIX", "")
+    try:
+        prefix = clean_prefix(raw_prefix)
+    except argparse.ArgumentTypeError as exc:
+        return jsonify({"error": str(exc)}), 400
+    try:
+        objects = list_objects(prefix)
+    except (BotoCoreError, ClientError) as exc:
+        return jsonify({"error": str(exc)}), 502
+    return jsonify({"prefix": prefix, "objects": objects})
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="启动 B2 文件管理（开发模式）")
     parser.add_argument(

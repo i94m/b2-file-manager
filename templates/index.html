@@ -202,58 +202,65 @@
     <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
       <div class="flex items-center gap-2">
         <h2 class="text-lg font-semibold">文件列表</h2>
-        {% if objects %}
-          <span class="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-500">{{ objects|length }} 个对象</span>
-        {% endif %}
+        <span id="object-count" class="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-500">{{ objects|length }} 个对象</span>
       </div>
-      <form action="{{ url_for('index', apikey=apikey) }}" method="get" class="flex items-center gap-2">
-        <input type="text" name="prefix" value="{{ prefix }}" placeholder="前缀过滤"
-               class="w-44 rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm shadow-sm outline-none transition
-                      focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
-        <button type="submit"
-                class="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 shadow-sm transition
+      <div class="flex flex-wrap items-center gap-2">
+        <form action="{{ url_for('index', apikey=apikey) }}" method="get" class="flex items-center gap-2">
+          <input type="text" name="prefix" value="{{ prefix }}" placeholder="前缀过滤"
+                 class="w-44 rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm shadow-sm outline-none transition
+                        focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+          <button type="submit"
+                  class="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 shadow-sm transition
+                         hover:bg-gray-50">
+            过滤
+          </button>
+        </form>
+        <button type="button" id="refresh-objects"
+                class="inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 shadow-sm transition
                        hover:bg-gray-50">
-          过滤
+          ↻ 刷新
         </button>
-      </form>
+      </div>
     </div>
 
-    {% if list_error %}
-      <div class="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
-        加载列表失败：{{ list_error }}
-      </div>
-    {% elif objects %}
-      <div class="overflow-x-auto">
-        <table class="w-full text-sm">
-          <thead>
-            <tr class="border-b border-gray-100 text-left text-xs uppercase tracking-wide text-gray-400">
-              <th class="py-2.5 pr-4 font-medium">对象名</th>
-              <th class="py-2.5 pr-4 text-right font-medium">大小</th>
-              <th class="py-2.5 text-right font-medium">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-          {% for obj in objects %}
-            <tr class="border-b border-gray-50 transition-colors last:border-0 hover:bg-gray-50/70">
-              <td class="max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700">{{ obj.key }}</td>
-              <td class="whitespace-nowrap py-2.5 pr-4 text-right text-gray-500">{{ format_bytes(obj.size) }}</td>
-              <td class="py-2.5 text-right">
-                <a href="{{ url_for('download', apikey=apikey, key=obj.key) }}"
-                   class="inline-flex items-center gap-1 rounded-lg bg-gray-800 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition
-                          hover:bg-gray-900">
-                  下载
-                </a>
-              </td>
-            </tr>
-          {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    {% else %}
-      <div class="rounded-xl border-2 border-dashed border-gray-200 py-10 text-center text-sm text-gray-400">
-        该前缀下没有对象
-      </div>
-    {% endif %}
+    <div id="object-list">
+      {% if list_error %}
+        <div class="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+          加载列表失败：{{ list_error }}
+        </div>
+      {% elif objects %}
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="border-b border-gray-100 text-left text-xs uppercase tracking-wide text-gray-400">
+                <th class="py-2.5 pr-4 font-medium">对象名</th>
+                <th class="py-2.5 pr-4 text-right font-medium">大小</th>
+                <th class="py-2.5 text-right font-medium">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+            {% for obj in objects %}
+              <tr class="border-b border-gray-50 transition-colors last:border-0 hover:bg-gray-50/70">
+                <td class="max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700">{{ obj.key }}</td>
+                <td class="whitespace-nowrap py-2.5 pr-4 text-right text-gray-500">{{ format_bytes(obj.size) }}</td>
+                <td class="py-2.5 text-right">
+                  <a href="{{ url_for('download', apikey=apikey, key=obj.key) }}"
+                     class="inline-flex items-center gap-1 rounded-lg bg-gray-800 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition
+                            hover:bg-gray-900">
+                    下载
+                  </a>
+                </td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="rounded-xl border-2 border-dashed border-gray-200 py-10 text-center text-sm text-gray-400">
+          该前缀下没有对象
+        </div>
+      {% endif %}
+    </div>
   </section>
 
   <!-- 上传任务 -->
@@ -470,6 +477,77 @@ function renderDownloads() {
   table.appendChild(tbody);
   el.replaceChildren(table);
 }
+
+const objectListEl = document.getElementById('object-list');
+const objectCountEl = document.getElementById('object-count');
+const refreshBtn = document.getElementById('refresh-objects');
+
+function renderObjects(objects) {
+  if (objectCountEl) objectCountEl.textContent = objects.length + ' 个对象';
+  if (!objects.length) {
+    objectListEl.innerHTML =
+      '<div class="rounded-xl border-2 border-dashed border-gray-200 py-10 text-center text-sm text-gray-400">' +
+      '该前缀下没有对象</div>';
+    return;
+  }
+  const table = document.createElement('table');
+  table.className = 'w-full text-sm';
+  table.innerHTML =
+    '<thead><tr class="border-b border-gray-100 text-left text-xs uppercase tracking-wide text-gray-400">' +
+    '<th class="py-2.5 pr-4 font-medium">对象名</th>' +
+    '<th class="py-2.5 pr-4 text-right font-medium">大小</th>' +
+    '<th class="py-2.5 text-right font-medium">操作</th></tr></thead>';
+  const tbody = document.createElement('tbody');
+  for (const obj of objects) {
+    const tr = document.createElement('tr');
+    tr.className = 'border-b border-gray-50 transition-colors last:border-0 hover:bg-gray-50/70';
+
+    const tdKey = document.createElement('td');
+    tdKey.className = 'max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700';
+    tdKey.textContent = obj.key;
+
+    const tdSize = document.createElement('td');
+    tdSize.className = 'whitespace-nowrap py-2.5 pr-4 text-right text-gray-500';
+    tdSize.textContent = fmtSize(obj.size);
+
+    const tdOp = document.createElement('td');
+    tdOp.className = 'py-2.5 text-right';
+    const link = document.createElement('a');
+    link.className = 'inline-flex items-center gap-1 rounded-lg bg-gray-800 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-gray-900';
+    link.href = '/download?apikey=' + encodeURIComponent(apikey) + '&key=' + encodeURIComponent(obj.key);
+    link.textContent = '下载';
+    tdOp.appendChild(link);
+
+    tr.append(tdKey, tdSize, tdOp);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  objectListEl.replaceChildren(table);
+}
+
+async function refreshObjects() {
+  refreshBtn.disabled = true;
+  refreshBtn.textContent = '刷新中…';
+  try {
+    const prefix = new URLSearchParams(window.location.search).get('prefix') || '';
+    const res = await fetch(
+      '/api/objects?apikey=' + encodeURIComponent(apikey) + '&prefix=' + encodeURIComponent(prefix)
+    );
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    renderObjects(data.objects);
+  } catch (err) {
+    objectListEl.innerHTML =
+      '<div class="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">' +
+      '刷新失败：' + err.message + '</div>';
+  } finally {
+    refreshBtn.disabled = false;
+    refreshBtn.textContent = '↻ 刷新';
+  }
+}
+
+refreshBtn.addEventListener('click', refreshObjects);
 
 function setConn(state) {
   const dot = document.getElementById('conn-dot');
