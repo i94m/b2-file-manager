@@ -125,6 +125,13 @@
       <p class="text-sm text-gray-500">加载中…</p>
     </div>
   </section>
+
+  <section class="mt-8 rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+    <h2 class="mb-3 text-lg font-semibold">下载状态</h2>
+    <div id="downloads">
+      <p class="text-sm text-gray-500">暂无下载任务。</p>
+    </div>
+  </section>
 </main>
 
 <script src="{{ url_for('static', filename='socket.io.min.js') }}"></script>
@@ -139,6 +146,13 @@ const STATUS_CLASS = {
   failed: 'bg-red-100 text-red-700'
 };
 let jobs = [];
+let downloads = [];
+const DL_STATUS_TEXT = {downloading: '下载中', done: '完成', failed: '失败'};
+const DL_STATUS_CLASS = {
+  downloading: 'bg-blue-100 text-blue-700',
+  done: 'bg-green-100 text-green-700',
+  failed: 'bg-red-100 text-red-700'
+};
 
 function fmtSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
@@ -223,6 +237,77 @@ function renderJobs() {
   jobsEl.replaceChildren(table);
 }
 
+function renderDownloads() {
+  const el = document.getElementById('downloads');
+  if (!downloads.length) {
+    el.innerHTML = '<p class="text-sm text-gray-500">暂无下载任务。</p>';
+    return;
+  }
+  const table = document.createElement('table');
+  table.className = 'w-full text-sm';
+  table.innerHTML =
+    '<thead><tr class="border-b border-gray-200 text-left text-gray-500">' +
+    '<th class="py-2 pr-4 font-medium">对象名</th>' +
+    '<th class="py-2 pr-4 font-medium">大小</th>' +
+    '<th class="py-2 pr-4 font-medium">状态</th>' +
+    '<th class="py-2 font-medium">进度</th></tr></thead>';
+  const tbody = document.createElement('tbody');
+  for (const dl of downloads) {
+    const tr = document.createElement('tr');
+    tr.className = 'border-b border-gray-100 align-top last:border-0';
+    const pct = dl.size
+      ? Math.min(100, Math.round(dl.transferred * 100 / dl.size))
+      : (dl.status === 'done' ? 100 : 0);
+
+    const tdKey = document.createElement('td');
+    tdKey.className = 'max-w-xs truncate py-2 pr-4 font-mono text-xs';
+    tdKey.textContent = dl.key;
+
+    const tdSize = document.createElement('td');
+    tdSize.className = 'whitespace-nowrap py-2 pr-4';
+    tdSize.textContent = fmtSize(dl.size);
+
+    const tdStatus = document.createElement('td');
+    tdStatus.className = 'py-2 pr-4';
+    const badge = document.createElement('span');
+    badge.className = 'inline-block rounded px-2 py-0.5 text-xs font-medium ' +
+      (DL_STATUS_CLASS[dl.status] || 'bg-gray-100 text-gray-700');
+    badge.textContent = DL_STATUS_TEXT[dl.status] || dl.status;
+    tdStatus.appendChild(badge);
+    if (dl.status === 'failed' && dl.error) {
+      const err = document.createElement('p');
+      err.className = 'mt-1 text-xs text-red-600';
+      err.textContent = dl.error;
+      tdStatus.appendChild(err);
+    }
+
+    const tdProg = document.createElement('td');
+    tdProg.className = 'py-2';
+    if (dl.status === 'done') {
+      tdProg.textContent = '100%';
+    } else if (dl.status === 'failed') {
+      tdProg.textContent = pct + '%';
+    } else {
+      const bar = document.createElement('div');
+      bar.className = 'h-2 w-32 overflow-hidden rounded bg-gray-200';
+      const fill = document.createElement('div');
+      fill.className = 'h-full rounded bg-blue-500';
+      fill.style.width = pct + '%';
+      bar.appendChild(fill);
+      tdProg.appendChild(bar);
+      const label = document.createElement('p');
+      label.className = 'mt-1 text-xs text-gray-500';
+      label.textContent = pct + '%';
+      tdProg.appendChild(label);
+    }
+
+    tr.append(tdKey, tdSize, tdStatus, tdProg);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  el.replaceChildren(table);
+}
+
 const socket = io({transports: ['websocket'], query: {apikey}});
 
 socket.on('connect', () => {
@@ -242,6 +327,17 @@ socket.on('job_update', (job) => {
     jobs[index] = job;
   }
   renderJobs();
+});
+
+socket.on('download_update', (dl) => {
+  const index = downloads.findIndex(item => item.id === dl.id);
+  if (index === -1) {
+    downloads.unshift(dl);
+  } else {
+    downloads[index] = dl;
+  }
+  if (downloads.length > 20) downloads.length = 20;
+  renderDownloads();
 });
 
 socket.on('connect_error', () => {

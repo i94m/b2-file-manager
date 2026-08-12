@@ -17,6 +17,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
@@ -363,6 +364,51 @@ def stream_body(body, chunk_size: int = 1024 * 1024):
         body.close()
 
 
+_downloads_lock = threading.Lock()
+_active_downloads: dict[str, dict] = {}
+
+
+def download_payload(
+    dl_id: str, key: str, size: int, transferred: int, status: str, error: str | None = None
+) -> dict:
+    return {
+        "id": dl_id,
+        "key": key,
+        "size": size,
+        "transferred": transferred,
+        "status": status,
+        "error": error,
+    }
+
+
+def update_download(
+    dl_id: str,
+    *,
+    transferred: int | None = None,
+    status: str | None = None,
+    error: str | None = None,
+) -> None:
+    with _downloads_lock:
+        record = _active_downloads.get(dl_id)
+        if record is None:
+            return
+        if transferred is not None:
+            record["transferred"] = transferred
+        if status is not None:
+            record["status"] = status
+        if error is not None:
+            record["error"] = error
+        payload = download_payload(
+            dl_id,
+            record["key"],
+            record["size"],
+            record["transferred"],
+            record["status"],
+            record.get("error"),
+        )
+    socketio.emit("download_update", payload)
+
+
 @app.get("/")
 def index():
     blocked = require_auth()
@@ -464,6 +510,18 @@ def download():
 
     body = obj["Body"]
     filename = PurePosixPath(key).name or "download"
+    size = obj.get("ContentLength") or 0
+    dl_id = uuid.uuid4().hex
+    with _downloads_lock:
+        _active_downloads[dl_id] = {
+            "key": key,
+            "size": size,
+            "transferred": 0,
+            "status": "downloading",
+            "error": None,
+        }
+    socketio.emit("download_update", download_payload(dl_id, key, size, 0, "downloading"))
+
     headers = {
         "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
     }
@@ -471,7 +529,30 @@ def download():
         headers["Content-Length"] = str(obj["ContentLength"])
     if obj.get("ContentType"):
         headers["Content-Type"] = obj["ContentType"]
-    return Response(stream_body(body), headers=headers)
+
+    def generate():
+        transferred = 0
+        last = 0.0
+        try:
+            for chunk in stream_body(body):
+                transferred += len(chunk)
+                now = time.monotonic()
+                if now - last >= 0.5 or transferred >= size:
+                    last = now
+                    update_download(dl_id, transferred=transferred)
+                yield chunk
+            update_download(dl_id, transferred=size, status="done")
+        except GeneratorExit:
+            update_download(dl_id, status="failed", error="下载已取消")
+            raise
+        except Exception as exc:
+            update_download(dl_id, status="failed", error=str(exc))
+            raise
+        finally:
+            with _downloads_lock:
+                _active_downloads.pop(dl_id, None)
+
+    return Response(generate(), headers=headers)
 
 
 @app.get("/api/jobs")
