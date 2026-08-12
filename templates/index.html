@@ -5,21 +5,37 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>B2 文件管理 · {{ bucket }}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script>
+    // 主题初始化（避免页面闪烁）：auto 跟随系统
+    (function () {
+      var stored = localStorage.getItem('theme') || 'auto';
+      var dark = stored === 'dark' ||
+        (stored === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.classList.toggle('dark', dark);
+    })();
+  </script>
 </head>
-<body class="min-h-screen bg-gradient-to-br from-gray-100 via-gray-50 to-blue-50/50 text-gray-900">
+<body class="min-h-screen bg-gradient-to-br from-gray-100 via-gray-50 to-blue-50/50 text-gray-900 dark:text-gray-100 dark:from-gray-950 dark:via-gray-900 dark:to-blue-950/30 dark:text-gray-100">
 <main class="mx-auto max-w-6xl px-4 py-10 sm:px-6">
   <header class="mb-8">
     <h1 class="text-3xl font-bold tracking-tight">B2 文件管理</h1>
-    <p class="mt-3 flex flex-wrap items-center gap-2 text-sm text-gray-500">
-      <span class="inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-white px-3 py-1 shadow-sm">
+    <p class="mt-3 flex flex-wrap items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+      <span class="inline-flex items-center gap-1.5 rounded-full border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-3 py-1 shadow-sm">
         <span class="h-1.5 w-1.5 rounded-full bg-blue-500"></span>
         Bucket:
-        <code class="font-mono text-xs font-medium text-gray-700">{{ bucket }}</code>
+        <code class="font-mono text-xs font-medium text-gray-700 dark:text-gray-200">{{ bucket }}</code>
       </span>
-      <span id="conn-chip" class="inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-white px-3 py-1 text-xs shadow-sm">
+      <span id="conn-chip" class="inline-flex items-center gap-1.5 rounded-full border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-3 py-1 text-xs shadow-sm">
         <span id="conn-dot" class="h-1.5 w-1.5 rounded-full bg-gray-400"></span>
         <span id="conn-text">连接中…</span>
       </span>
+      <select id="theme-select" title="主题"
+              class="rounded-full border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-3 py-1 text-xs font-medium text-gray-700 dark:text-gray-200 shadow-sm outline-none transition
+                     focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+        <option value="auto">自动</option>
+        <option value="light">亮色</option>
+        <option value="dark">暗色</option>
+      </select>
     </p>
   </header>
 
@@ -28,7 +44,7 @@
       <div class="mb-6 space-y-2">
       {% for category, message in messages %}
         <div class="flex items-start gap-2 rounded-xl border px-4 py-3 text-sm shadow-sm
-          {{ 'border-green-200 bg-green-50 text-green-800' if category == 'ok' else 'border-red-200 bg-red-50 text-red-800' }}">
+          {{ 'border-green-200 bg-green-50 text-green-800 dark:border-green-900 dark:bg-green-950/50 dark:text-green-300' if category == 'ok' else 'border-red-200 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/50 dark:text-red-300' }}">
           <span class="mt-0.5">{{ '✓' if category == 'ok' else '✕' }}</span>
           <span>{{ message }}</span>
         </div>
@@ -38,31 +54,31 @@
   {% endwith %}
 
   <!-- 上传：整行卡片 -->
-  <section class="mb-6 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm sm:p-7">
+  <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
     <div class="mb-6 flex items-center gap-3">
-      <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-blue-100 text-base font-bold text-blue-600">↑</span>
+      <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-blue-100 text-base font-bold text-blue-600 dark:bg-blue-900/40 dark:text-blue-300">↑</span>
       <div>
         <h2 class="text-lg font-semibold leading-tight">上传到 Bucket</h2>
-        <p class="text-xs text-gray-400">本机文件或服务器文件，统一进入后台队列上传</p>
+        <p class="text-xs text-gray-400 dark:text-gray-500">本机文件或服务器文件，统一进入后台队列上传</p>
       </div>
     </div>
 
     <div class="grid gap-8 md:grid-cols-2">
-      <div class="md:border-r md:border-gray-100 md:pr-8">
-        <h3 class="mb-3 text-sm font-semibold text-gray-700">从本地上传到 Bucket</h3>
+      <div class="md:border-r md:border-gray-100 dark:border-gray-800 md:pr-8">
+        <h3 class="mb-3 text-sm font-semibold text-gray-700 dark:text-gray-200">从本地上传到 Bucket</h3>
         <form action="{{ url_for('upload', apikey=apikey) }}" method="post"
               enctype="multipart/form-data" class="space-y-3">
           <div>
-            <label for="file" class="mb-1 block text-xs font-medium text-gray-600">选择本机文件</label>
+            <label for="file" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">选择本机文件</label>
             <input type="file" name="file" id="file" required
-                   class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                   class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
           <div>
-            <label for="prefix-upload" class="mb-1 block text-xs font-medium text-gray-600">目标前缀（可选）</label>
+            <label for="prefix-upload" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">目标前缀（可选）</label>
             <input type="text" name="prefix" id="prefix-upload" value="{{ default_prefix }}"
                    placeholder="例如 backups/2026"
-                   class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                   class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
           <button type="submit"
@@ -74,20 +90,20 @@
       </div>
 
       <div class="md:pl-8">
-        <h3 class="mb-3 text-sm font-semibold text-gray-700">从服务器上传到 Bucket</h3>
+        <h3 class="mb-3 text-sm font-semibold text-gray-700 dark:text-gray-200">从服务器上传到 Bucket</h3>
         <form action="{{ url_for('server_upload', apikey=apikey) }}" method="post" class="space-y-3">
           <div>
-            <label for="server-path" class="mb-1 block text-xs font-medium text-gray-600">服务器文件绝对路径</label>
+            <label for="server-path" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">服务器文件绝对路径</label>
             <input type="text" name="path" id="server-path" required
                    placeholder="例如 /data/backup/file.zip"
-                   class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                   class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
           <div>
-            <label for="prefix-server" class="mb-1 block text-xs font-medium text-gray-600">目标前缀（可选）</label>
+            <label for="prefix-server" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">目标前缀（可选）</label>
             <input type="text" name="prefix" id="prefix-server" value="{{ default_prefix }}"
                    placeholder="例如 backups/2026"
-                   class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                   class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
           <button type="submit"
@@ -101,47 +117,47 @@
   </section>
 
   <!-- 下载：整行卡片 -->
-  <section class="mb-6 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm sm:p-7">
+  <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
     <div class="mb-6 flex items-center gap-3">
-      <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gray-800 text-base font-bold text-white">↓</span>
+      <span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gray-800 dark:bg-gray-700 text-base font-bold text-white">↓</span>
       <div>
         <h2 class="text-lg font-semibold leading-tight">下载</h2>
-        <p class="text-xs text-gray-400">链接抓取，或从 Bucket 下载到本地 / 服务器</p>
+        <p class="text-xs text-gray-400 dark:text-gray-500">链接抓取，或从 Bucket 下载到本地 / 服务器</p>
       </div>
     </div>
 
     <div class="grid gap-8 md:grid-cols-2 xl:grid-cols-3">
-      <div class="md:border-r md:border-gray-100 md:pr-8 xl:border-r xl:pr-8">
-        <h3 class="mb-3 text-sm font-semibold text-gray-700">从链接下载到 Bucket/服务器</h3>
+      <div class="md:border-r md:border-gray-100 dark:border-gray-800 md:pr-8 xl:border-r xl:pr-8">
+        <h3 class="mb-3 text-sm font-semibold text-gray-700 dark:text-gray-200">从链接下载到 Bucket/服务器</h3>
         <form action="{{ url_for('url_upload', apikey=apikey) }}" method="post" class="space-y-3">
           <div>
-            <label for="url" class="mb-1 block text-xs font-medium text-gray-600">链接地址（URL）</label>
+            <label for="url" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">链接地址（URL）</label>
             <input type="url" name="url" id="url" required
                    placeholder="https://example.com/file.zip"
-                   class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                   class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
           <div>
-            <label for="url_target" class="mb-1 block text-xs font-medium text-gray-600">下载目标</label>
+            <label for="url_target" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">下载目标</label>
             <select name="target" id="url_target"
-                    class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                    class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                            focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
               <option value="bucket">下载到 Bucket</option>
               <option value="server">下载到服务器</option>
             </select>
           </div>
           <div id="url_prefix_wrap">
-            <label for="url_prefix" class="mb-1 block text-xs font-medium text-gray-600">目标前缀（可选）</label>
+            <label for="url_prefix" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">目标前缀（可选）</label>
             <input type="text" name="prefix" value="{{ default_prefix }}" id="url_prefix"
                    placeholder="例如 mirrors/2026"
-                   class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                   class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
           <div id="url_destination_wrap" class="hidden">
-            <label for="url_destination" class="mb-1 block text-xs font-medium text-gray-600">服务器绝对路径</label>
+            <label for="url_destination" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">服务器绝对路径</label>
             <input type="text" name="destination" id="url_destination"
                    placeholder="例如 /data/downloads/file.zip"
-                   class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                   class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
           <button type="submit"
@@ -152,44 +168,44 @@
         </form>
       </div>
 
-      <div class="md:border-r md:border-gray-100 md:pr-8">
-        <h3 class="mb-3 text-sm font-semibold text-gray-700">从 Bucket 下载到本地</h3>
+      <div class="md:border-r md:border-gray-100 dark:border-gray-800 md:pr-8">
+        <h3 class="mb-3 text-sm font-semibold text-gray-700 dark:text-gray-200">从 Bucket 下载到本地</h3>
         <form action="{{ url_for('download', apikey=apikey) }}" method="get" class="space-y-3">
           <div>
-            <label for="download-key" class="mb-1 block text-xs font-medium text-gray-600">对象名（key）</label>
+            <label for="download-key" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">对象名（key）</label>
             <input type="text" name="key" id="download-key" required
                    placeholder="例如 backups/2026/report.pdf"
-                   class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                   class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
           <button type="submit"
-                  class="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-gray-800 px-4 py-2 text-sm font-semibold text-white shadow-sm transition
-                         hover:bg-gray-900 active:scale-[0.99]">
+                  class="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-gray-800 dark:bg-gray-700 px-4 py-2 text-sm font-semibold text-white shadow-sm transition
+                         hover:bg-gray-900 dark:hover:bg-gray-600 active:scale-[0.99]">
             下载
           </button>
         </form>
       </div>
 
       <div class="xl:pl-0">
-        <h3 class="mb-3 text-sm font-semibold text-gray-700">从 Bucket 下载到服务器</h3>
+        <h3 class="mb-3 text-sm font-semibold text-gray-700 dark:text-gray-200">从 Bucket 下载到服务器</h3>
         <form action="{{ url_for('server_download', apikey=apikey) }}" method="post" class="space-y-3">
           <div>
-            <label for="server-dl-key" class="mb-1 block text-xs font-medium text-gray-600">对象名（key）</label>
+            <label for="server-dl-key" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">对象名（key）</label>
             <input type="text" name="key" id="server-dl-key" required
                    placeholder="例如 backups/2026/report.pdf"
-                   class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                   class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
           <div>
-            <label for="server-dl-dest" class="mb-1 block text-xs font-medium text-gray-600">服务器绝对路径</label>
+            <label for="server-dl-dest" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">服务器绝对路径</label>
             <input type="text" name="destination" id="server-dl-dest" required
                    placeholder="例如 /data/downloads/report.pdf"
-                   class="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm outline-none transition
+                   class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
           <button type="submit"
-                  class="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-gray-800 px-4 py-2 text-sm font-semibold text-white shadow-sm transition
-                         hover:bg-gray-900 active:scale-[0.99]">
+                  class="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-gray-800 dark:bg-gray-700 px-4 py-2 text-sm font-semibold text-white shadow-sm transition
+                         hover:bg-gray-900 dark:hover:bg-gray-600 active:scale-[0.99]">
             加入下载队列
           </button>
         </form>
@@ -198,26 +214,26 @@
   </section>
 
   <!-- 文件列表 -->
-  <section class="mb-6 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm sm:p-7">
+  <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
     <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
       <div class="flex items-center gap-2">
         <h2 class="text-lg font-semibold">文件列表</h2>
-        <span id="object-count" class="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-500">{{ objects|length }} 个对象</span>
+        <span id="object-count" class="rounded-full bg-gray-100 dark:bg-gray-800 px-2.5 py-0.5 text-xs font-medium text-gray-500 dark:text-gray-400">{{ objects|length }} 个对象</span>
       </div>
       <div class="flex flex-wrap items-center gap-2">
         <form action="{{ url_for('index', apikey=apikey) }}" method="get" class="flex items-center gap-2">
           <input type="text" name="prefix" value="{{ prefix }}" placeholder="前缀过滤"
-                 class="w-44 rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm shadow-sm outline-none transition
+                 class="w-44 rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-1.5 text-sm shadow-sm outline-none transition
                         focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           <button type="submit"
-                  class="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 shadow-sm transition
-                         hover:bg-gray-50">
+                  class="rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-1.5 text-sm font-medium text-gray-700 dark:text-gray-200 shadow-sm transition
+                         hover:bg-gray-50 dark:hover:bg-gray-800 dark:bg-gray-700/60">
             过滤
           </button>
         </form>
         <button type="button" id="refresh-objects"
-                class="inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 shadow-sm transition
-                       hover:bg-gray-50">
+                class="inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-1.5 text-sm font-medium text-gray-700 dark:text-gray-200 shadow-sm transition
+                       hover:bg-gray-50 dark:hover:bg-gray-800 dark:bg-gray-700/60">
           ↻ 刷新
         </button>
       </div>
@@ -232,7 +248,7 @@
         <div class="overflow-x-auto">
           <table class="w-full text-sm">
             <thead>
-              <tr class="border-b border-gray-100 text-left text-xs uppercase tracking-wide text-gray-400">
+              <tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">
                 <th class="py-2.5 pr-4 font-medium">对象名</th>
                 <th class="py-2.5 pr-4 text-right font-medium">大小</th>
                 <th class="py-2.5 text-right font-medium">操作</th>
@@ -240,13 +256,13 @@
             </thead>
             <tbody>
             {% for obj in objects %}
-              <tr class="border-b border-gray-50 transition-colors last:border-0 hover:bg-gray-50/70">
-                <td class="max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700">{{ obj.key }}</td>
-                <td class="whitespace-nowrap py-2.5 pr-4 text-right text-gray-500">{{ format_bytes(obj.size) }}</td>
+              <tr class="border-b border-gray-50 dark:border-gray-800/60 transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800 dark:bg-gray-700/60">
+                <td class="max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200">{{ obj.key }}</td>
+                <td class="whitespace-nowrap py-2.5 pr-4 text-right text-gray-500 dark:text-gray-400">{{ format_bytes(obj.size) }}</td>
                 <td class="py-2.5 text-right">
                   <a href="{{ url_for('download', apikey=apikey, key=obj.key) }}"
-                     class="inline-flex items-center gap-1 rounded-lg bg-gray-800 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition
-                            hover:bg-gray-900">
+                     class="inline-flex items-center gap-1 rounded-lg bg-gray-800 dark:bg-gray-700 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition
+                            hover:bg-gray-900 dark:hover:bg-gray-600">
                     下载
                   </a>
                 </td>
@@ -256,7 +272,7 @@
           </table>
         </div>
       {% else %}
-        <div class="rounded-xl border-2 border-dashed border-gray-200 py-10 text-center text-sm text-gray-400">
+        <div class="rounded-xl border-2 border-dashed border-gray-200 dark:border-gray-800 py-10 text-center text-sm text-gray-400 dark:text-gray-500">
           该前缀下没有对象
         </div>
       {% endif %}
@@ -264,22 +280,22 @@
   </section>
 
   <!-- 上传任务 -->
-  <section class="mb-6 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm sm:p-7">
+  <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
     <h2 class="mb-4 text-lg font-semibold">上传任务</h2>
     <div id="jobs" data-apikey="{{ apikey }}">
-      <p class="text-sm text-gray-500">加载中…</p>
+      <p class="text-sm text-gray-500 dark:text-gray-400">加载中…</p>
     </div>
   </section>
 
   <!-- 下载状态 -->
-  <section class="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm sm:p-7">
+  <section class="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
     <h2 class="mb-4 text-lg font-semibold">下载状态</h2>
     <div id="downloads">
-      <p class="text-sm text-gray-500">暂无下载任务。</p>
+      <p class="text-sm text-gray-500 dark:text-gray-400">暂无下载任务。</p>
     </div>
   </section>
 
-  <footer class="mt-10 text-center text-xs text-gray-400">
+  <footer class="mt-10 text-center text-xs text-gray-400 dark:text-gray-500">
     B2 文件管理 · WebSocket 实时同步 · 上传/下载状态自动刷新
   </footer>
 </main>
@@ -290,7 +306,7 @@ const jobsEl = document.getElementById('jobs');
 const apikey = jobsEl.dataset.apikey;
 const STATUS_TEXT = {queued: '排队中', uploading: '上传中', done: '完成', failed: '失败'};
 const STATUS_CLASS = {
-  queued: 'bg-gray-100 text-gray-600',
+  queued: 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300',
   uploading: 'bg-blue-100 text-blue-700',
   done: 'bg-green-100 text-green-700',
   failed: 'bg-red-100 text-red-700'
@@ -320,7 +336,7 @@ function fmtSize(bytes) {
 }
 
 function emptyState(el, text) {
-  el.innerHTML = '<p class="py-3 text-center text-sm text-gray-400">' + text + '</p>';
+  el.innerHTML = '<p class="py-3 text-center text-sm text-gray-400 dark:text-gray-500">' + text + '</p>';
 }
 
 function renderJobs() {
@@ -328,7 +344,7 @@ function renderJobs() {
   const table = document.createElement('table');
   table.className = 'w-full text-sm';
   table.innerHTML =
-    '<thead><tr class="border-b border-gray-100 text-left text-xs uppercase tracking-wide text-gray-400">' +
+    '<thead><tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">' +
     '<th class="py-2.5 pr-4 font-medium">类型</th>' +
     '<th class="py-2.5 pr-4 font-medium">文件</th>' +
     '<th class="py-2.5 pr-4 font-medium">对象名</th>' +
@@ -339,14 +355,14 @@ function renderJobs() {
 
   for (const job of jobs) {
     const tr = document.createElement('tr');
-    tr.className = 'border-b border-gray-50 align-top transition-colors last:border-0 hover:bg-gray-50/70';
+    tr.className = 'border-b border-gray-50 dark:border-gray-800/60 align-top transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800 dark:bg-gray-700/60';
     const pct = job.size ? Math.min(100, Math.round(job.progress * 100 / job.size)) : 0;
 
     const tdKind = document.createElement('td');
     tdKind.className = 'py-2.5 pr-4';
     const kindBadge = document.createElement('span');
     kindBadge.className = 'inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ' +
-      (KIND_CLASS[job.kind] || 'bg-gray-100 text-gray-600');
+      (KIND_CLASS[job.kind] || 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300');
     kindBadge.textContent = KIND_TEXT[job.kind] || job.kind || '上传';
     tdKind.appendChild(kindBadge);
 
@@ -355,25 +371,25 @@ function renderJobs() {
     tdFile.textContent = job.filename;
 
     const tdKey = document.createElement('td');
-    tdKey.className = 'max-w-xs truncate py-2.5 pr-4 font-mono text-xs text-gray-600';
+    tdKey.className = 'max-w-xs truncate py-2.5 pr-4 font-mono text-xs text-gray-600 dark:text-gray-300';
     tdKey.textContent = job.object_key;
     const pathLine = job.source || job.destination;
     if (pathLine) {
       const sub = document.createElement('p');
-      sub.className = 'mt-0.5 max-w-xs truncate text-[10px] text-gray-400';
+      sub.className = 'mt-0.5 max-w-xs truncate text-[10px] text-gray-400 dark:text-gray-500';
       sub.textContent = pathLine;
       tdKey.appendChild(sub);
     }
 
     const tdSize = document.createElement('td');
-    tdSize.className = 'whitespace-nowrap py-2.5 pr-4 text-gray-500';
+    tdSize.className = 'whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400';
     tdSize.textContent = fmtSize(job.size);
 
     const tdStatus = document.createElement('td');
     tdStatus.className = 'py-2.5 pr-4';
     const badge = document.createElement('span');
     badge.className = 'inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ' +
-      (STATUS_CLASS[job.status] || 'bg-gray-100 text-gray-600');
+      (STATUS_CLASS[job.status] || 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300');
     badge.textContent = STATUS_TEXT[job.status] || job.status;
     tdStatus.appendChild(badge);
     if (job.status === 'failed' && job.error) {
@@ -391,14 +407,14 @@ function renderJobs() {
       tdProg.textContent = pct + '%';
     } else {
       const bar = document.createElement('div');
-      bar.className = 'h-1.5 w-32 overflow-hidden rounded-full bg-gray-100';
+      bar.className = 'h-1.5 w-32 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800';
       const fill = document.createElement('div');
       fill.className = 'h-full rounded-full bg-blue-500';
       fill.style.width = pct + '%';
       bar.appendChild(fill);
       tdProg.appendChild(bar);
       const label = document.createElement('p');
-      label.className = 'mt-1 text-xs text-gray-400';
+      label.className = 'mt-1 text-xs text-gray-400 dark:text-gray-500';
       label.textContent = pct + '%';
       tdProg.appendChild(label);
     }
@@ -416,7 +432,7 @@ function renderDownloads() {
   const table = document.createElement('table');
   table.className = 'w-full text-sm';
   table.innerHTML =
-    '<thead><tr class="border-b border-gray-100 text-left text-xs uppercase tracking-wide text-gray-400">' +
+    '<thead><tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">' +
     '<th class="py-2.5 pr-4 font-medium">对象名</th>' +
     '<th class="py-2.5 pr-4 font-medium">大小</th>' +
     '<th class="py-2.5 pr-4 font-medium">状态</th>' +
@@ -424,24 +440,24 @@ function renderDownloads() {
   const tbody = document.createElement('tbody');
   for (const dl of downloads) {
     const tr = document.createElement('tr');
-    tr.className = 'border-b border-gray-50 align-top transition-colors last:border-0 hover:bg-gray-50/70';
+    tr.className = 'border-b border-gray-50 dark:border-gray-800/60 align-top transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800 dark:bg-gray-700/60';
     const pct = dl.size
       ? Math.min(100, Math.round(dl.transferred * 100 / dl.size))
       : (dl.status === 'done' ? 100 : 0);
 
     const tdKey = document.createElement('td');
-    tdKey.className = 'max-w-xs truncate py-2.5 pr-4 font-mono text-xs text-gray-600';
+    tdKey.className = 'max-w-xs truncate py-2.5 pr-4 font-mono text-xs text-gray-600 dark:text-gray-300';
     tdKey.textContent = dl.key;
 
     const tdSize = document.createElement('td');
-    tdSize.className = 'whitespace-nowrap py-2.5 pr-4 text-gray-500';
+    tdSize.className = 'whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400';
     tdSize.textContent = fmtSize(dl.size);
 
     const tdStatus = document.createElement('td');
     tdStatus.className = 'py-2.5 pr-4';
     const badge = document.createElement('span');
     badge.className = 'inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ' +
-      (DL_STATUS_CLASS[dl.status] || 'bg-gray-100 text-gray-600');
+      (DL_STATUS_CLASS[dl.status] || 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300');
     badge.textContent = DL_STATUS_TEXT[dl.status] || dl.status;
     tdStatus.appendChild(badge);
     if (dl.status === 'failed' && dl.error) {
@@ -459,14 +475,14 @@ function renderDownloads() {
       tdProg.textContent = pct + '%';
     } else {
       const bar = document.createElement('div');
-      bar.className = 'h-1.5 w-32 overflow-hidden rounded-full bg-gray-100';
+      bar.className = 'h-1.5 w-32 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800';
       const fill = document.createElement('div');
       fill.className = 'h-full rounded-full bg-blue-500';
       fill.style.width = pct + '%';
       bar.appendChild(fill);
       tdProg.appendChild(bar);
       const label = document.createElement('p');
-      label.className = 'mt-1 text-xs text-gray-400';
+      label.className = 'mt-1 text-xs text-gray-400 dark:text-gray-500';
       label.textContent = pct + '%';
       tdProg.appendChild(label);
     }
@@ -486,34 +502,34 @@ function renderObjects(objects) {
   if (objectCountEl) objectCountEl.textContent = objects.length + ' 个对象';
   if (!objects.length) {
     objectListEl.innerHTML =
-      '<div class="rounded-xl border-2 border-dashed border-gray-200 py-10 text-center text-sm text-gray-400">' +
+      '<div class="rounded-xl border-2 border-dashed border-gray-200 dark:border-gray-800 py-10 text-center text-sm text-gray-400 dark:text-gray-500">' +
       '该前缀下没有对象</div>';
     return;
   }
   const table = document.createElement('table');
   table.className = 'w-full text-sm';
   table.innerHTML =
-    '<thead><tr class="border-b border-gray-100 text-left text-xs uppercase tracking-wide text-gray-400">' +
+    '<thead><tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">' +
     '<th class="py-2.5 pr-4 font-medium">对象名</th>' +
     '<th class="py-2.5 pr-4 text-right font-medium">大小</th>' +
     '<th class="py-2.5 text-right font-medium">操作</th></tr></thead>';
   const tbody = document.createElement('tbody');
   for (const obj of objects) {
     const tr = document.createElement('tr');
-    tr.className = 'border-b border-gray-50 transition-colors last:border-0 hover:bg-gray-50/70';
+    tr.className = 'border-b border-gray-50 dark:border-gray-800/60 transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800 dark:bg-gray-700/60';
 
     const tdKey = document.createElement('td');
-    tdKey.className = 'max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700';
+    tdKey.className = 'max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200';
     tdKey.textContent = obj.key;
 
     const tdSize = document.createElement('td');
-    tdSize.className = 'whitespace-nowrap py-2.5 pr-4 text-right text-gray-500';
+    tdSize.className = 'whitespace-nowrap py-2.5 pr-4 text-right text-gray-500 dark:text-gray-400';
     tdSize.textContent = fmtSize(obj.size);
 
     const tdOp = document.createElement('td');
     tdOp.className = 'py-2.5 text-right';
     const link = document.createElement('a');
-    link.className = 'inline-flex items-center gap-1 rounded-lg bg-gray-800 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-gray-900';
+    link.className = 'inline-flex items-center gap-1 rounded-lg bg-gray-800 dark:bg-gray-700 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-gray-900 dark:hover:bg-gray-600';
     link.href = '/download?apikey=' + encodeURIComponent(apikey) + '&key=' + encodeURIComponent(obj.key);
     link.textContent = '下载';
     tdOp.appendChild(link);
@@ -579,6 +595,24 @@ function syncUrlTarget() {
 }
 urlTarget.addEventListener('change', syncUrlTarget);
 syncUrlTarget();
+
+// 主题切换：auto 跟随系统，选择记忆到 localStorage
+const themeSelect = document.getElementById('theme-select');
+function applyTheme(theme) {
+  const dark = theme === 'dark' ||
+    (theme === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.classList.toggle('dark', dark);
+}
+function setTheme(theme) {
+  localStorage.setItem('theme', theme);
+  applyTheme(theme);
+}
+themeSelect.value = localStorage.getItem('theme') || 'auto';
+themeSelect.addEventListener('change', () => setTheme(themeSelect.value));
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  if ((localStorage.getItem('theme') || 'auto') === 'auto') applyTheme('auto');
+});
+applyTheme(themeSelect.value);
 
 socket.on('connect', () => {
   setConn('on');
