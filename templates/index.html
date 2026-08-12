@@ -15,7 +15,7 @@
     })();
   </script>
 </head>
-<body class="min-h-screen bg-gradient-to-br from-gray-100 via-gray-50 to-blue-50/50 text-gray-900 dark:text-gray-100 dark:from-gray-950 dark:via-gray-900 dark:to-blue-950/30 dark:text-gray-100">
+<body class="min-h-screen bg-gray-50 dark:bg-gray-950 text-gray-900 dark:text-gray-100">
 <main class="mx-auto max-w-6xl px-4 py-10 sm:px-6">
   <header class="mb-8">
     <h1 class="text-3xl font-bold tracking-tight">B2 文件管理</h1>
@@ -213,12 +213,88 @@
     </div>
   </section>
 
-  <!-- 文件列表 -->
+  <!-- 上传任务 -->
+  <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
+    <h2 class="mb-4 text-lg font-semibold">上传任务</h2>
+    <div id="jobs" data-apikey="{{ apikey }}">
+      <p class="text-sm text-gray-500 dark:text-gray-400">加载中…</p>
+    </div>
+  </section>
+
+  <!-- 下载状态 -->
+  <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
+    <h2 class="mb-4 text-lg font-semibold">下载状态</h2>
+    <div id="downloads">
+      <p class="text-sm text-gray-500 dark:text-gray-400">暂无下载任务。</p>
+    </div>
+  </section>
+
+  <!-- 服务器文件列表 -->
   <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
     <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
       <div class="flex items-center gap-2">
-        <h2 class="text-lg font-semibold">文件列表</h2>
+        <h2 class="text-lg font-semibold">服务器文件列表</h2>
+        {% if server_root %}
+          <span class="rounded-full bg-gray-100 dark:bg-gray-800 px-2.5 py-0.5 text-xs font-medium text-gray-500 dark:text-gray-400">{{ server_files|length }} 个文件</span>
+        {% endif %}
+      </div>
+      {% if server_root %}
+        <span class="rounded-full border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-3 py-1 text-xs text-gray-500 dark:text-gray-400">
+          根目录：<code class="font-mono text-gray-700 dark:text-gray-200">{{ server_root }}</code>
+        </span>
+      {% endif %}
+    </div>
+
+    {% if server_root %}
+      {% if server_files %}
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">
+                <th class="py-2.5 pr-4 font-medium">相对路径</th>
+                <th class="py-2.5 pr-4 text-right font-medium">大小</th>
+                <th class="py-2.5 text-right font-medium">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+            {% for f in server_files %}
+              <tr class="border-b border-gray-50 dark:border-gray-800/60 transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800/60">
+                <td class="max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200">{{ f.path }}</td>
+                <td class="whitespace-nowrap py-2.5 pr-4 text-right text-gray-500 dark:text-gray-400">{{ format_bytes(f.size) }}</td>
+                <td class="py-2.5 text-right">
+                  <form action="{{ url_for('server_upload', apikey=apikey) }}" method="post" class="inline">
+                    <input type="hidden" name="path" value="{{ f.absolute }}">
+                    <button type="submit"
+                            class="inline-flex items-center gap-1 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition
+                                   hover:bg-blue-700">
+                      上传到 Bucket
+                    </button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="rounded-xl border-2 border-dashed border-gray-200 dark:border-gray-800 py-10 text-center text-sm text-gray-400 dark:text-gray-500">
+          目录下没有文件
+        </div>
+      {% endif %}
+    {% else %}
+      <div class="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+        未配置 SERVER_FILE_ROOT，请在 .env 中设置服务器文件根目录后重启服务。
+      </div>
+    {% endif %}
+  </section>
+
+  <!-- Bucket 文件列表 -->
+  <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
+    <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+      <div class="flex flex-wrap items-center gap-2">
+        <h2 class="text-lg font-semibold">Bucket 文件列表</h2>
         <span id="object-count" class="rounded-full bg-gray-100 dark:bg-gray-800 px-2.5 py-0.5 text-xs font-medium text-gray-500 dark:text-gray-400">{{ objects|length }} 个对象</span>
+        <span class="text-xs text-gray-400 dark:text-gray-500">仅显示最近 50 条</span>
       </div>
       <div class="flex flex-wrap items-center gap-2">
         <form action="{{ url_for('index', apikey=apikey) }}" method="get" class="flex items-center gap-2">
@@ -227,13 +303,13 @@
                         focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           <button type="submit"
                   class="rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-1.5 text-sm font-medium text-gray-700 dark:text-gray-200 shadow-sm transition
-                         hover:bg-gray-50 dark:hover:bg-gray-800 dark:bg-gray-700/60">
+                         hover:bg-gray-50 dark:hover:bg-gray-800/60">
             过滤
           </button>
         </form>
         <button type="button" id="refresh-objects"
                 class="inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-1.5 text-sm font-medium text-gray-700 dark:text-gray-200 shadow-sm transition
-                       hover:bg-gray-50 dark:hover:bg-gray-800 dark:bg-gray-700/60">
+                       hover:bg-gray-50 dark:hover:bg-gray-800/60">
           ↻ 刷新
         </button>
       </div>
@@ -251,14 +327,16 @@
               <tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">
                 <th class="py-2.5 pr-4 font-medium">对象名</th>
                 <th class="py-2.5 pr-4 text-right font-medium">大小</th>
+                <th class="py-2.5 pr-4 font-medium">修改时间</th>
                 <th class="py-2.5 text-right font-medium">操作</th>
               </tr>
             </thead>
             <tbody>
             {% for obj in objects %}
-              <tr class="border-b border-gray-50 dark:border-gray-800/60 transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800 dark:bg-gray-700/60">
+              <tr class="border-b border-gray-50 dark:border-gray-800/60 transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800/60">
                 <td class="max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200">{{ obj.key }}</td>
                 <td class="whitespace-nowrap py-2.5 pr-4 text-right text-gray-500 dark:text-gray-400">{{ format_bytes(obj.size) }}</td>
+                <td class="whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400">{{ format_time(obj.last_modified) }}</td>
                 <td class="py-2.5 text-right">
                   <a href="{{ url_for('download', apikey=apikey, key=obj.key) }}"
                      class="inline-flex items-center gap-1 rounded-lg bg-gray-800 dark:bg-gray-700 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition
@@ -276,22 +354,6 @@
           该前缀下没有对象
         </div>
       {% endif %}
-    </div>
-  </section>
-
-  <!-- 上传任务 -->
-  <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
-    <h2 class="mb-4 text-lg font-semibold">上传任务</h2>
-    <div id="jobs" data-apikey="{{ apikey }}">
-      <p class="text-sm text-gray-500 dark:text-gray-400">加载中…</p>
-    </div>
-  </section>
-
-  <!-- 下载状态 -->
-  <section class="rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
-    <h2 class="mb-4 text-lg font-semibold">下载状态</h2>
-    <div id="downloads">
-      <p class="text-sm text-gray-500 dark:text-gray-400">暂无下载任务。</p>
     </div>
   </section>
 
@@ -335,6 +397,14 @@ function fmtSize(bytes) {
   return value.toFixed(2) + ' ' + units[i];
 }
 
+function fmtTime(epoch) {
+  if (!epoch) return '—';
+  const d = new Date(epoch * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
 function emptyState(el, text) {
   el.innerHTML = '<p class="py-3 text-center text-sm text-gray-400 dark:text-gray-500">' + text + '</p>';
 }
@@ -355,7 +425,7 @@ function renderJobs() {
 
   for (const job of jobs) {
     const tr = document.createElement('tr');
-    tr.className = 'border-b border-gray-50 dark:border-gray-800/60 align-top transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800 dark:bg-gray-700/60';
+    tr.className = 'border-b border-gray-50 dark:border-gray-800/60 align-top transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800/60';
     const pct = job.size ? Math.min(100, Math.round(job.progress * 100 / job.size)) : 0;
 
     const tdKind = document.createElement('td');
@@ -440,7 +510,7 @@ function renderDownloads() {
   const tbody = document.createElement('tbody');
   for (const dl of downloads) {
     const tr = document.createElement('tr');
-    tr.className = 'border-b border-gray-50 dark:border-gray-800/60 align-top transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800 dark:bg-gray-700/60';
+    tr.className = 'border-b border-gray-50 dark:border-gray-800/60 align-top transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800/60';
     const pct = dl.size
       ? Math.min(100, Math.round(dl.transferred * 100 / dl.size))
       : (dl.status === 'done' ? 100 : 0);
@@ -512,11 +582,12 @@ function renderObjects(objects) {
     '<thead><tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">' +
     '<th class="py-2.5 pr-4 font-medium">对象名</th>' +
     '<th class="py-2.5 pr-4 text-right font-medium">大小</th>' +
+    '<th class="py-2.5 pr-4 font-medium">修改时间</th>' +
     '<th class="py-2.5 text-right font-medium">操作</th></tr></thead>';
   const tbody = document.createElement('tbody');
   for (const obj of objects) {
     const tr = document.createElement('tr');
-    tr.className = 'border-b border-gray-50 dark:border-gray-800/60 transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800 dark:bg-gray-700/60';
+    tr.className = 'border-b border-gray-50 dark:border-gray-800/60 transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800/60';
 
     const tdKey = document.createElement('td');
     tdKey.className = 'max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200';
@@ -526,6 +597,10 @@ function renderObjects(objects) {
     tdSize.className = 'whitespace-nowrap py-2.5 pr-4 text-right text-gray-500 dark:text-gray-400';
     tdSize.textContent = fmtSize(obj.size);
 
+    const tdTime = document.createElement('td');
+    tdTime.className = 'whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400';
+    tdTime.textContent = fmtTime(obj.last_modified);
+
     const tdOp = document.createElement('td');
     tdOp.className = 'py-2.5 text-right';
     const link = document.createElement('a');
@@ -534,7 +609,7 @@ function renderObjects(objects) {
     link.textContent = '下载';
     tdOp.appendChild(link);
 
-    tr.append(tdKey, tdSize, tdOp);
+    tr.append(tdKey, tdSize, tdTime, tdOp);
     tbody.appendChild(tr);
   }
   table.appendChild(tbody);

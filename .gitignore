@@ -9,3 +9,4 @@ jobs.db-wal
 jobs.db-shm
 tmp_uploads/
 logs/
+server_files/

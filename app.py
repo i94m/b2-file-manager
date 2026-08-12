@@ -76,6 +76,10 @@ def format_bytes(value: float) -> str:
     return f"{value:.2f} TiB"
 
 
+def format_time(epoch: float) -> str:
+    return "--" if not epoch else time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
+
+
 # --------------------------------------------------------------------------
 # 配置与 boto3 client
 # --------------------------------------------------------------------------
@@ -130,6 +134,49 @@ def get_client():
             config=Config(signature_version="s3v4", retries={"max_attempts": 8, "mode": "standard"}),
         )
     return _CLIENT
+
+
+def server_root() -> Path | None:
+    """SERVER_FILE_ROOT 配置的服务器文件根目录；未配置返回 None。"""
+    raw = os.environ.get("SERVER_FILE_ROOT", "").strip()
+    if not raw:
+        return None
+    root = Path(raw).expanduser()
+    if not root.is_absolute():
+        root = BASE_DIR / root
+    return root.resolve()
+
+
+def resolve_server_path(raw: str) -> Path:
+    """解析服务器路径并校验在 SERVER_FILE_ROOT 内（未配置时不限制）。"""
+    if not raw or not raw.strip():
+        raise ValueError("请输入绝对路径")
+    root = server_root()
+    path = Path(raw).expanduser().resolve()
+    if not path.is_absolute():
+        raise ValueError("请输入绝对路径")
+    if root is not None:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            raise ValueError(f"路径必须在 SERVER_FILE_ROOT 目录内: {root}") from None
+    return path
+
+
+def list_server_files() -> tuple[str | None, list[dict]]:
+    root = server_root()
+    if root is None:
+        return None, []
+    root.mkdir(parents=True, exist_ok=True)
+    files = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            files.append({"path": relative, "size": path.stat().st_size, "absolute": str(path)})
+    return str(root), files
 
 
 # --------------------------------------------------------------------------
@@ -469,7 +516,7 @@ def socket_connect():
     emit("jobs_snapshot", [job_payload(job) for job in recent_jobs()])
 
 
-def list_objects(prefix: str) -> list[dict]:
+def list_objects(prefix: str, limit: int = 50) -> list[dict]:
     prefix = prefix.strip("/")
     if prefix:
         prefix += "/"
@@ -481,9 +528,14 @@ def list_objects(prefix: str) -> list[dict]:
             key = item["Key"]
             if key.endswith("/") and int(item.get("Size", 0)) == 0:
                 continue
-            objects.append({"key": key, "size": int(item.get("Size", 0))})
-    objects.sort(key=lambda obj: obj["key"])
-    return objects
+            last_modified = item.get("LastModified")
+            objects.append({
+                "key": key,
+                "size": int(item.get("Size", 0)),
+                "last_modified": int(last_modified.timestamp()) if last_modified else 0,
+            })
+    objects.sort(key=lambda obj: obj["last_modified"], reverse=True)
+    return objects[:limit]
 
 
 def stream_body(body, chunk_size: int = 1024 * 1024):
@@ -563,6 +615,7 @@ def index():
     except (BotoCoreError, ClientError) as exc:
         list_error = str(exc)
 
+    server_root_text, server_files = list_server_files()
     return render_template(
         "index.html",
         apikey=apikey,
@@ -571,7 +624,10 @@ def index():
         prefix=prefix,
         objects=objects,
         list_error=list_error,
+        server_root=server_root_text,
+        server_files=server_files,
         format_bytes=format_bytes,
+        format_time=format_time,
     )
 
 
@@ -634,9 +690,10 @@ def server_upload():
         flash(str(exc), "error")
         return redirect(url_for("index", apikey=apikey))
 
-    source = Path(raw_path).expanduser()
-    if not raw_path or not source.is_absolute():
-        flash("请填写服务器上的绝对路径（例如 /data/backup/file.zip）。", "error")
+    try:
+        source = resolve_server_path(raw_path)
+    except ValueError as exc:
+        flash(str(exc), "error")
         return redirect(url_for("index", apikey=apikey))
     if not source.is_file():
         flash(f"路径不存在或不是普通文件: {source}", "error")
@@ -665,13 +722,14 @@ def server_download():
     apikey = request.args.get("apikey", "")
     key = (request.form.get("key") or "").strip().lstrip("/")
     raw_destination = (request.form.get("destination") or "").strip()
-    destination = Path(raw_destination).expanduser()
 
     if not key:
         flash("请填写要下载的 bucket 对象名（key）。", "error")
         return redirect(url_for("index", apikey=apikey))
-    if not raw_destination or not destination.is_absolute():
-        flash("请填写服务器上的绝对目标路径（例如 /data/downloads/file.zip）。", "error")
+    try:
+        destination = resolve_server_path(raw_destination)
+    except ValueError as exc:
+        flash(str(exc), "error")
         return redirect(url_for("index", apikey=apikey))
     if destination.is_dir():
         flash("目标路径是已存在的目录，请填写完整的文件路径。", "error")
@@ -721,9 +779,10 @@ def url_upload():
     object_key = ""
     if target == "server":
         raw_destination = (request.form.get("destination") or "").strip()
-        destination = Path(raw_destination).expanduser()
-        if not raw_destination or not destination.is_absolute():
-            flash("下载到服务器时，请填写服务器上的绝对目标路径。", "error")
+        try:
+            destination = resolve_server_path(raw_destination)
+        except ValueError as exc:
+            flash(str(exc), "error")
             return redirect(url_for("index", apikey=apikey))
         if destination.is_dir():
             flash("目标路径是已存在的目录，请填写完整的文件路径。", "error")
