@@ -1,0 +1,11 @@
+.env
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+# SQLite 运行时数据库（jobs.db.example 是模板，保留入库）
+jobs.db
+jobs.db-wal
+jobs.db-shm
+tmp_uploads/
+logs/
