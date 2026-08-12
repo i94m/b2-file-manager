@@ -127,6 +127,7 @@
   </section>
 </main>
 
+<script src="{{ url_for('static', filename='socket.io.min.js') }}"></script>
 <script>
 const jobsEl = document.getElementById('jobs');
 const apikey = jobsEl.dataset.apikey;
@@ -137,6 +138,7 @@ const STATUS_CLASS = {
   done: 'bg-green-100 text-green-700',
   failed: 'bg-red-100 text-red-700'
 };
+let jobs = [];
 
 function fmtSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
@@ -147,21 +149,7 @@ function fmtSize(bytes) {
   return value.toFixed(2) + ' ' + units[i];
 }
 
-function fmtTime(epoch) {
-  return epoch ? new Date(epoch * 1000).toLocaleString() : '—';
-}
-
-async function refreshJobs() {
-  try {
-    const res = await fetch('/api/jobs?apikey=' + encodeURIComponent(apikey));
-    if (!res.ok) throw new Error('status ' + res.status);
-    renderJobs(await res.json());
-  } catch (err) {
-    jobsEl.innerHTML = '<p class="text-sm text-red-600">任务状态加载失败，请刷新页面。</p>';
-  }
-}
-
-function renderJobs(jobs) {
+function renderJobs() {
   if (!jobs.length) {
     jobsEl.innerHTML = '<p class="text-sm text-gray-500">暂无上传任务。</p>';
     return;
@@ -235,8 +223,30 @@ function renderJobs(jobs) {
   jobsEl.replaceChildren(table);
 }
 
-refreshJobs();
-setInterval(refreshJobs, 2000);
+const socket = io({transports: ['websocket'], query: {apikey}});
+
+socket.on('connect', () => {
+  jobsEl.innerHTML = '<p class="text-sm text-gray-500">已连接，等待任务…</p>';
+});
+
+socket.on('jobs_snapshot', (items) => {
+  jobs = items;
+  renderJobs();
+});
+
+socket.on('job_update', (job) => {
+  const index = jobs.findIndex(item => item.id === job.id);
+  if (index === -1) {
+    jobs.unshift(job);
+  } else {
+    jobs[index] = job;
+  }
+  renderJobs();
+});
+
+socket.on('connect_error', () => {
+  jobsEl.innerHTML = '<p class="text-sm text-red-600">实时连接失败，请刷新页面。</p>';
+});
 </script>
 </body>
 </html>

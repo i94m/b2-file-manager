@@ -36,6 +36,7 @@ from flask import (
     request,
     url_for,
 )
+from flask_socketio import SocketIO, emit
 
 from backblaze_upload import clean_prefix, normalize_endpoint
 
@@ -57,6 +58,7 @@ TRANSFER_CONFIG = TransferConfig(
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
+socketio = SocketIO(app, async_mode="threading")
 
 _CLIENT = None
 
@@ -167,6 +169,27 @@ def recent_jobs(limit: int = MAX_JOBS_SHOWN) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def job_payload(job: dict) -> dict:
+    return {
+        "id": job["id"],
+        "filename": job["filename"],
+        "object_key": job["object_key"],
+        "size": job["size"],
+        "status": job["status"],
+        "progress": job["progress"],
+        "error": job["error"],
+        "created_at": job["created_at"],
+    }
+
+
+def emit_job_update(job_id: int) -> None:
+    """向所有已连接的页面广播单个任务的最新状态。"""
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is not None:
+        socketio.emit("job_update", job_payload(dict(row)))
+
+
 # --------------------------------------------------------------------------
 # 后台上传队列
 # --------------------------------------------------------------------------
@@ -186,6 +209,7 @@ def make_progress(job_id: int, size: int):
                         "UPDATE jobs SET progress=? WHERE id=?",
                         (state["progress"], job_id),
                     )
+                emit_job_update(job_id)
 
     return callback
 
@@ -202,6 +226,7 @@ def process_job(job_id: int) -> None:
         )
         object_key = row["object_key"]
         size = row["size"]
+    emit_job_update(job_id)
 
     try:
         get_client().upload_file(
@@ -216,12 +241,14 @@ def process_job(job_id: int) -> None:
                 "UPDATE jobs SET status='done', progress=?, finished_at=? WHERE id=?",
                 (size, time.time(), job_id),
             )
+        emit_job_update(job_id)
     except (BotoCoreError, ClientError, OSError) as exc:
         with get_db() as conn:
             conn.execute(
                 "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
                 (str(exc), time.time(), job_id),
             )
+        emit_job_update(job_id)
     finally:
         try:
             temp_path.unlink(missing_ok=True)
@@ -289,12 +316,23 @@ def cleanup_stale_multipart(max_age_hours: float = 24.0) -> None:
 # Flask 路由
 # --------------------------------------------------------------------------
 
-def require_auth():
+def apikey_ok() -> bool:
     provided = request.args.get("apikey", "")
     expected = os.environ.get("APP_API_KEY", "")
-    if not expected or not provided or not secrets.compare_digest(provided, expected):
+    return bool(expected) and bool(provided) and secrets.compare_digest(provided, expected)
+
+
+def require_auth():
+    if not apikey_ok():
         return Response("401 未授权", status=401)
     return None
+
+
+@socketio.on("connect")
+def socket_connect():
+    if not apikey_ok():
+        return False
+    emit("jobs_snapshot", [job_payload(job) for job in recent_jobs()])
 
 
 def list_objects(prefix: str) -> list[dict]:
@@ -399,6 +437,7 @@ def upload():
         return redirect(url_for("index", apikey=apikey))
 
     JOB_QUEUE.put(job_id)
+    emit_job_update(job_id)
     flash(f"「{filename}」已加入上传队列（{format_bytes(size)}）。", "ok")
     return redirect(url_for("index", apikey=apikey))
 
@@ -440,21 +479,7 @@ def api_jobs():
     blocked = require_auth()
     if blocked:
         return blocked
-    return jsonify(
-        [
-            {
-                "id": job["id"],
-                "filename": job["filename"],
-                "object_key": job["object_key"],
-                "size": job["size"],
-                "status": job["status"],
-                "progress": job["progress"],
-                "error": job["error"],
-                "created_at": job["created_at"],
-            }
-            for job in recent_jobs()
-        ]
-    )
+    return jsonify([job_payload(job) for job in recent_jobs()])
 
 
 def main() -> int:
@@ -468,7 +493,7 @@ def main() -> int:
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5000"))
     print(f"B2 文件管理已启动: http://{host}:{port}/?apikey=<APP_API_KEY>")
-    app.run(host=host, port=port, threaded=True)
+    socketio.run(app, host=host, port=port)
     return 0
 
 
