@@ -293,7 +293,7 @@ def require_auth():
     provided = request.args.get("apikey", "")
     expected = os.environ.get("APP_API_KEY", "")
     if not expected or not provided or not secrets.compare_digest(provided, expected):
-        return Response("401 未授权：请携带正确的 ?apikey= 参数", status=401)
+        return Response("401 未授权", status=401)
     return None
 
 
