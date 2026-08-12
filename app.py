@@ -231,6 +231,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 object_key TEXT NOT NULL,
+                filename TEXT,
                 md5 TEXT NOT NULL,
                 size INTEGER NOT NULL DEFAULT 0,
                 source_url TEXT,
@@ -242,6 +243,9 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_md5 ON files(md5)")
+        file_columns = {row["name"] for row in conn.execute("PRAGMA table_info(files)")}
+        if "filename" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN filename TEXT")
 
 
 def recent_jobs(limit: int = MAX_JOBS_SHOWN) -> list[dict]:
@@ -268,6 +272,12 @@ def insert_job(
             (kind, filename, object_key, source, destination, size, time.time()),
         )
         return cursor.lastrowid
+
+
+def uuid_object_key(prefix: str, filename: str) -> str:
+    """生成 UUID.后缀 的对象 key，保留原始文件扩展名。"""
+    ext = PurePosixPath(filename).suffix
+    return "/".join(part for part in (prefix, f"{uuid.uuid4().hex}{ext}") if part)
 
 
 def job_payload(job: dict) -> dict:
@@ -421,24 +431,32 @@ def verify_object(object_key: str, size: int) -> None:
         raise OSError(f"上传校验失败：bucket 中 {actual} 字节，本地 {size} 字节")
 
 
-def insert_file_record(object_key: str, md5: str, size: int, source_url: str | None = None) -> None:
+def insert_file_record(
+    object_key: str, filename: str | None, md5: str, size: int, source_url: str | None = None
+) -> None:
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO files (object_key, md5, size, source_url, status, created_at, synced_at) "
-            "VALUES (?, ?, ?, ?, 'synced', ?, ?)",
-            (object_key, md5, size, source_url, time.time(), time.time()),
+            "INSERT INTO files (object_key, filename, md5, size, source_url, status, created_at, synced_at) "
+            "VALUES (?, ?, ?, ?, ?, 'synced', ?, ?)",
+            (object_key, filename, md5, size, source_url, time.time(), time.time()),
         )
 
 
 def sync_to_bucket(
-    source_path: Path, object_key: str, job_id: int, size: int, md5: str, source_url: str | None = None
+    source_path: Path,
+    object_key: str,
+    job_id: int,
+    size: int,
+    md5: str,
+    filename: str | None = None,
+    source_url: str | None = None,
 ) -> bool:
     """上传到 bucket 并登记 files 记录；md5 重复时跳过，返回是否真正上传。"""
     if not ensure_unique_md5(md5, job_id):
         return False
     upload_to_bucket(source_path, object_key, job_id, size)
     verify_object(object_key, size)
-    insert_file_record(object_key, md5, size, source_url)
+    insert_file_record(object_key, filename, md5, size, source_url)
     return True
 
 
@@ -472,6 +490,7 @@ def process_job(job_id: int) -> None:
         size = row["size"]
         source = row["source"]
         destination = row["destination"]
+        filename = row["filename"]
     emit_job_update(job_id)
 
     try:
@@ -491,12 +510,12 @@ def process_job(job_id: int) -> None:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(source_path), dest)
                 else:
-                    sync_to_bucket(source_path, object_key, job_id, size, md5, source)
+                    sync_to_bucket(source_path, object_key, job_id, size, md5, filename, source)
             else:
                 if source_path is None:
                     source_path = UPLOAD_DIR / f"{job_id}.part"
                 md5 = hash_file(source_path)
-                sync_to_bucket(source_path, object_key, job_id, size, md5)
+                sync_to_bucket(source_path, object_key, job_id, size, md5, filename)
             final_size = size
         with get_db() as conn:
             conn.execute(
@@ -751,7 +770,7 @@ def upload():
         return redirect(url_for("index", apikey=apikey))
 
     filename = Path(file.filename.replace("\\", "/")).name
-    object_key = "/".join(part for part in (prefix, filename) if part)
+    object_key = uuid_object_key(prefix, filename)
     incoming = UPLOAD_DIR / f"incoming-{secrets.token_hex(8)}.part"
 
     try:
@@ -800,7 +819,7 @@ def server_upload():
         flash(f"路径不存在或不是普通文件: {source}", "error")
         return redirect(url_for("index", apikey=apikey))
 
-    object_key = "/".join(part for part in (prefix, source.name) if part)
+    object_key = uuid_object_key(prefix, source.name)
     size = source.stat().st_size
     job_id = insert_job(
         kind="upload",
@@ -895,7 +914,7 @@ def url_upload():
             flash(str(exc), "error")
             return redirect(url_for("index", apikey=apikey))
         filename = PurePosixPath(urlparse(url).path).name or "download"
-        object_key = "/".join(part for part in (prefix, filename) if part)
+        object_key = uuid_object_key(prefix, filename)
 
     filename = PurePosixPath(urlparse(url).path).name or "download"
     job_id = insert_job(
