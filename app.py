@@ -228,24 +228,80 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS files (
+            CREATE TABLE IF NOT EXISTS scripts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                object_key TEXT NOT NULL,
-                filename TEXT,
-                md5 TEXT NOT NULL,
-                size INTEGER NOT NULL DEFAULT 0,
-                source_url TEXT,
-                status TEXT NOT NULL DEFAULT 'synced',
+                name TEXT NOT NULL,
+                command TEXT NOT NULL,
+                description TEXT,
                 created_at REAL NOT NULL,
-                synced_at REAL,
-                error TEXT
+                updated_at REAL NOT NULL
             )
             """
         )
+        file_info = conn.execute("PRAGMA table_info(files)").fetchall()
+        file_columns = {row["name"] for row in file_info}
+        md5_col = next((row for row in file_info if row["name"] == "md5"), None)
+        files_ddl = """
+            CREATE TABLE files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                object_key TEXT NOT NULL,
+                filename TEXT,
+                md5 TEXT,
+                size INTEGER NOT NULL DEFAULT 0,
+                bucket TEXT NOT NULL DEFAULT '',
+                source_url TEXT,
+                uploaded INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                script_id INTEGER,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                synced_at REAL,
+                error TEXT
+            )
+        """
+        if md5_col is not None and md5_col["notnull"] == 1:
+            # 旧版 files 表：md5 NOT NULL。重建为可空（pending 记录先无 md5），并保留已有数据。
+            conn.execute("DROP INDEX IF EXISTS idx_files_md5")
+            conn.execute("DROP INDEX IF EXISTS idx_files_job")
+            conn.execute("ALTER TABLE files RENAME TO files_old")
+            old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(files_old)")}
+
+            def src(name: str, fallback: str) -> str:
+                return name if name in old_columns else fallback
+
+            conn.execute(files_ddl)
+            empty_bucket = "''"
+            conn.execute(
+                "INSERT INTO files "
+                "(id, job_id, object_key, filename, md5, size, bucket, source_url, "
+                " uploaded, status, script_id, created_at, updated_at, synced_at, error) "
+                f"SELECT id, {src('job_id', 'NULL')}, object_key, filename, md5, size, "
+                f"{src('bucket', empty_bucket)}, source_url, {src('uploaded', '0')}, status, "
+                f"{src('script_id', 'NULL')}, created_at, {src('updated_at', 'created_at')}, "
+                "synced_at, error FROM files_old"
+            )
+            conn.execute("DROP TABLE files_old")
+        else:
+            conn.execute(files_ddl.replace("CREATE TABLE files", "CREATE TABLE IF NOT EXISTS files", 1))
+            for name, definition in (
+                ("job_id", "INTEGER"),
+                ("md5", "TEXT"),
+                ("bucket", "TEXT NOT NULL DEFAULT ''"),
+                ("uploaded", "INTEGER NOT NULL DEFAULT 0"),
+                ("script_id", "INTEGER"),
+                ("updated_at", "REAL"),
+            ):
+                if name not in file_columns:
+                    conn.execute(f"ALTER TABLE files ADD COLUMN {name} {definition}")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_md5 ON files(md5)")
-        file_columns = {row["name"] for row in conn.execute("PRAGMA table_info(files)")}
-        if "filename" not in file_columns:
-            conn.execute("ALTER TABLE files ADD COLUMN filename TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_job ON files(job_id)")
+        conn.execute(
+            "UPDATE files SET uploaded=1, status='synced', "
+            "updated_at=COALESCE(updated_at, created_at), "
+            "bucket=COALESCE(NULLIF(bucket, ''), ?) WHERE uploaded=1 OR status='synced'",
+            (os.environ.get("B2_BUCKET", ""),),
+        )
 
 
 def recent_jobs(limit: int = MAX_JOBS_SHOWN) -> list[dict]:
@@ -412,7 +468,10 @@ def hash_file(path: Path) -> str:
 def ensure_unique_md5(md5: str, job_id: int) -> bool:
     """md5 已存在时跳过上传并给任务加备注，返回是否为新文件。"""
     with get_db() as conn:
-        row = conn.execute("SELECT object_key FROM files WHERE md5=?", (md5,)).fetchone()
+        row = conn.execute(
+            "SELECT object_key FROM files WHERE md5=? AND job_id IS NOT ?",
+            (md5, job_id),
+        ).fetchone()
     if row is not None:
         with get_db() as conn:
             conn.execute(
@@ -431,15 +490,43 @@ def verify_object(object_key: str, size: int) -> None:
         raise OSError(f"上传校验失败：bucket 中 {actual} 字节，本地 {size} 字节")
 
 
-def insert_file_record(
-    object_key: str, filename: str | None, md5: str, size: int, source_url: str | None = None
+def insert_file_pending(
+    *,
+    job_id: int,
+    object_key: str,
+    filename: str,
+    size: int,
+    source_url: str | None = None,
+    script_id: int | None = None,
 ) -> None:
+    """提交任务时先登记一条 pending 记录，后续由 worker 逐步更新。"""
+    now = time.time()
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO files (object_key, filename, md5, size, source_url, status, created_at, synced_at) "
-            "VALUES (?, ?, ?, ?, ?, 'synced', ?, ?)",
-            (object_key, filename, md5, size, source_url, time.time(), time.time()),
+            "INSERT INTO files (job_id, object_key, filename, size, bucket, source_url, script_id, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (
+                job_id,
+                object_key,
+                filename,
+                size,
+                os.environ.get("B2_BUCKET", ""),
+                source_url,
+                script_id,
+                now,
+                now,
+            ),
         )
+
+
+def update_file_by_job(job_id: int, **fields) -> None:
+    if not fields:
+        return
+    fields["updated_at"] = time.time()
+    sets = ", ".join(f"{name}=?" for name in fields)
+    values = list(fields.values()) + [job_id]
+    with get_db() as conn:
+        conn.execute(f"UPDATE files SET {sets} WHERE job_id=?", values)
 
 
 def sync_to_bucket(
@@ -451,12 +538,21 @@ def sync_to_bucket(
     filename: str | None = None,
     source_url: str | None = None,
 ) -> bool:
-    """上传到 bucket 并登记 files 记录；md5 重复时跳过，返回是否真正上传。"""
+    """上传到 bucket 并更新 files 记录；md5 重复时删除 pending 记录并跳过。"""
     if not ensure_unique_md5(md5, job_id):
+        with get_db() as conn:
+            conn.execute("DELETE FROM files WHERE job_id=?", (job_id,))
         return False
+    update_file_by_job(job_id, size=size, md5=md5)
     upload_to_bucket(source_path, object_key, job_id, size)
     verify_object(object_key, size)
-    insert_file_record(object_key, filename, md5, size, source_url)
+    now = time.time()
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE files SET md5=?, size=?, uploaded=1, status='synced', synced_at=?, updated_at=? "
+            "WHERE job_id=?",
+            (md5, size, now, now, job_id),
+        )
     return True
 
 
@@ -506,6 +602,7 @@ def process_job(job_id: int) -> None:
             if kind == "fetch":
                 source_path, size, md5 = fetch_url_to_temp(source, job_id)
                 if destination:
+                    update_file_by_job(job_id, size=size, md5=md5)
                     dest = Path(destination)
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(source_path), dest)
@@ -524,6 +621,7 @@ def process_job(job_id: int) -> None:
             )
         emit_job_update(job_id)
     except (BotoCoreError, ClientError, OSError, ValueError, TimeoutError, TypeError) as exc:
+        update_file_by_job(job_id, status="failed", error=str(exc))
         with get_db() as conn:
             conn.execute(
                 "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
@@ -553,6 +651,7 @@ def recover_jobs() -> None:
         interrupted = conn.execute("SELECT * FROM jobs WHERE status='uploading'").fetchall()
         for row in interrupted:
             cleanup_job_temp(row["id"], row["kind"], row["destination"])
+            update_file_by_job(row["id"], status="failed", error="服务重启，任务中断")
             conn.execute(
                 "UPDATE jobs SET status='failed', error='服务重启，任务中断，请重新提交', "
                 "finished_at=? WHERE id=?",
@@ -593,6 +692,12 @@ def cleanup_stale_multipart(max_age_hours: float = 24.0) -> None:
 def recent_files(limit: int = 50) -> list[dict]:
     with get_db() as conn:
         rows = conn.execute("SELECT * FROM files ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def recent_scripts() -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM scripts ORDER BY id DESC").fetchall()
     return [dict(row) for row in rows]
 
 
@@ -733,6 +838,7 @@ def index():
         list_error = str(exc)
 
     server_root_text, server_files = list_server_files()
+    scripts = recent_scripts()
     return render_template(
         "index.html",
         apikey=apikey,
@@ -744,6 +850,8 @@ def index():
         server_root=server_root_text,
         server_files=server_files,
         synced_files=recent_files(),
+        scripts=scripts,
+        scripts_by_id={script["id"]: script["name"] for script in scripts},
         bucket_private=BUCKET_PRIVATE,
         bucket_private_note=BUCKET_PRIVATE_NOTE,
         format_bytes=format_bytes,
@@ -771,6 +879,7 @@ def upload():
 
     filename = Path(file.filename.replace("\\", "/")).name
     object_key = uuid_object_key(prefix, filename)
+    script_id = request.form.get("script_id", type=int)
     incoming = UPLOAD_DIR / f"incoming-{secrets.token_hex(8)}.part"
 
     try:
@@ -786,7 +895,14 @@ def upload():
             )
             job_id = cursor.lastrowid
         os.replace(incoming, UPLOAD_DIR / f"{job_id}.part")
-    except (OSError, ValueError) as exc:
+        insert_file_pending(
+            job_id=job_id,
+            object_key=object_key,
+            filename=filename,
+            size=size,
+            script_id=script_id,
+        )
+    except (OSError, ValueError, sqlite3.Error) as exc:
         incoming.unlink(missing_ok=True)
         flash(f"接收文件失败: {exc}", "error")
         return redirect(url_for("index", apikey=apikey))
@@ -821,12 +937,20 @@ def server_upload():
 
     object_key = uuid_object_key(prefix, source.name)
     size = source.stat().st_size
+    script_id = request.form.get("script_id", type=int)
     job_id = insert_job(
         kind="upload",
         filename=source.name,
         object_key=object_key,
         size=size,
         source=str(source),
+    )
+    insert_file_pending(
+        job_id=job_id,
+        object_key=object_key,
+        filename=source.name,
+        size=size,
+        script_id=script_id,
     )
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
@@ -897,6 +1021,7 @@ def url_upload():
     target = (request.form.get("target") or "bucket").strip()
     destination = None
     object_key = ""
+    script_id = request.form.get("script_id", type=int)
     if target == "server":
         raw_destination = (request.form.get("destination") or "").strip()
         try:
@@ -925,6 +1050,15 @@ def url_upload():
         source=url,
         destination=str(destination) if destination else None,
     )
+    if not destination:
+        insert_file_pending(
+            job_id=job_id,
+            object_key=object_key,
+            filename=filename,
+            size=0,
+            source_url=url,
+            script_id=script_id,
+        )
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
     if destination:
@@ -1024,6 +1158,43 @@ def api_objects():
     except (BotoCoreError, ClientError) as exc:
         return jsonify({"error": str(exc)}), 502
     return jsonify({"prefix": prefix, "objects": objects})
+
+
+@app.post("/scripts")
+def add_script():
+    blocked = require_auth()
+    if blocked:
+        return blocked
+    apikey = request.args.get("apikey", "")
+    name = (request.form.get("name") or "").strip()
+    command = (request.form.get("command") or "").strip()
+    description = (request.form.get("description") or "").strip()
+    if not name or not command:
+        flash("脚本名称和命令必填。", "error")
+        return redirect(url_for("index", apikey=apikey))
+    now = time.time()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO scripts (name, command, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (name, command, description or None, now, now),
+        )
+    flash(f"脚本「{name}」已添加。", "ok")
+    return redirect(url_for("index", apikey=apikey))
+
+
+@app.post("/scripts/delete")
+def delete_script():
+    blocked = require_auth()
+    if blocked:
+        return blocked
+    apikey = request.args.get("apikey", "")
+    script_id = request.form.get("id", type=int)
+    if script_id:
+        with get_db() as conn:
+            conn.execute("DELETE FROM scripts WHERE id=?", (script_id,))
+            conn.execute("UPDATE files SET script_id=NULL WHERE script_id=?", (script_id,))
+        flash("脚本已删除。", "ok")
+    return redirect(url_for("index", apikey=apikey))
 
 
 def main() -> int:

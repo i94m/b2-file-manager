@@ -88,6 +88,15 @@
                    class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
           </div>
+          <div>
+            <label for="script-upload" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">处理脚本（可选）</label>
+            <select name="script_id" id="script-upload"
+                    class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
+                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+              <option value="">不使用脚本</option>
+              {% for s in scripts %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}
+            </select>
+          </div>
           <button type="submit"
                   class="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition
                          hover:bg-blue-700 active:scale-[0.99]">
@@ -112,6 +121,15 @@
                    placeholder="例如 backups/2026"
                    class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+          </div>
+          <div>
+            <label for="script-server" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">处理脚本（可选）</label>
+            <select name="script_id" id="script-server"
+                    class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
+                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+              <option value="">不使用脚本</option>
+              {% for s in scripts %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}
+            </select>
           </div>
           <button type="submit"
                   class="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition
@@ -166,6 +184,15 @@
                    placeholder="例如 /data/downloads/file.zip"
                    class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+          </div>
+          <div>
+            <label for="script-url" class="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">处理脚本（可选）</label>
+            <select name="script_id" id="script-url"
+                    class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
+                           focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+              <option value="">不使用脚本</option>
+              {% for s in scripts %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}
+            </select>
           </div>
           <button type="submit"
                   class="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition
@@ -236,6 +263,71 @@
     </div>
   </section>
 
+  <!-- 处理脚本 -->
+  <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
+    <div class="mb-4 flex flex-wrap items-center gap-2">
+      <h2 class="text-lg font-semibold">处理脚本</h2>
+      <span class="rounded-full bg-gray-100 dark:bg-gray-800 px-2.5 py-0.5 text-xs font-medium text-gray-500 dark:text-gray-400">{{ scripts|length }} 个</span>
+    </div>
+
+    <form action="{{ url_for('add_script', apikey=apikey) }}" method="post"
+          class="mb-4 grid gap-3 md:grid-cols-4">
+      <input type="text" name="name" required placeholder="脚本名称，例如 解压处理"
+             class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
+                    focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+      <input type="text" name="command" required placeholder="命令/路径，例如 /opt/scripts/process.sh"
+             class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
+                    focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+      <input type="text" name="description" placeholder="说明（可选）"
+             class="w-full rounded-lg border border-gray-300 bg-white dark:border-gray-700 dark:bg-gray-800 px-3 py-2 text-sm shadow-sm outline-none transition
+                    focus:border-blue-500 focus:ring-2 focus:ring-blue-100">
+      <button type="submit"
+              class="inline-flex items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition
+                     hover:bg-blue-700 active:scale-[0.99]">
+        添加脚本
+      </button>
+    </form>
+
+    {% if scripts %}
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">
+              <th class="py-2.5 pr-4 font-medium">名称</th>
+              <th class="py-2.5 pr-4 font-medium">命令</th>
+              <th class="py-2.5 pr-4 font-medium">说明</th>
+              <th class="py-2.5 pr-4 font-medium">创建时间</th>
+              <th class="py-2.5 text-right font-medium">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for s in scripts %}
+            <tr class="border-b border-gray-50 dark:border-gray-800/60 transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800/60">
+              <td class="py-2.5 pr-4 font-medium text-gray-700 dark:text-gray-200">{{ s.name }}</td>
+              <td class="max-w-md truncate py-2.5 pr-4 font-mono text-xs text-gray-500 dark:text-gray-400" title="{{ s.command }}">{{ s.command }}</td>
+              <td class="max-w-xs truncate py-2.5 pr-4 text-gray-500 dark:text-gray-400" title="{{ s.description or '' }}">{{ s.description or '—' }}</td>
+              <td class="whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400">{{ format_time(s.created_at) }}</td>
+              <td class="py-2.5 text-right">
+                <form action="{{ url_for('delete_script', apikey=apikey) }}" method="post" class="inline">
+                  <input type="hidden" name="id" value="{{ s.id }}">
+                  <button type="submit"
+                          class="rounded-lg border border-red-200 bg-red-50 px-3 py-1.5 text-xs font-medium text-red-700 transition hover:bg-red-100">
+                    删除
+                  </button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="rounded-xl border-2 border-dashed border-gray-200 dark:border-gray-800 py-8 text-center text-sm text-gray-400 dark:text-gray-500">
+        还没有脚本，添加后可在上传任务中选择关联
+      </div>
+    {% endif %}
+  </section>
+
   <!-- 已同步文件 -->
   <section class="mb-6 rounded-2xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 p-6 shadow-sm sm:p-7">
     <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -255,8 +347,12 @@
               <th class="py-2.5 pr-4 font-medium">原始名称</th>
               <th class="py-2.5 pr-4 font-medium">MD5</th>
               <th class="py-2.5 pr-4 text-right font-medium">大小</th>
-              <th class="py-2.5 pr-4 font-medium">同步时间</th>
-              <th class="py-2.5 font-medium">来源</th>
+              <th class="py-2.5 pr-4 font-medium">Bucket</th>
+              <th class="py-2.5 pr-4 font-medium">状态</th>
+              <th class="py-2.5 pr-4 font-medium">脚本</th>
+              <th class="py-2.5 pr-4 font-medium">来源</th>
+              <th class="py-2.5 pr-4 font-medium">创建时间</th>
+              <th class="py-2.5 font-medium">更新时间</th>
             </tr>
           </thead>
           <tbody>
@@ -266,8 +362,20 @@
               <td class="max-w-xs truncate py-2.5 pr-4 text-gray-700 dark:text-gray-200" title="{{ f.filename or '' }}">{{ f.filename or '—' }}</td>
               <td class="py-2.5 pr-4 font-mono text-xs text-gray-500 dark:text-gray-400" title="{{ f.md5 }}">{{ f.md5[:8] }}…{{ f.md5[-6:] }}</td>
               <td class="whitespace-nowrap py-2.5 pr-4 text-right text-gray-500 dark:text-gray-400">{{ format_bytes(f.size) }}</td>
-              <td class="whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400">{{ format_time(f.synced_at) }}</td>
+              <td class="py-2.5 pr-4 font-mono text-xs text-gray-500 dark:text-gray-400">{{ f.bucket or '—' }}</td>
+              <td class="py-2.5 pr-4">
+                {% if f.uploaded %}
+                  <span class="inline-block rounded-full bg-green-100 px-2.5 py-0.5 text-xs font-medium text-green-700">已上传</span>
+                {% elif f.status == 'failed' %}
+                  <span class="inline-block rounded-full bg-red-100 px-2.5 py-0.5 text-xs font-medium text-red-700">失败</span>
+                {% else %}
+                  <span class="inline-block rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600">未上传</span>
+                {% endif %}
+              </td>
+              <td class="max-w-xs truncate py-2.5 pr-4 text-gray-500 dark:text-gray-400" title="{{ scripts_by_id.get(f.script_id, '') }}">{{ scripts_by_id.get(f.script_id, '—') }}</td>
               <td class="max-w-xs truncate py-2.5 font-mono text-xs text-gray-400 dark:text-gray-500" title="{{ f.source_url or '' }}">{{ f.source_url or '—' }}</td>
+              <td class="whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400">{{ format_time(f.created_at) }}</td>
+              <td class="whitespace-nowrap py-2.5 text-gray-500 dark:text-gray-400">{{ format_time(f.updated_at) }}</td>
             </tr>
           {% endfor %}
           </tbody>
