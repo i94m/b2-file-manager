@@ -24,7 +24,7 @@ import {
   FetchUrlDialog,
   UploadDialog,
 } from "@/components/action-dialogs"
-import { JobStatusBar } from "@/components/job-status-bar"
+import { ConnectionStatus, JobsTable } from "@/components/job-status-bar"
 import { ServerFilesSection } from "@/components/server-files-section"
 
 function ThemeToggle() {
@@ -165,6 +165,7 @@ function AppShell() {
                 <span className="size-1.5 rounded-full bg-blue-500" />
                 Bucket: <code className="font-mono font-medium text-foreground">{bucket || "…"}</code>
               </span>
+              <ConnectionStatus />
             </div>
           </div>
           <ThemeToggle />
@@ -231,9 +232,9 @@ function AppShell() {
           onDeleted={loadFiles}
         />
 
-        {/* 任务状态栏 */}
+        {/* 任务记录表格 */}
         <div className="mt-4">
-          <JobStatusBar />
+          <JobsTable />
         </div>
 
         {/* 本地文件（SERVER_FILE_ROOT） */}
