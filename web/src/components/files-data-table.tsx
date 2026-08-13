@@ -28,11 +28,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 
 /** 骨架行各列的宽度类（按 columns 顺序对齐，模拟真实数据宽度）。 */
 const SKELETON_WIDTHS = [
-  "w-32",   // 对象名 (UUID)
   "w-28",   // 原始名称
-  "w-40",   // MD5
   "w-16",   // 大小（右对齐）
-  "w-16",   // Bucket
   "w-12",   // 本地
   "w-12",   // 云
   "w-16",   // 脚本
@@ -124,26 +121,9 @@ export function FilesDataTable({
   const columns = React.useMemo<ColumnDef<FileItem>[]>(
     () => [
       {
-        accessorKey: "object_key",
-        header: "对象名 (UUID)",
-        cell: ({ row }) => (
-          <Truncate
-            value={row.original.object_key}
-            className="font-mono text-xs text-muted-foreground"
-          />
-        ),
-      },
-      {
         accessorKey: "filename",
         header: "原始名称",
         cell: ({ row }) => <Truncate value={row.original.filename} />,
-      },
-      {
-        accessorKey: "md5",
-        header: "MD5",
-        cell: ({ row }) => (
-          <Truncate value={row.original.md5} className="font-mono text-[11px] text-muted-foreground" />
-        ),
       },
       {
         accessorKey: "size",
@@ -152,15 +132,6 @@ export function FilesDataTable({
           <div className="text-right tabular-nums text-muted-foreground">
             {formatBytes(row.original.size)}
           </div>
-        ),
-      },
-      {
-        accessorKey: "bucket",
-        header: "Bucket",
-        cell: ({ row }) => (
-          <span className="font-mono text-xs text-muted-foreground">
-            {row.original.bucket || "—"}
-          </span>
         ),
       },
       {
@@ -250,7 +221,7 @@ export function FilesDataTable({
                         className={cn(
                           "h-4",
                           SKELETON_WIDTHS[j] ?? "w-20",
-                          j === 3 && "ml-auto", // 大小列右对齐
+                          j === 1 && "ml-auto", // 大小列右对齐
                         )}
                       />
                     </TableCell>
