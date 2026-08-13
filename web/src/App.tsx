@@ -155,7 +155,7 @@ function AppShell() {
 
   return (
     <div className="min-h-screen bg-background">
-      <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6">
+      <main className="mx-auto max-w-[1600px] px-4 py-8 sm:px-6">
         {/* Header */}
         <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
           <div>
@@ -197,7 +197,7 @@ function AppShell() {
               <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
                 className="w-[28rem] pl-8"
-                placeholder="搜索文件名 / MD5 / 来源"
+                placeholder="搜索文件名 / 原始链接"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
               />

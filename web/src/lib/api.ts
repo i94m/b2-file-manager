@@ -1,4 +1,4 @@
-import type { AppInfo, Datasource, FilesResponse, ServerFilesResponse } from "./types"
+import type { AppInfo, Datasource, FileItem, FilesResponse, ServerFilesResponse } from "./types"
 
 /**
  * apikey 全程从 URL ?apikey= 取，不缓存到 localStorage。
@@ -129,6 +129,19 @@ export async function serverDownload(
   form.append("destination", destination)
   const res = await fetch("/server-download", { method: "POST", headers: headers(true), body: form })
   return handle<FormResult>(res)
+}
+
+/** PATCH /api/files/:id — 手动修改 本地/云存储 状态。 */
+export async function updateFile(
+  fileId: number,
+  data: { local_path?: string | null; uploaded?: boolean },
+): Promise<{ status: string; file_id: number; file: FileItem }> {
+  const res = await fetch(`/api/files/${fileId}`, {
+    method: "PATCH",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  })
+  return handle(res)
 }
 
 /** DELETE /api/files/:id — 删除文件记录（同时从 bucket 删除对象）。 */

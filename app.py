@@ -1707,7 +1707,7 @@ def api_files():
     查询参数：
         page      页码，从 1 起（默认 1）
         page_size 每页条数，1~200（默认 20）
-        q         可选，按 filename / object_key / source_url 模糊匹配
+        q         可选，按 filename / source_url 模糊匹配
         status    可选，按 status 精确过滤
 
     返回：
@@ -1731,9 +1731,9 @@ def api_files():
     if q:
         like = f"%{q}%"
         conditions.append(
-            "(filename LIKE ? OR object_key LIKE ? OR source_url LIKE ? OR md5 LIKE ?)"
+            "(filename LIKE ? OR source_url LIKE ?)"
         )
-        params.extend([like, like, like, like])
+        params.extend([like, like])
     if status:
         conditions.append("status = ?")
         params.append(status)
@@ -1826,6 +1826,55 @@ def api_delete_file(file_id: int):
         conn.execute("DELETE FROM files WHERE id=?", (file_id,))
 
     return jsonify({"deleted": True, "file_id": file_id})
+
+
+@app.patch("/api/files/<int:file_id>")
+def api_update_file(file_id: int):
+    """手动修改文件记录的 本地/云存储 状态。
+
+    请求体 JSON（均可选）：
+        local_path  非空字符串=标记为已存在本地（写入路径），null/空=标记不存在
+        uploaded    true=标记已上传云存储，false=标记未上传
+
+    返回：
+        {"status": "ok", "file_id": id, "file": {更新后的行}}
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    body = request.get_json(silent=True) or {}
+    fields: list[str] = []
+    params: list = []
+
+    if "local_path" in body:
+        val = body["local_path"]
+        if val:
+            fields.append("local_path = ?")
+            params.append(str(val))
+        else:
+            fields.append("local_path = NULL")
+    if "uploaded" in body:
+        fields.append("uploaded = ?")
+        params.append(1 if body["uploaded"] else 0)
+
+    if not fields:
+        return jsonify({"error": "没有可更新的字段"}), 400
+
+    fields.append("updated_at = ?")
+    params.append(time.time())
+    params.append(file_id)
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
+        conn.execute(
+            f"UPDATE files SET {', '.join(fields)} WHERE id = ?", params
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+
+    return jsonify({"status": "ok", "file_id": file_id, "file": dict(row)})
 
 
 @app.get("/api/objects")

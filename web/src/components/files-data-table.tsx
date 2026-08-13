@@ -6,12 +6,12 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Trash2 } from "lucide-react"
+import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Loader2, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { type Datasource, type FileItem } from "@/lib/types"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
-import { deleteFile, downloadServer, downloadUrl, uploadToCloud } from "@/lib/api"
+import { deleteFile, downloadServer, downloadUrl, updateFile, uploadToCloud } from "@/lib/api"
 import { useJobs } from "@/lib/use-jobs"
 import { JobProgressBadge } from "@/components/progress-cell"
 import { Button } from "@/components/ui/button"
@@ -30,14 +30,13 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 /** 骨架行各列的宽度类（按 columns 顺序对齐，模拟真实数据宽度）。 */
 const SKELETON_WIDTHS = [
   "w-4",    // select
-  "w-28",   // 原始名称
-  "w-16",   // 大小（右对齐）
-  "w-12",   // 本地
-  "w-12",   // 云
-  "w-16",   // 脚本
-  "w-32",   // 来源
-  "w-24",   // 创建时间
+  "w-16",   // 数据源
+  "w-28",   // 文件名称
+  "w-20",   // 大小（居中）
+  "w-16",   // 本地
+  "w-16",   // 云存储
   "w-8",    // 操作
+  "w-24",   // 创建时间
 ]
 
 interface FilesDataTableProps {
@@ -64,44 +63,125 @@ function Truncate({ value, className }: { value: string | null; className?: stri
   )
 }
 
-/** 本地 / 云存储 存在状态：绿色"已存在" / 红色"不存在"（失败时 hover 显示错误）。 */
-function PresenceLabel({ active, error }: { active: boolean; error?: string | null }) {
-  if (active) {
-    return <span className="text-xs font-medium text-emerald-600">已存在</span>
-  }
-  if (error) {
+/** 本地 / 云存储 存在状态：绿色"已存在" / 红色"不存在"。
+ *  传入 onToggle 时变为可点击按钮（hover 提示"点击切换状态"）。 */
+function PresenceLabel({
+  active,
+  error,
+  onToggle,
+  busy,
+}: {
+  active: boolean
+  error?: string | null
+  onToggle?: () => void
+  busy?: boolean
+}) {
+  const label = active ? "已存在" : "不存在"
+  const color = active ? "text-emerald-600" : "text-red-500"
+
+  if (onToggle) {
     return (
       <Tooltip>
         <TooltipTrigger asChild>
-          <span className="cursor-help text-xs font-medium text-red-500">不存在</span>
+          <button
+            type="button"
+            onClick={onToggle}
+            disabled={busy}
+            className="inline-flex items-center rounded px-1 py-0.5 transition-colors hover:bg-accent disabled:opacity-50"
+          >
+            {busy ? (
+              <Loader2 className="size-3 animate-spin text-muted-foreground" />
+            ) : (
+              <span className={cn("text-xs font-medium", color)}>{label}</span>
+            )}
+          </button>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs break-all">
+          {!active && error ? error : "点击切换状态"}
+        </TooltipContent>
+      </Tooltip>
+    )
+  }
+
+  if (!active && error) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className={cn("cursor-help text-xs font-medium", color)}>{label}</span>
         </TooltipTrigger>
         <TooltipContent className="max-w-xs break-all">{error}</TooltipContent>
       </Tooltip>
     )
   }
-  return <span className="text-xs font-medium text-red-500">不存在</span>
+  return <span className={cn("text-xs font-medium", color)}>{label}</span>
 }
 
-/** 本地列：正在下载/抓取时显示进度，否则显示存在状态文字。 */
-function LocalCell({ file }: { file: FileItem }) {
+/** 本地列：正在下载/抓取时显示进度，否则显示可点击的存在状态。 */
+function LocalCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void }) {
   const { jobs } = useJobs()
+  const [busy, setBusy] = React.useState(false)
   const job = file.job_id ? jobs[file.job_id] : undefined
   const active = job && (job.status === "uploading" || job.status === "queued") &&
     (job.kind === "fetch" || job.kind === "download")
   if (active) return <JobProgressBadge file={file} />
+
+  const handleToggle = async () => {
+    setBusy(true)
+    try {
+      await updateFile(file.id, {
+        local_path: file.local_path ? null : file.object_key,
+      })
+      toast.success(file.local_path ? "已标记为本地不存在" : "已标记为本地已存在")
+      onUpdated()
+    } catch (e) {
+      toast.error("修改失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const failed = file.status === "failed" && !file.local_path
-  return <PresenceLabel active={!!file.local_path} error={failed ? file.error : undefined} />
+  return (
+    <PresenceLabel
+      active={!!file.local_path}
+      error={failed ? file.error : undefined}
+      onToggle={handleToggle}
+      busy={busy}
+    />
+  )
 }
 
-/** 云存储列：正在上传时显示进度，否则显示存在状态文字。 */
-function CloudCell({ file }: { file: FileItem }) {
+/** 云存储列：正在上传时显示进度，否则显示可点击的存在状态。 */
+function CloudCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void }) {
   const { jobs } = useJobs()
+  const [busy, setBusy] = React.useState(false)
   const job = file.job_id ? jobs[file.job_id] : undefined
   const active = job && (job.status === "uploading" || job.status === "queued") &&
     job.kind === "upload"
   if (active) return <JobProgressBadge file={file} />
+
+  const handleToggle = async () => {
+    setBusy(true)
+    try {
+      await updateFile(file.id, { uploaded: file.uploaded !== 1 })
+      toast.success(file.uploaded === 1 ? "已标记为云存储未上传" : "已标记为云存储已上传")
+      onUpdated()
+    } catch (e) {
+      toast.error("修改失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const failed = file.status === "failed" && !!file.local_path && !file.uploaded
-  return <PresenceLabel active={file.uploaded === 1} error={failed ? file.error : undefined} />
+  return (
+    <PresenceLabel
+      active={file.uploaded === 1}
+      error={failed ? file.error : undefined}
+      onToggle={handleToggle}
+      busy={busy}
+    />
+  )
 }
 
 export function FilesDataTable({
@@ -143,30 +223,6 @@ export function FilesDataTable({
         ),
       },
       {
-        accessorKey: "filename",
-        header: "原始名称",
-        cell: ({ row }) => <Truncate value={row.original.filename} />,
-      },
-      {
-        accessorKey: "size",
-        header: () => <div className="text-right">大小</div>,
-        cell: ({ row }) => (
-          <div className="text-right tabular-nums text-muted-foreground">
-            {formatBytes(row.original.size)}
-          </div>
-        ),
-      },
-      {
-        id: "local",
-        header: "本地",
-        cell: ({ row }) => <LocalCell file={row.original} />,
-      },
-      {
-        id: "cloud",
-        header: "云存储",
-        cell: ({ row }) => <CloudCell file={row.original} />,
-      },
-      {
         accessorKey: "datasource_id",
         header: "数据源",
         cell: ({ row }) => {
@@ -177,28 +233,59 @@ export function FilesDataTable({
         },
       },
       {
-        accessorKey: "source_url",
-        header: "来源",
+        accessorKey: "filename",
+        header: "文件名称",
+        cell: ({ row }) => {
+          const f = row.original
+          if (!f.source_url) {
+            return <Truncate value={f.filename} />
+          }
+          return (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="block max-w-[28rem] truncate cursor-default">
+                  {f.filename}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent className="max-w-sm break-all font-mono text-xs">
+                {f.source_url}
+              </TooltipContent>
+            </Tooltip>
+          )
+        },
+      },
+      {
+        accessorKey: "size",
+        header: () => <div className="min-w-[5rem] text-center">大小</div>,
         cell: ({ row }) => (
-          <Truncate
-            value={row.original.source_url}
-            className="font-mono text-xs text-muted-foreground"
-          />
+          <div className="text-center tabular-nums text-muted-foreground">
+            {formatBytes(row.original.size)}
+          </div>
         ),
       },
       {
+        id: "local",
+        header: () => <div className="min-w-[4rem] text-center">本地</div>,
+        cell: ({ row }) => <div className="flex justify-center"><LocalCell file={row.original} onUpdated={onDeleted} /></div>,
+      },
+      {
+        id: "cloud",
+        header: () => <div className="min-w-[4rem] text-center">云存储</div>,
+        cell: ({ row }) => <div className="flex justify-center"><CloudCell file={row.original} onUpdated={onDeleted} /></div>,
+      },
+      {
+        id: "actions",
+        header: () => <div className="text-center">操作</div>,
+        cell: ({ row }) => <RowActions file={row.original} onDeleted={onDeleted} />,
+      },
+      {
         accessorKey: "created_at",
-        header: "创建时间",
+        header: () => <div className="text-right">创建时间</div>,
         cell: ({ row }) => (
           <span className="whitespace-nowrap text-muted-foreground">
             {formatTime(row.original.created_at)}
           </span>
         ),
-      },
-      {
-        id: "actions",
-        header: () => <div className="text-right">操作</div>,
-        cell: ({ row }) => <RowActions file={row.original} onDeleted={onDeleted} />,
       },
     ],
     [datasourceName, onDeleted],
@@ -263,7 +350,13 @@ export function FilesDataTable({
             <HardDriveDownload className="size-3.5" />
             批量下载到服务器{downloadable.length > 0 && `（${downloadable.length}）`}
           </Button>
-          <Button size="sm" variant="outline" onClick={batchUpload} disabled={batchBusy}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={batchUpload}
+            disabled={batchBusy || uploadable.length === 0}
+            title={uploadable.length === 0 ? "需先下载到服务器" : undefined}
+          >
             <CloudUpload className="size-3.5" />
             批量上传到云{uploadable.length > 0 && `（${uploadable.length}）`}
           </Button>
@@ -297,7 +390,7 @@ export function FilesDataTable({
                         className={cn(
                           "h-4",
                           SKELETON_WIDTHS[j] ?? "w-20",
-                          j === 2 && "ml-auto", // 大小列右对齐
+                          j === 3 && "mx-auto", // 大小列居中
                         )}
                       />
                     </TableCell>
@@ -398,7 +491,7 @@ function RowActions({ file, onDeleted }: { file: FileItem; onDeleted: () => void
   }
 
   return (
-    <div className="flex items-center justify-end gap-1">
+    <div className="flex items-center justify-center gap-1">
       {!file.local_path && (
         <Button
           variant="ghost"
