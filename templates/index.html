@@ -14,6 +14,10 @@
       document.documentElement.classList.toggle('dark', dark);
     })();
   </script>
+  <style>
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+  </style>
 </head>
 <body class="min-h-screen bg-gray-50 dark:bg-gray-950 text-gray-900 dark:text-gray-100">
 <main class="mx-auto max-w-6xl px-4 py-10 sm:px-6">
@@ -532,12 +536,18 @@
                 <td class="max-w-xl truncate py-2.5 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200">{{ obj.key }}</td>
                 <td class="whitespace-nowrap py-2.5 pr-4 text-right text-gray-500 dark:text-gray-400">{{ format_bytes(obj.size) }}</td>
                 <td class="whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400">{{ format_time(obj.last_modified) }}</td>
-                <td class="py-2.5 text-right">
+                <td class="py-2.5 text-right whitespace-nowrap">
                   <a href="{{ url_for('download', apikey=apikey, key=obj.key) }}"
                      class="inline-flex items-center gap-1 rounded-lg bg-gray-800 dark:bg-gray-700 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition
                             hover:bg-gray-900 dark:hover:bg-gray-600">
                     下载
                   </a>
+                  <button type="button" data-delete-key="{{ obj.key }}"
+                          style="margin-left:0.25rem;border-radius:0.5rem;border:1px solid var(--color-red-300,#fca5a5);background:transparent;padding:0.375rem 0.75rem;font-size:0.75rem;font-weight:500;color:var(--color-red-600,#dc2626);cursor:pointer;transition:background .15s"
+                          onmouseover="this.style.background='rgba(220,38,38,0.08)'"
+                          onmouseout="this.style.background='transparent'">
+                    删除
+                  </button>
                 </td>
               </tr>
             {% endfor %}
@@ -561,18 +571,18 @@
 <script>
 const jobsEl = document.getElementById('jobs');
 const apikey = jobsEl.dataset.apikey;
-const STATUS_TEXT = {queued: '排队中', uploading: '上传中', done: '完成', failed: '失败'};
-const STATUS_CLASS = {
-  queued: 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300',
-  uploading: 'bg-blue-100 text-blue-700',
-  done: 'bg-green-100 text-green-700',
-  failed: 'bg-red-100 text-red-700'
+const STATUS_TEXT = {queued: '排队中', uploading: '进行中', done: '已完成', failed: '失败'};
+const STATUS_STYLE = {
+  queued:   {bg: 'bg-gray-100',   color: 'text-gray-600',   dot: '#9ca3af'},
+  uploading:{bg: 'bg-blue-100',    color: 'text-blue-700',   dot: '#3b82f6'},
+  done:     {bg: 'bg-green-100',   color: 'text-green-700',  dot: '#22c55e'},
+  failed:   {bg: 'bg-red-100',     color: 'text-red-700',    dot: '#ef4444'}
 };
 const KIND_TEXT = {upload: '上传', fetch: '抓取', download: '下载'};
-const KIND_CLASS = {
-  upload: 'bg-blue-100 text-blue-700',
-  fetch: 'bg-purple-100 text-purple-700',
-  download: 'bg-teal-100 text-teal-700'
+const KIND_STYLE = {
+  upload:   {bg: 'bg-blue-100',    color: 'text-blue-700'},
+  fetch:    {bg: 'bg-purple-100',  color: 'text-purple-700'},
+  download: {bg: 'bg-teal-100',    color: 'text-teal-700'}
 };
 const DL_STATUS_TEXT = {downloading: '下载中', done: '完成', failed: '失败'};
 const DL_STATUS_CLASS = {
@@ -583,13 +593,59 @@ const DL_STATUS_CLASS = {
 let jobs = [];
 let downloads = [];
 
+/* 速度追踪：记录每个 job 上次的 progress 快照，用于计算传输速率 */
+const _speedTrack = {};  // {jobId: {progress, time, rate}}
+
+function trackSpeed(job) {
+  const now = Date.now();
+  const track = _speedTrack[job.id];
+  if (!track) {
+    _speedTrack[job.id] = {progress: job.progress, time: now, rate: 0};
+    return 0;
+  }
+  const dt = (now - track.time) / 1000;
+  if (dt < 1.5) return track.rate;  // 太短时间内不更新，避免抖动
+  const dProgress = job.progress - track.progress;
+  const rate = dProgress > 0 ? dProgress / dt : 0;
+  _speedTrack[job.id] = {progress: job.progress, time: now, rate: rate};
+  return rate;
+}
+
 function fmtSize(bytes) {
+  if (!bytes || bytes < 0) return '—';
   if (bytes < 1024) return bytes + ' B';
   const units = ['KiB', 'MiB', 'GiB', 'TiB'];
   let value = bytes;
   let i = -1;
   do { value /= 1024; i++; } while (value >= 1024 && i < units.length - 1);
   return value.toFixed(2) + ' ' + units[i];
+}
+
+function fmtRate(bytesPerSec) {
+  if (!bytesPerSec || bytesPerSec < 1) return '—';
+  if (bytesPerSec < 1024) return Math.round(bytesPerSec) + ' B/s';
+  const units = ['KiB/s', 'MiB/s', 'GiB/s'];
+  let value = bytesPerSec;
+  let i = -1;
+  do { value /= 1024; i++; } while (value >= 1024 && i < units.length - 1);
+  return value.toFixed(1) + ' ' + units[i];
+}
+
+function fmtEta(seconds) {
+  if (!seconds || seconds < 0 || !isFinite(seconds)) return '—';
+  if (seconds < 60) return Math.ceil(seconds) + ' 秒';
+  if (seconds < 3600) return Math.ceil(seconds / 60) + ' 分';
+  return (seconds / 3600).toFixed(1) + ' 小时';
+}
+
+function fmtElapsed(startedAt) {
+  if (!startedAt) return '—';
+  const sec = Math.floor(Date.now() / 1000 - startedAt);
+  if (sec < 60) return sec + ' 秒';
+  if (sec < 3600) return Math.floor(sec / 60) + ' 分 ' + (sec % 60) + ' 秒';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return h + ' 时 ' + m + ' 分';
 }
 
 function fmtTime(epoch) {
@@ -601,100 +657,170 @@ function fmtTime(epoch) {
 }
 
 function emptyState(el, text) {
-  el.innerHTML = '<p class="py-3 text-center text-sm text-gray-400 dark:text-gray-500">' + text + '</p>';
+  el.innerHTML = '<p style="padding:0.75rem 0;text-align:center;font-size:0.875rem;color:#9ca3af">' + text + '</p>';
 }
 
 function renderJobs() {
   if (!jobs.length) { emptyState(jobsEl, '暂无上传任务。'); return; }
-  const table = document.createElement('table');
-  table.className = 'w-full text-sm';
-  table.innerHTML =
-    '<thead><tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">' +
-    '<th class="py-2.5 pr-4 font-medium">类型</th>' +
-    '<th class="py-2.5 pr-4 font-medium">文件</th>' +
-    '<th class="py-2.5 pr-4 font-medium">对象名</th>' +
-    '<th class="py-2.5 pr-4 font-medium">大小</th>' +
-    '<th class="py-2.5 pr-4 font-medium">状态</th>' +
-    '<th class="py-2.5 font-medium">进度</th></tr></thead>';
-  const tbody = document.createElement('tbody');
 
-  for (const job of jobs) {
-    const tr = document.createElement('tr');
-    tr.className = 'border-b border-gray-50 dark:border-gray-800/60 align-top transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800/60';
-    const pct = job.size ? Math.min(100, Math.round(job.progress * 100 / job.size)) : 0;
+  /* 按状态分组：进行中/排队 → 活跃区；完成/失败 → 历史区 */
+  const active = jobs.filter(j => j.status === 'uploading' || j.status === 'queued');
+  const done   = jobs.filter(j => j.status === 'done' || j.status === 'failed');
 
-    const tdKind = document.createElement('td');
-    tdKind.className = 'py-2.5 pr-4';
-    const kindBadge = document.createElement('span');
-    kindBadge.className = 'inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ' +
-      (KIND_CLASS[job.kind] || 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300');
-    kindBadge.textContent = KIND_TEXT[job.kind] || job.kind || '上传';
-    tdKind.appendChild(kindBadge);
+  const wrapper = document.createElement('div');
 
-    const tdFile = document.createElement('td');
-    tdFile.className = 'py-2.5 pr-4';
-    tdFile.textContent = job.filename;
+  /* ---- 活跃任务：卡片式 ---- */
+  if (active.length) {
+    const activeWrap = document.createElement('div');
+    activeWrap.style.cssText = 'display:flex;flex-direction:column;gap:0.75rem;margin-bottom:1rem';
 
-    const tdKey = document.createElement('td');
-    tdKey.className = 'max-w-xs truncate py-2.5 pr-4 font-mono text-xs text-gray-600 dark:text-gray-300';
-    tdKey.textContent = job.object_key;
-    const pathLine = job.source || job.destination;
-    if (pathLine) {
-      const sub = document.createElement('p');
-      sub.className = 'mt-0.5 max-w-xs truncate text-[10px] text-gray-400 dark:text-gray-500';
-      sub.textContent = pathLine;
-      tdKey.appendChild(sub);
+    for (const job of active) {
+      const card = renderJobCard(job);
+      activeWrap.appendChild(card);
     }
-
-    const tdSize = document.createElement('td');
-    tdSize.className = 'whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400';
-    tdSize.textContent = fmtSize(job.size);
-
-    const tdStatus = document.createElement('td');
-    tdStatus.className = 'py-2.5 pr-4';
-    const badge = document.createElement('span');
-    badge.className = 'inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ' +
-      (STATUS_CLASS[job.status] || 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300');
-    badge.textContent = STATUS_TEXT[job.status] || job.status;
-    tdStatus.appendChild(badge);
-    if (job.status === 'failed' && job.error) {
-      const err = document.createElement('p');
-      err.className = 'mt-1 max-w-xs text-xs text-red-600';
-      err.textContent = job.error;
-      tdStatus.appendChild(err);
-    }
-    if (job.note) {
-      const note = document.createElement('p');
-      note.className = 'mt-1 max-w-xs text-xs text-amber-600';
-      note.textContent = job.note;
-      tdStatus.appendChild(note);
-    }
-
-    const tdProg = document.createElement('td');
-    tdProg.className = 'py-2.5';
-    if (job.status === 'done') {
-      tdProg.textContent = '100%';
-    } else if (job.status === 'failed') {
-      tdProg.textContent = pct + '%';
-    } else {
-      const bar = document.createElement('div');
-      bar.className = 'h-1.5 w-32 overflow-hidden rounded-full bg-gray-100 dark:bg-gray-800';
-      const fill = document.createElement('div');
-      fill.className = 'h-full rounded-full bg-blue-500';
-      fill.style.width = pct + '%';
-      bar.appendChild(fill);
-      tdProg.appendChild(bar);
-      const label = document.createElement('p');
-      label.className = 'mt-1 text-xs text-gray-400 dark:text-gray-500';
-      label.textContent = pct + '%';
-      tdProg.appendChild(label);
-    }
-
-    tr.append(tdKind, tdFile, tdKey, tdSize, tdStatus, tdProg);
-    tbody.appendChild(tr);
+    wrapper.appendChild(activeWrap);
   }
-  table.appendChild(tbody);
-  jobsEl.replaceChildren(table);
+
+  /* ---- 历史任务：紧凑表格 ---- */
+  if (done.length) {
+    const histLabel = document.createElement('p');
+    histLabel.style.cssText = 'margin-bottom:0.5rem;font-size:0.75rem;font-weight:600;color:#9ca3af;text-transform:uppercase;letter-spacing:0.05em';
+    histLabel.textContent = '历史任务 (' + done.length + ')';
+    wrapper.appendChild(histLabel);
+
+    const table = document.createElement('table');
+    table.className = 'w-full text-sm';
+    table.innerHTML =
+      '<thead><tr class="border-b border-gray-100 dark:border-gray-800 text-left text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">' +
+      '<th class="py-2.5 pr-4 font-medium">类型</th>' +
+      '<th class="py-2.5 pr-4 font-medium">文件名</th>' +
+      '<th class="py-2.5 pr-4 font-medium">大小</th>' +
+      '<th class="py-2.5 pr-4 font-medium">状态</th>' +
+      '<th class="py-2.5 font-medium">耗时</th></tr></thead>';
+    const tbody = document.createElement('tbody');
+    for (const job of done) {
+      const tr = document.createElement('tr');
+      tr.className = 'border-b border-gray-50 dark:border-gray-800/60 align-top transition-colors last:border-0 hover:bg-gray-50/70 dark:hover:bg-gray-800/60';
+
+      const tdKind = document.createElement('td');
+      tdKind.className = 'py-2.5 pr-4';
+      const ks = KIND_STYLE[job.kind] || {bg: 'bg-gray-100', color: 'text-gray-600'};
+      tdKind.innerHTML = '<span class="inline-block rounded-full ' + ks.bg + ' ' + ks.color + ' px-2.5 py-0.5 text-xs font-medium">' + (KIND_TEXT[job.kind] || job.kind || '上传') + '</span>';
+
+      const tdFile = document.createElement('td');
+      tdFile.className = 'py-2.5 pr-4';
+      tdFile.innerHTML = '<div style="font-weight:500">' + escHtml(job.filename) + '</div>' +
+        '<div style="font-size:0.6875rem;color:#9ca3af;font-family:monospace;margin-top:2px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escAttr(job.source || job.destination || '') + '">' + escHtml(job.source || job.destination || job.object_key || '') + '</div>';
+
+      const tdSize = document.createElement('td');
+      tdSize.className = 'whitespace-nowrap py-2.5 pr-4 text-gray-500 dark:text-gray-400';
+      tdSize.textContent = fmtSize(job.size);
+
+      const tdStatus = document.createElement('td');
+      tdStatus.className = 'py-2.5 pr-4';
+      const ss = STATUS_STYLE[job.status] || STATUS_STYLE.queued;
+      tdStatus.innerHTML = '<span class="inline-block rounded-full ' + ss.bg + ' ' + ss.color + ' px-2.5 py-0.5 text-xs font-medium">' + (STATUS_TEXT[job.status] || job.status) + '</span>';
+      if (job.status === 'failed' && job.error) {
+        tdStatus.innerHTML += '<p style="margin-top:4px;max-width:200px;font-size:0.6875rem;color:#dc2626">' + escHtml(job.error) + '</p>';
+      }
+      if (job.note) {
+        tdStatus.innerHTML += '<p style="margin-top:4px;max-width:200px;font-size:0.6875rem;color:#d97706">' + escHtml(job.note) + '</p>';
+      }
+
+      const tdElapsed = document.createElement('td');
+      tdElapsed.className = 'whitespace-nowrap py-2.5 text-gray-400 dark:text-gray-500 text-xs';
+      tdElapsed.textContent = fmtElapsed(job.started_at);
+
+      tr.append(tdKind, tdFile, tdSize, tdStatus, tdElapsed);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    wrapper.appendChild(table);
+  }
+
+  jobsEl.replaceChildren(wrapper);
+}
+
+function escHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escAttr(s) { return escHtml(s); }
+
+function renderJobCard(job) {
+  const pct = job.size ? Math.min(100, (job.progress / job.size * 100)) : 0;
+  const pctStr = pct.toFixed(1);
+  const isActive = job.status === 'uploading';
+  const rate = isActive ? trackSpeed(job) : 0;
+  const remaining = job.size - job.progress;
+  const eta = (rate > 0 && remaining > 0) ? remaining / rate : null;
+  const ss = STATUS_STYLE[job.status] || STATUS_STYLE.queued;
+  const ks = KIND_STYLE[job.kind] || {bg: 'bg-gray-100', color: 'text-gray-600'};
+
+  const card = document.createElement('div');
+  card.style.cssText = 'border-radius:0.75rem;border:1px solid #e5e7eb;padding:1rem 1.25rem;background:#fafafa;transition:border-color .2s';
+
+  /* 第一行：状态点 + 文件名 + 类型标签 */
+  const row1 = document.createElement('div');
+  row1.style.cssText = 'display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem;flex-wrap:wrap';
+  row1.innerHTML =
+    '<span style="width:8px;height:8px;border-radius:50%;background:' + ss.dot + ';' + (isActive ? 'animation:pulse 1.5s infinite' : '') + '"></span>' +
+    '<span style="font-weight:600;font-size:0.9rem;color:#111827">' + escHtml(job.filename) + '</span>' +
+    '<span class="inline-block rounded-full ' + ks.bg + ' ' + ks.color + ' px-2 py-0.5" style="font-size:0.6875rem;font-weight:500">' + (KIND_TEXT[job.kind] || job.kind) + '</span>' +
+    '<span class="inline-block rounded-full ' + ss.bg + ' ' + ss.color + ' px-2 py-0.5" style="font-size:0.6875rem;font-weight:500">' + (STATUS_TEXT[job.status] || job.status) + '</span>';
+
+  /* 第二行：来源 URL */
+  if (job.source || job.destination) {
+    const src = document.createElement('div');
+    src.style.cssText = 'font-size:0.6875rem;color:#9ca3af;font-family:monospace;margin-bottom:0.625rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%';
+    src.textContent = job.source || job.destination;
+    row1.appendChild(src);
+  }
+  card.appendChild(row1);
+
+  /* 第三行：进度条 */
+  if (isActive || job.status === 'queued') {
+    const barWrap = document.createElement('div');
+    barWrap.style.cssText = 'display:flex;align-items:center;gap:0.75rem';
+
+    const bar = document.createElement('div');
+    bar.style.cssText = 'flex:1;height:8px;border-radius:4px;background:#e5e7eb;overflow:hidden';
+    const fill = document.createElement('div');
+    fill.style.cssText = 'height:100%;border-radius:4px;background:linear-gradient(90deg,#3b82f6,#60a5fa);transition:width .3s ease' + (isActive ? ';background-image:linear-gradient(90deg,#3b82f6,#60a5fa);background-size:200% 100%;animation:shimmer 2s linear infinite' : '');
+    fill.style.width = pctStr + '%';
+    bar.appendChild(fill);
+    barWrap.appendChild(bar);
+
+    const pctLabel = document.createElement('span');
+    pctLabel.style.cssText = 'font-size:0.8rem;font-weight:600;color:#374151;min-width:3.5rem;text-align:right';
+    pctLabel.textContent = pctStr + '%';
+    barWrap.appendChild(pctLabel);
+
+    card.appendChild(barWrap);
+  }
+
+  /* 第四行：统计数据 */
+  if (isActive || job.status === 'queued') {
+    const stats = document.createElement('div');
+    stats.style.cssText = 'display:flex;gap:1.5rem;margin-top:0.5rem;font-size:0.75rem;color:#6b7280;flex-wrap:wrap';
+
+    const remainingBytes = Math.max(0, job.size - job.progress);
+    const items = [
+      {label: '已传输', value: fmtSize(job.progress) + ' / ' + fmtSize(job.size)},
+      {label: '速率',   value: isActive ? fmtRate(rate) : '—'},
+      {label: '剩余',   value: fmtSize(remainingBytes)},
+      {label: '预计',   value: isActive ? fmtEta(eta) : '—'},
+      {label: '已用',   value: fmtElapsed(job.started_at)},
+    ];
+    for (const item of items) {
+      const el = document.createElement('span');
+      el.innerHTML = '<span style="color:#9ca3af">' + item.label + '</span> <span style="font-weight:500;color:#4b5563">' + item.value + '</span>';
+      stats.appendChild(el);
+    }
+    card.appendChild(stats);
+  }
+
+  return card;
 }
 
 function renderDownloads() {
@@ -803,12 +929,21 @@ function renderObjects(objects) {
     tdTime.textContent = fmtTime(obj.last_modified);
 
     const tdOp = document.createElement('td');
-    tdOp.className = 'py-2.5 text-right';
+    tdOp.className = 'py-2.5 text-right whitespace-nowrap';
     const link = document.createElement('a');
     link.className = 'inline-flex items-center gap-1 rounded-lg bg-gray-800 dark:bg-gray-700 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-gray-900 dark:hover:bg-gray-600';
     link.href = '/download?apikey=' + encodeURIComponent(apikey) + '&key=' + encodeURIComponent(obj.key);
     link.textContent = '下载';
-    tdOp.appendChild(link);
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.style.cssText = 'margin-left:0.25rem;border-radius:0.5rem;border:1px solid #fca5a5;background:transparent;padding:0.375rem 0.75rem;font-size:0.75rem;font-weight:500;color:#dc2626;cursor:pointer;transition:background .15s';
+    delBtn.textContent = '删除';
+    delBtn.addEventListener('mouseenter', function() { this.style.background = 'rgba(220,38,38,0.08)'; });
+    delBtn.addEventListener('mouseleave', function() { this.style.background = 'transparent'; });
+    delBtn.addEventListener('click', function() { confirmDeleteObject(obj, delBtn); });
+
+    tdOp.append(link, delBtn);
 
     tr.append(tdKey, tdSize, tdTime, tdOp);
     tbody.appendChild(tr);
@@ -840,6 +975,120 @@ async function refreshObjects() {
 }
 
 refreshBtn.addEventListener('click', refreshObjects);
+
+/* ---------- 删除确认弹窗 ---------- */
+let modalOverlay = null;
+function ensureModal() {
+  if (modalOverlay) return modalOverlay;
+  modalOverlay = document.createElement('div');
+  modalOverlay.id = 'delete-modal-overlay';
+  modalOverlay.style.cssText = [
+    'position:fixed', 'top:0', 'left:0', 'right:0', 'bottom:0',
+    'z-index:9999',
+    'display:none',
+    'align-items:center', 'justify-content:center',
+    'background:rgba(0,0,0,0.45)',
+    'backdrop-filter:blur(4px)', '-webkit-backdrop-filter:blur(4px)',
+  ].join(';');
+  modalOverlay.innerHTML =
+    '<div style="margin:0 1rem;width:100%;max-width:24rem;border-radius:1rem;' +
+      'background:#fff;padding:1.5rem;box-shadow:0 20px 25px -5px rgba(0,0,0,0.2),0 10px 10px -5px rgba(0,0,0,0.1);' +
+      'font-family:inherit">' +
+      '<h3 style="margin-bottom:0.5rem;font-size:1.125rem;font-weight:600;color:#111827">确认删除</h3>' +
+      '<p style="margin-bottom:0.25rem;font-size:0.875rem;color:#6b7280">确定要从 Bucket 中删除此文件吗？此操作不可恢复。</p>' +
+      '<p id="del-key-display" style="margin-bottom:1.25rem;word-break:break-all;border-radius:0.5rem;' +
+        'background:#f3f4f6;padding:0.5rem 0.75rem;font-family:ui-monospace,monospace;font-size:0.75rem;color:#374151"></p>' +
+      '<div style="display:flex;justify-content:flex-end;gap:0.5rem">' +
+        '<button type="button" id="del-cancel" ' +
+          'style="border-radius:0.5rem;border:1px solid #d1d5db;background:#fff;padding:0.5rem 1rem;' +
+            'font-size:0.875rem;font-weight:500;color:#374151;cursor:pointer;transition:background .15s"' +
+          'onmouseover="this.style.background=\'#f9fafb\'"' +
+          'onmouseout="this.style.background=\'#fff\'">取消</button>' +
+        '<button type="button" id="del-confirm" ' +
+          'style="border-radius:0.5rem;border:none;background:#dc2626;padding:0.5rem 1rem;' +
+            'font-size:0.875rem;font-weight:500;color:#fff;cursor:pointer;transition:background .15s"' +
+          'onmouseover="this.style.background=\'#b91c1c\'"' +
+          'onmouseout="this.style.background=\'#dc2626\'">删除</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modalOverlay);
+  modalOverlay.addEventListener('click', function(e) {
+    if (e.target === modalOverlay) closeModal();
+  });
+  document.getElementById('del-cancel').addEventListener('click', closeModal);
+
+  /* 深色模式适配 */
+  if (document.documentElement.classList.contains('dark')) applyModalDark();
+  return modalOverlay;
+}
+
+function applyModalDark() {
+  const box = modalOverlay.querySelector('div');
+  if (!box) return;
+  box.style.background = '#111827';
+  box.querySelector('h3').style.color = '#f3f4f6';
+  box.querySelector('p').style.color = '#9ca3af';
+  const keyEl = document.getElementById('del-key-display');
+  keyEl.style.background = '#1f2937';
+  keyEl.style.color = '#e5e7eb';
+  const cancel = document.getElementById('del-cancel');
+  cancel.style.background = '#1f2937';
+  cancel.style.borderColor = '#374151';
+  cancel.style.color = '#e5e7eb';
+  cancel.onmouseover = function() { this.style.background = '#374151'; };
+  cancel.onmouseout = function() { this.style.background = '#1f2937'; };
+}
+
+function openModal(key, onConfirm) {
+  ensureModal();
+  document.getElementById('del-key-display').textContent = key;
+  const confirmBtn = document.getElementById('del-confirm');
+  confirmBtn.disabled = false;
+  confirmBtn.textContent = '删除';
+  confirmBtn.onclick = function() { onConfirm(confirmBtn); };
+  modalOverlay.style.display = 'flex';
+}
+
+function closeModal() {
+  if (modalOverlay) modalOverlay.style.display = 'none';
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape' && modalOverlay && modalOverlay.style.display !== 'none') closeModal();
+});
+
+async function confirmDeleteObject(obj, btn) {
+  openModal(obj.key, async function(confirmBtn) {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = '删除中…';
+    confirmBtn.style.opacity = '0.5';
+    if (btn) { btn.disabled = true; btn.textContent = '删除中…'; }
+    try {
+      const res = await fetch('/api/objects?apikey=' + encodeURIComponent(apikey), {
+        method: 'DELETE',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: obj.key}),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || ('HTTP ' + res.status));
+      closeModal();
+      refreshObjects();
+    } catch (err) {
+      alert('删除失败: ' + err.message);
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = '删除';
+      confirmBtn.style.opacity = '1';
+      if (btn) { btn.disabled = false; btn.textContent = '删除'; }
+    }
+  });
+}
+
+/* 处理 Jinja 渲染的静态列表中的删除按钮 */
+document.addEventListener('click', function(e) {
+  const btn = e.target.closest('[data-delete-key]');
+  if (!btn) return;
+  confirmDeleteObject({key: btn.dataset.deleteKey}, btn);
+});
 
 function setConn(state) {
   const dot = document.getElementById('conn-dot');

@@ -466,10 +466,14 @@ def hash_file(path: Path) -> str:
 
 
 def ensure_unique_md5(md5: str, job_id: int) -> bool:
-    """md5 已存在时跳过上传并给任务加备注，返回是否为新文件。"""
+    """md5 已存在时跳过上传并给任务加备注，返回是否为新文件。
+
+    只有 uploaded=1（实际上传成功）的记录才算数，避免中断/失败的残留记录
+    导致后续相同文件被误判为"已存在"而跳过上传。
+    """
     with get_db() as conn:
         row = conn.execute(
-            "SELECT object_key FROM files WHERE md5=? AND job_id IS NOT ?",
+            "SELECT object_key FROM files WHERE md5=? AND job_id IS NOT ? AND uploaded=1",
             (md5, job_id),
         ).fetchone()
     if row is not None:
@@ -720,9 +724,18 @@ def check_bucket_private() -> tuple[bool | None, str]:
 # --------------------------------------------------------------------------
 
 def apikey_ok() -> bool:
-    provided = request.args.get("apikey", "")
+    """检查 apikey：支持 query param、X-API-Key header、Authorization Bearer。"""
     expected = os.environ.get("APP_API_KEY", "")
-    return bool(expected) and bool(provided) and secrets.compare_digest(provided, expected)
+    if not expected:
+        return False
+    provided = request.args.get("apikey", "")
+    if not provided:
+        provided = request.headers.get("X-API-Key", "")
+    if not provided:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            provided = auth[7:]
+    return bool(provided) and secrets.compare_digest(provided, expected)
 
 
 def require_auth():
@@ -1135,12 +1148,191 @@ def download():
     return Response(generate(), headers=headers)
 
 
+@app.post("/api/submit")
+def api_submit():
+    """提交 URL 自动下载并上传到 bucket（支持单个/批量）。
+
+    请求头认证：
+        X-API-Key: <key>          或
+        Authorization: Bearer <key>
+
+    请求体 JSON：
+    {
+        "urls": ["https://...", "https://..."],   // 必填，1~50 个链接
+        "prefix": "backups/2026"                  // 可选，对象 key 前缀
+    }
+
+    返回（200 或 400）：
+    {
+        "submitted": 2,
+        "jobs": [
+            {"url": "https://...", "job_id": 5, "object_key": "abc123.zip", "status": "queued"},
+            ...
+        ],
+        "errors": [
+            {"url": "https://bad", "error": "无效的 URL"}
+        ]
+    }
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权：缺少或无效的 apikey"}), 401
+
+    body = request.get_json(silent=True) or {}
+    raw_urls = body.get("urls")
+
+    # 也兼容单条 url 字段
+    if raw_urls is None:
+        single = body.get("url")
+        raw_urls = [single] if single else []
+
+    if not raw_urls:
+        return jsonify({"error": "请提供 urls 字段（至少一个链接）"}), 400
+
+    if not isinstance(raw_urls, list):
+        return jsonify({"error": "urls 必须是数组"}), 400
+
+    if len(raw_urls) > 50:
+        return jsonify({"error": "单次最多提交 50 个链接"}), 400
+
+    prefix_raw = body.get("prefix") or os.environ.get("B2_PREFIX", "")
+    try:
+        prefix = clean_prefix(prefix_raw)
+    except argparse.ArgumentTypeError as exc:
+        return jsonify({"error": f"prefix 无效: {exc}"}), 400
+
+    submitted: list[dict] = []
+    errors: list[dict] = []
+
+    for url in raw_urls:
+        url = (url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            errors.append({"url": url, "error": "链接必须以 http:// 或 https:// 开头"})
+            continue
+        filename = PurePosixPath(urlparse(url).path).name or "download"
+        object_key = uuid_object_key(prefix, filename)
+        job_id = insert_job(
+            kind="fetch",
+            filename=filename,
+            object_key=object_key,
+            size=0,
+            source=url,
+        )
+        insert_file_pending(
+            job_id=job_id,
+            object_key=object_key,
+            filename=filename,
+            size=0,
+            source_url=url,
+        )
+        JOB_QUEUE.put(job_id)
+        emit_job_update(job_id)
+        submitted.append({
+            "url": url,
+            "job_id": job_id,
+            "object_key": object_key,
+            "filename": filename,
+            "status": "queued",
+        })
+
+    return jsonify({
+        "submitted": len(submitted),
+        "jobs": submitted,
+        "errors": errors,
+    }), (200 if submitted else 400)
+
+
+@app.get("/api/status/<int:job_id>")
+def api_status(job_id: int):
+    """查询单个任务及其对应文件的状态。
+
+    返回：
+    {
+        "job": {
+            "id": 5, "status": "done", "kind": "fetch",
+            "filename": "photo.jpg", "object_key": "abc123.jpg",
+            "source": "https://...", "size": 10240, "progress": 10240,
+            "error": null, "created_at": 1234567890
+        },
+        "file": {
+            "id": 3, "status": "synced", "md5": "abc...", "uploaded": 1,
+            "bucket": "mybucket", "object_key": "abc123.jpg",
+            "synced_at": 1234567895
+        } | null
+    }
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    with get_db() as conn:
+        job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if job is None:
+            return jsonify({"error": f"任务 {job_id} 不存在"}), 404
+        file_row = conn.execute("SELECT * FROM files WHERE job_id=?", (job_id,)).fetchone()
+
+    result = {"job": job_payload(dict(job))}
+    if file_row is not None:
+        f = dict(file_row)
+        result["file"] = {
+            "id": f["id"],
+            "status": f["status"],
+            "md5": f["md5"],
+            "size": f["size"],
+            "uploaded": f["uploaded"],
+            "bucket": f["bucket"],
+            "object_key": f["object_key"],
+            "synced_at": f["synced_at"],
+            "error": f.get("error"),
+        }
+    else:
+        result["file"] = None
+
+    return jsonify(result)
+
+
 @app.get("/api/jobs")
 def api_jobs():
     blocked = require_auth()
     if blocked:
         return blocked
     return jsonify([job_payload(job) for job in recent_jobs()])
+
+
+@app.delete("/api/objects")
+def api_delete_object():
+    """删除 bucket 中的一个对象。
+
+    请求体 JSON：
+        {"key": "path/to/object.zip"}
+
+    返回：
+        {"deleted": true, "key": "path/to/object.zip"}
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    body = request.get_json(silent=True) or {}
+    key = (body.get("key") or "").strip().lstrip("/")
+    if not key:
+        return jsonify({"error": "缺少 key 参数"}), 400
+
+    try:
+        get_client().delete_object(Bucket=os.environ["B2_BUCKET"], Key=key)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return jsonify({"error": f"对象不存在: {key}"}), 404
+        return jsonify({"error": str(exc)}), 502
+    except (BotoCoreError, OSError) as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    # 同步更新本地 files 表
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE files SET status='deleted', uploaded=0, updated_at=? WHERE object_key=?",
+            (time.time(), key),
+        )
+
+    return jsonify({"deleted": True, "key": key})
 
 
 @app.get("/api/objects")
