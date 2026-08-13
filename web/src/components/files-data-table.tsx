@@ -6,16 +6,50 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Loader2, Trash2 } from "lucide-react"
+import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Loader2, Pencil, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { type Datasource, type FileItem } from "@/lib/types"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
-import { deleteFile, downloadServer, downloadUrl, updateFile, uploadToCloud } from "@/lib/api"
+import {
+  deleteFile,
+  downloadServer,
+  downloadUrl,
+  updateFile,
+  uploadToBeijing,
+  uploadToCloud,
+} from "@/lib/api"
 import { useJobs } from "@/lib/use-jobs"
 import { JobProgressBadge } from "@/components/progress-cell"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog"
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import {
   Table,
   TableBody,
@@ -28,16 +62,19 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 
 /** 骨架行各列的宽度类（按 columns 顺序对齐，模拟真实数据宽度）。 */
-const SKELETON_WIDTHS = [
-  "w-4",    // select
-  "w-16",   // 数据源
-  "w-28",   // 文件名称
-  "w-20",   // 大小（居中）
-  "w-16",   // 本地
-  "w-16",   // 云存储
-  "w-8",    // 操作
-  "w-24",   // 创建时间
-]
+function skeletonWidths(beijingEnabled: boolean): string[] {
+  const widths = [
+    "w-4",    // select
+    "w-16",   // 数据源
+    "w-28",   // 文件名称
+    "w-20",   // 大小（居中）
+    "w-16",   // 本地
+    "w-16",   // 自己桶
+  ]
+  if (beijingEnabled) widths.push("w-16") // 北京桶
+  widths.push("w-8", "w-24") // 操作、创建时间
+  return widths
+}
 
 interface FilesDataTableProps {
   data: FileItem[]
@@ -46,6 +83,7 @@ interface FilesDataTableProps {
   page: number
   pageSize: number
   loading: boolean
+  beijingEnabled: boolean
   onPageChange: (page: number) => void
   onDeleted: () => void
 }
@@ -63,125 +101,210 @@ function Truncate({ value, className }: { value: string | null; className?: stri
   )
 }
 
-/** 本地 / 云存储 存在状态：绿色"已存在" / 红色"不存在"。
- *  传入 onToggle 时变为可点击按钮（hover 提示"点击切换状态"）。 */
-function PresenceLabel({
-  active,
+/** 状态文字：active=绿 / muted=正常灰 / queued=黄。失败时 hover 展示错误。 */
+function StatusText({
+  children,
+  tone = "muted",
   error,
-  onToggle,
-  busy,
 }: {
-  active: boolean
+  children: React.ReactNode
+  tone?: "active" | "muted" | "queued"
   error?: string | null
-  onToggle?: () => void
-  busy?: boolean
 }) {
-  const label = active ? "已存在" : "不存在"
-  const color = active ? "text-emerald-600" : "text-red-500"
-
-  if (onToggle) {
+  const color =
+    tone === "active"
+      ? "text-emerald-600"
+      : tone === "queued"
+        ? "text-amber-500"
+        : "text-muted-foreground"
+  if (error) {
     return (
       <Tooltip>
         <TooltipTrigger asChild>
-          <button
-            type="button"
-            onClick={onToggle}
-            disabled={busy}
-            className="inline-flex items-center rounded px-1 py-0.5 transition-colors hover:bg-accent disabled:opacity-50"
-          >
-            {busy ? (
-              <Loader2 className="size-3 animate-spin text-muted-foreground" />
-            ) : (
-              <span className={cn("text-xs font-medium", color)}>{label}</span>
-            )}
-          </button>
-        </TooltipTrigger>
-        <TooltipContent className="max-w-xs break-all">
-          {!active && error ? error : "点击切换状态"}
-        </TooltipContent>
-      </Tooltip>
-    )
-  }
-
-  if (!active && error) {
-    return (
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className={cn("cursor-help text-xs font-medium", color)}>{label}</span>
+          <span className={cn("cursor-help text-xs font-medium", color)}>{children}</span>
         </TooltipTrigger>
         <TooltipContent className="max-w-xs break-all">{error}</TooltipContent>
       </Tooltip>
     )
   }
-  return <span className={cn("text-xs font-medium", color)}>{label}</span>
+  return <span className={cn("text-xs font-medium", color)}>{children}</span>
 }
 
-/** 本地列：正在下载/抓取时显示进度，否则显示可点击的存在状态。 */
+/** 单元格内的小图标按钮（可做 <a> 或 <button>）。 */
+function IconBtn({
+  icon: Icon,
+  title,
+  onClick,
+  busy,
+  href,
+}: {
+  icon: React.ComponentType<{ className?: string }>
+  title: string
+  onClick?: () => void
+  busy?: boolean
+  href?: string
+}) {
+  const className =
+    "inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+  if (href) {
+    return (
+      <a href={href} className={className} title={title}>
+        <Icon className="size-3" />
+      </a>
+    )
+  }
+  return (
+    <button type="button" onClick={onClick} disabled={busy} className={className} title={title}>
+      {busy ? <Loader2 className="size-3 animate-spin" /> : <Icon className="size-3" />}
+    </button>
+  )
+}
+
+/** 排队中黄字。 */
+function QueuedLabel() {
+  return <StatusText tone="queued">排队中</StatusText>
+}
+
+/** 单元格内的紧凑操作按钮（图标+文字），失败时 hover 展示错误。 */
+function CellButton({
+  icon: Icon,
+  label,
+  title,
+  onClick,
+  busy,
+  error,
+}: {
+  icon: React.ComponentType<{ className?: string }>
+  label: string
+  title: string
+  onClick: () => void
+  busy?: boolean
+  error?: string | null
+}) {
+  const btn = (
+    <Button variant="ghost" size="sm" onClick={onClick} disabled={busy} title={title} className="h-6 gap-1 px-1.5 text-xs text-muted-foreground">
+      {busy ? <Loader2 className="size-3 animate-spin" /> : <Icon className="size-3" />}
+      {label}
+    </Button>
+  )
+  if (error) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>{btn}</TooltipTrigger>
+        <TooltipContent className="max-w-xs break-all">{error}</TooltipContent>
+      </Tooltip>
+    )
+  }
+  return btn
+}
+
+/** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿字 / 否则→下载按钮。 */
 function LocalCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void }) {
   const { jobs } = useJobs()
   const [busy, setBusy] = React.useState(false)
   const job = file.job_id ? jobs[file.job_id] : undefined
-  const active = job && (job.status === "uploading" || job.status === "queued") &&
-    (job.kind === "fetch" || job.kind === "download")
-  if (active) return <JobProgressBadge file={file} />
+  const isMyJob = job && (job.kind === "fetch" || job.kind === "download")
 
-  const handleToggle = async () => {
+  if (isMyJob && job!.status === "queued") return <QueuedLabel />
+  if (isMyJob && job!.status === "uploading") return <JobProgressBadge file={file} />
+
+  if (file.local_path) return <StatusText tone="active">已存在</StatusText>
+
+  const handleDownload = async () => {
     setBusy(true)
     try {
-      await updateFile(file.id, {
-        local_path: file.local_path ? null : file.object_key,
-      })
-      toast.success(file.local_path ? "已标记为本地不存在" : "已标记为本地已存在")
+      const r = await downloadServer(file.id)
+      toast.success(r.message)
       onUpdated()
     } catch (e) {
-      toast.error("修改失败", { description: (e as Error).message })
+      toast.error("下载失败", { description: (e as Error).message })
     } finally {
       setBusy(false)
     }
   }
 
-  const failed = file.status === "failed" && !file.local_path
-  return (
-    <PresenceLabel
-      active={!!file.local_path}
-      error={failed ? file.error : undefined}
-      onToggle={handleToggle}
-      busy={busy}
-    />
-  )
+  const failed = file.status === "failed"
+  return <CellButton icon={HardDriveDownload} label="下载" title="下载到服务器" onClick={handleDownload} busy={busy} error={failed ? file.error : undefined} />
 }
 
-/** 云存储列：正在上传时显示进度，否则显示可点击的存在状态。 */
+/** 自己桶列：排队→黄字 / 上传中→进度 / 已存在→绿字+下载 / 有本地→上传按钮。 */
 function CloudCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void }) {
   const { jobs } = useJobs()
   const [busy, setBusy] = React.useState(false)
   const job = file.job_id ? jobs[file.job_id] : undefined
-  const active = job && (job.status === "uploading" || job.status === "queued") &&
-    job.kind === "upload"
-  if (active) return <JobProgressBadge file={file} />
+  const isMyJob = job && job.kind === "upload"
 
-  const handleToggle = async () => {
-    setBusy(true)
-    try {
-      await updateFile(file.id, { uploaded: file.uploaded !== 1 })
-      toast.success(file.uploaded === 1 ? "已标记为云存储未上传" : "已标记为云存储已上传")
-      onUpdated()
-    } catch (e) {
-      toast.error("修改失败", { description: (e as Error).message })
-    } finally {
-      setBusy(false)
-    }
-  }
+  if (isMyJob && job!.status === "queued") return <QueuedLabel />
+  if (isMyJob && job!.status === "uploading") return <JobProgressBadge file={file} />
 
   const failed = file.status === "failed" && !!file.local_path && !file.uploaded
-  return (
-    <PresenceLabel
-      active={file.uploaded === 1}
-      error={failed ? file.error : undefined}
-      onToggle={handleToggle}
-      busy={busy}
-    />
-  )
+
+  if (file.uploaded === 1) {
+    return (
+      <div className="flex flex-col items-center gap-0.5">
+        <StatusText tone="active">已存在</StatusText>
+        <IconBtn icon={Download} title="下载(自己桶)" href={downloadUrl(file.object_key)} />
+      </div>
+    )
+  }
+
+  if (file.local_path) {
+    const handleUpload = async () => {
+      setBusy(true)
+      try {
+        const r = await uploadToCloud(file.id)
+        toast.success(r.message)
+        onUpdated()
+      } catch (e) {
+        toast.error("上传失败", { description: (e as Error).message })
+      } finally {
+        setBusy(false)
+      }
+    }
+    return <CellButton icon={CloudUpload} label="上传" title="上传到自己桶" onClick={handleUpload} busy={busy} error={failed ? file.error : undefined} />
+  }
+
+  return <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
+}
+
+/** 北京桶列：与 CloudCell 对称，读 uploaded_beijing，检测 upload_beijing 任务。 */
+function BeijingCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void }) {
+  const { jobs } = useJobs()
+  const [busy, setBusy] = React.useState(false)
+  const job = file.job_id ? jobs[file.job_id] : undefined
+  const isMyJob = job && job.kind === "upload_beijing"
+
+  if (isMyJob && job!.status === "queued") return <QueuedLabel />
+  if (isMyJob && job!.status === "uploading") return <JobProgressBadge file={file} />
+
+  const failed = file.status === "failed" && !!file.local_path && !file.uploaded_beijing
+
+  if (file.uploaded_beijing === 1) {
+    return (
+      <div className="flex flex-col items-center gap-0.5">
+        <StatusText tone="active">已存在</StatusText>
+        <IconBtn icon={Download} title="下载(北京桶)" href={downloadUrl(file.object_key, "beijing")} />
+      </div>
+    )
+  }
+
+  if (file.local_path) {
+    const handleUpload = async () => {
+      setBusy(true)
+      try {
+        const r = await uploadToBeijing(file.id)
+        toast.success(r.message)
+        onUpdated()
+      } catch (e) {
+        toast.error("上传失败", { description: (e as Error).message })
+      } finally {
+        setBusy(false)
+      }
+    }
+    return <CellButton icon={CloudUpload} label="上传" title="上传到北京桶" onClick={handleUpload} busy={busy} error={failed ? file.error : undefined} />
+  }
+
+  return <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
 }
 
 export function FilesDataTable({
@@ -191,6 +314,7 @@ export function FilesDataTable({
   page,
   pageSize,
   loading,
+  beijingEnabled,
   onPageChange,
   onDeleted,
 }: FilesDataTableProps) {
@@ -201,94 +325,107 @@ export function FilesDataTable({
   }, [scripts])
 
   const [rowSelection, setRowSelection] = React.useState<Record<string, boolean>>({})
+  const [editingFile, setEditingFile] = React.useState<FileItem | null>(null)
 
   const columns = React.useMemo<ColumnDef<FileItem>[]>(
-    () => [
-      {
-        id: "select",
-        header: ({ table }) => (
-          <Checkbox
-            checked={table.getIsAllPageRowsSelected()}
-            indeterminate={table.getIsSomePageRowsSelected()}
-            onCheckedChange={(v) => table.toggleAllPageRowsSelected(v)}
-            aria-label="全选"
-          />
-        ),
-        cell: ({ row }) => (
-          <Checkbox
-            checked={row.getIsSelected()}
-            onCheckedChange={(v) => row.toggleSelected(v)}
-            aria-label="选择"
-          />
-        ),
-      },
-      {
-        accessorKey: "datasource_id",
-        header: "数据源",
-        cell: ({ row }) => {
-          const name = row.original.datasource_id
-            ? datasourceName.get(row.original.datasource_id)
-            : null
-          return <Truncate value={name ?? null} className="text-xs" />
+    () => {
+      const cols: ColumnDef<FileItem>[] = [
+        {
+          id: "select",
+          header: ({ table }) => (
+            <Checkbox
+              checked={table.getIsAllPageRowsSelected()}
+              indeterminate={table.getIsSomePageRowsSelected()}
+              onCheckedChange={(v) => table.toggleAllPageRowsSelected(v)}
+              aria-label="全选"
+            />
+          ),
+          cell: ({ row }) => (
+            <Checkbox
+              checked={row.getIsSelected()}
+              onCheckedChange={(v) => row.toggleSelected(v)}
+              aria-label="选择"
+            />
+          ),
         },
-      },
-      {
-        accessorKey: "filename",
-        header: "文件名称",
-        cell: ({ row }) => {
-          const f = row.original
-          if (!f.source_url) {
-            return <Truncate value={f.filename} />
-          }
-          return (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="block max-w-[28rem] truncate cursor-default">
-                  {f.filename}
-                </span>
-              </TooltipTrigger>
-              <TooltipContent className="max-w-sm break-all font-mono text-xs">
-                {f.source_url}
-              </TooltipContent>
-            </Tooltip>
-          )
+        {
+          accessorKey: "datasource_id",
+          header: "数据源",
+          cell: ({ row }) => {
+            const name = row.original.datasource_id
+              ? datasourceName.get(row.original.datasource_id)
+              : null
+            return <Truncate value={name ?? null} className="text-xs" />
+          },
         },
-      },
-      {
-        accessorKey: "size",
-        header: () => <div className="min-w-[5rem] text-center">大小</div>,
-        cell: ({ row }) => (
-          <div className="text-center tabular-nums text-muted-foreground">
-            {formatBytes(row.original.size)}
-          </div>
-        ),
-      },
-      {
-        id: "local",
-        header: () => <div className="min-w-[4rem] text-center">本地</div>,
-        cell: ({ row }) => <div className="flex justify-center"><LocalCell file={row.original} onUpdated={onDeleted} /></div>,
-      },
-      {
-        id: "cloud",
-        header: () => <div className="min-w-[4rem] text-center">云存储</div>,
-        cell: ({ row }) => <div className="flex justify-center"><CloudCell file={row.original} onUpdated={onDeleted} /></div>,
-      },
-      {
-        id: "actions",
-        header: () => <div className="text-center">操作</div>,
-        cell: ({ row }) => <RowActions file={row.original} onDeleted={onDeleted} />,
-      },
-      {
-        accessorKey: "created_at",
-        header: () => <div className="text-right">创建时间</div>,
-        cell: ({ row }) => (
-          <span className="whitespace-nowrap text-muted-foreground">
-            {formatTime(row.original.created_at)}
-          </span>
-        ),
-      },
-    ],
-    [datasourceName, onDeleted],
+        {
+          accessorKey: "filename",
+          header: "文件名称",
+          cell: ({ row }) => {
+            const f = row.original
+            if (!f.source_url) {
+              return <Truncate value={f.filename} />
+            }
+            return (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="block max-w-[28rem] truncate cursor-default">
+                    {f.filename}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-sm break-all font-mono text-xs">
+                  {f.source_url}
+                </TooltipContent>
+              </Tooltip>
+            )
+          },
+        },
+        {
+          accessorKey: "size",
+          header: () => <div className="min-w-[5rem] text-center">大小</div>,
+          cell: ({ row }) => (
+            <div className="text-center tabular-nums text-muted-foreground">
+              {formatBytes(row.original.size)}
+            </div>
+          ),
+        },
+        {
+          id: "local",
+          header: () => <div className="min-w-[4rem] text-center">本地</div>,
+          cell: ({ row }) => <div className="flex justify-center"><LocalCell file={row.original} onUpdated={onDeleted} /></div>,
+        },
+        {
+          id: "cloud",
+          header: () => <div className="min-w-[4rem] text-center">自己桶</div>,
+          cell: ({ row }) => <div className="flex justify-center"><CloudCell file={row.original} onUpdated={onDeleted} /></div>,
+        },
+      ]
+      if (beijingEnabled) {
+        cols.push({
+          id: "beijing",
+          header: () => <div className="min-w-[4rem] text-center">北京桶</div>,
+          cell: ({ row }) => <div className="flex justify-center"><BeijingCell file={row.original} onUpdated={onDeleted} /></div>,
+        })
+      }
+      cols.push(
+        {
+          id: "actions",
+          header: () => <div className="text-center">操作</div>,
+          cell: ({ row }) => <RowActions file={row.original} onDeleted={onDeleted} onEdit={() => setEditingFile(row.original)} />,
+        },
+        {
+          accessorKey: "created_at",
+          header: () => <div className="text-left">创建时间</div>,
+          cell: ({ row }) => (
+            <span className="whitespace-nowrap text-muted-foreground">
+              {formatTime(row.original.created_at)}
+            </span>
+          ),
+        },
+      )
+      return cols
+    },
+    [datasourceName, onDeleted, beijingEnabled],
   )
 
   const table = useReactTable({
@@ -309,6 +446,7 @@ export function FilesDataTable({
   const selectedFiles = table.getSelectedRowModel().rows.map((r) => r.original)
   const downloadable = selectedFiles.filter((f) => !f.local_path)
   const uploadable = selectedFiles.filter((f) => f.local_path && f.uploaded === 0)
+  const beijingUploadable = selectedFiles.filter((f) => f.local_path && f.uploaded_beijing === 0)
 
   const [batchBusy, setBatchBusy] = React.useState(false)
 
@@ -340,6 +478,22 @@ export function FilesDataTable({
     onDeleted()
   }
 
+  const batchUploadBeijing = async () => {
+    if (!beijingUploadable.length) {
+      toast("没有可上传的文件（需先下载到服务器）")
+      return
+    }
+    setBatchBusy(true)
+    const results = await Promise.allSettled(beijingUploadable.map((f) => uploadToBeijing(f.id)))
+    const ok = results.filter((r) => r.status === "fulfilled").length
+    toast.success(`已入队 ${ok} 个上传任务`)
+    setRowSelection({})
+    setBatchBusy(false)
+    onDeleted()
+  }
+
+  const skelWidths = skeletonWidths(beijingEnabled)
+
   return (
     <div className="space-y-3">
       {/* 批量操作栏 */}
@@ -358,8 +512,20 @@ export function FilesDataTable({
             title={uploadable.length === 0 ? "需先下载到服务器" : undefined}
           >
             <CloudUpload className="size-3.5" />
-            批量上传到云{uploadable.length > 0 && `（${uploadable.length}）`}
+            批量上传到自己桶{uploadable.length > 0 && `（${uploadable.length}）`}
           </Button>
+          {beijingEnabled && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={batchUploadBeijing}
+              disabled={batchBusy || beijingUploadable.length === 0}
+              title={beijingUploadable.length === 0 ? "需先下载到服务器" : undefined}
+            >
+              <CloudUpload className="size-3.5" />
+              批量上传到北京桶{beijingUploadable.length > 0 && `（${beijingUploadable.length}）`}
+            </Button>
+          )}
           <Button size="sm" variant="ghost" onClick={() => setRowSelection({})} disabled={batchBusy}>
             取消选择
           </Button>
@@ -389,7 +555,7 @@ export function FilesDataTable({
                       <Skeleton
                         className={cn(
                           "h-4",
-                          SKELETON_WIDTHS[j] ?? "w-20",
+                          skelWidths[j] ?? "w-20",
                           j === 3 && "mx-auto", // 大小列居中
                         )}
                       />
@@ -443,45 +609,32 @@ export function FilesDataTable({
           </Button>
         </div>
       </div>
+
+      {editingFile && (
+        <EditFileDialog
+          file={editingFile}
+          scripts={scripts}
+          onClose={() => setEditingFile(null)}
+          onSaved={() => {
+            setEditingFile(null)
+            onDeleted()
+          }}
+        />
+      )}
     </div>
   )
 }
 
-function RowActions({ file, onDeleted }: { file: FileItem; onDeleted: () => void }) {
+function RowActions({ file, onDeleted, onEdit }: { file: FileItem; onDeleted: () => void; onEdit: () => void }) {
   const [busy, setBusy] = React.useState(false)
-
-  const handleDownloadServer = async () => {
-    setBusy(true)
-    try {
-      const r = await downloadServer(file.id)
-      toast.success(r.message)
-      onDeleted()
-    } catch (e) {
-      toast.error("下载失败", { description: (e as Error).message })
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const handleUploadCloud = async () => {
-    setBusy(true)
-    try {
-      const r = await uploadToCloud(file.id)
-      toast.success(r.message)
-      onDeleted()
-    } catch (e) {
-      toast.error("上传失败", { description: (e as Error).message })
-    } finally {
-      setBusy(false)
-    }
-  }
+  const [deleteOpen, setDeleteOpen] = React.useState(false)
 
   const handleDelete = async () => {
-    if (!confirm(`确认删除「${file.filename || file.object_key}」？此操作不可撤销。`)) return
     setBusy(true)
     try {
       await deleteFile(file.id)
       toast.success("已删除")
+      setDeleteOpen(false)
       onDeleted()
     } catch (e) {
       toast.error("删除失败", { description: (e as Error).message })
@@ -492,45 +645,240 @@ function RowActions({ file, onDeleted }: { file: FileItem; onDeleted: () => void
 
   return (
     <div className="flex items-center justify-center gap-1">
-      {!file.local_path && (
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={handleDownloadServer}
-          disabled={busy}
-          title="下载到服务器"
-        >
-          <HardDriveDownload className="size-3.5" /> 下载到服务器
-        </Button>
-      )}
-      {file.local_path && file.uploaded === 0 && (
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={handleUploadCloud}
-          disabled={busy}
-          title="上传到云"
-        >
-          <CloudUpload className="size-3.5" /> 上传到云
-        </Button>
-      )}
-      {file.uploaded === 1 && (
-        <Button asChild variant="ghost" size="sm" title="下载">
-          <a href={downloadUrl(file.object_key)}>
-            <Download className="size-3.5" /> 下载
-          </a>
-        </Button>
-      )}
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={handleDelete}
-        disabled={busy}
-        className="text-destructive hover:text-destructive"
-        title="删除"
-      >
-        <Trash2 className="size-3.5" /> 删除
+      <Button variant="ghost" size="sm" onClick={onEdit} title="编辑">
+        <Pencil className="size-3.5" /> 编辑
       </Button>
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <AlertDialogTrigger asChild>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-destructive hover:text-destructive"
+            title="删除"
+          >
+            <Trash2 className="size-3.5" /> 删除
+          </Button>
+        </AlertDialogTrigger>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认删除？</AlertDialogTitle>
+            <AlertDialogDescription>
+              确认删除「{file.filename || file.object_key}」？此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleDelete}
+              disabled={busy}
+              className="bg-destructive text-white hover:bg-destructive/90"
+            >
+              {busy ? "删除中…" : "删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
+  )
+}
+
+/** 编辑文件记录 Modal。 */
+function EditFileDialog({
+  file,
+  scripts,
+  onClose,
+  onSaved,
+}: {
+  file: FileItem
+  scripts: Datasource[]
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [form, setForm] = React.useState({
+    filename: file.filename ?? "",
+    object_key: file.object_key,
+    md5: file.md5 ?? "",
+    size: String(file.size),
+    bucket: file.bucket ?? "",
+    source_url: file.source_url ?? "",
+    local_path: file.local_path ?? "",
+    uploaded: file.uploaded === 1,
+    uploaded_beijing: file.uploaded_beijing === 1,
+    status: file.status,
+    datasource_id: file.datasource_id ? String(file.datasource_id) : "",
+    error: file.error ?? "",
+  })
+  const [busy, setBusy] = React.useState(false)
+
+  const set = (key: keyof typeof form, value: string | boolean) =>
+    setForm((f) => ({ ...f, [key]: value }))
+
+  const submit = async () => {
+    setBusy(true)
+    try {
+      await updateFile(file.id, {
+        filename: form.filename || null,
+        object_key: form.object_key,
+        md5: form.md5 || null,
+        size: Number(form.size) || 0,
+        bucket: form.bucket,
+        source_url: form.source_url || null,
+        local_path: form.local_path || null,
+        uploaded: form.uploaded,
+        uploaded_beijing: form.uploaded_beijing,
+        status: form.status,
+        datasource_id: form.datasource_id ? Number(form.datasource_id) : null,
+        error: form.error || null,
+      })
+      toast.success("已保存")
+      onSaved()
+    } catch (e) {
+      toast.error("保存失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(v) => { if (!v && !busy) onClose() }}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>编辑文件记录</DialogTitle>
+        </DialogHeader>
+        <div className="max-h-[60vh] space-y-4 overflow-y-auto py-2">
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-filename">文件名</Label>
+              <Input
+                id="edit-filename"
+                value={form.filename}
+                onChange={(e) => set("filename", e.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-object-key">Object Key</Label>
+              <Input
+                id="edit-object-key"
+                value={form.object_key}
+                onChange={(e) => set("object_key", e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-md5">MD5</Label>
+              <Input
+                id="edit-md5"
+                value={form.md5}
+                onChange={(e) => set("md5", e.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-size">大小（字节）</Label>
+              <Input
+                id="edit-size"
+                type="number"
+                value={form.size}
+                onChange={(e) => set("size", e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-bucket">Bucket</Label>
+              <Input
+                id="edit-bucket"
+                value={form.bucket}
+                onChange={(e) => set("bucket", e.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-source-url">来源链接</Label>
+              <Input
+                id="edit-source-url"
+                value={form.source_url}
+                onChange={(e) => set("source_url", e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-local-path">本地路径</Label>
+              <Input
+                id="edit-local-path"
+                value={form.local_path}
+                onChange={(e) => set("local_path", e.target.value)}
+                placeholder="（空 = 不存在）"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-error">错误信息</Label>
+              <Input
+                id="edit-error"
+                value={form.error}
+                onChange={(e) => set("error", e.target.value)}
+                placeholder="（空 = 无）"
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label>状态</Label>
+              <Select value={form.status} onValueChange={(v) => set("status", v)}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="pending">pending</SelectItem>
+                  <SelectItem value="synced">synced</SelectItem>
+                  <SelectItem value="failed">failed</SelectItem>
+                  <SelectItem value="deleted">deleted</SelectItem>
+                  <SelectItem value="cancelled">cancelled</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>数据源</Label>
+              <Select value={form.datasource_id} onValueChange={(v) => set("datasource_id", v)}>
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="不关联" />
+                </SelectTrigger>
+                <SelectContent>
+                  {scripts.map((s) => (
+                    <SelectItem key={s.id} value={String(s.id)}>
+                      {s.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <div className="flex items-center gap-6">
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <Checkbox
+                checked={form.uploaded}
+                onCheckedChange={(v) => set("uploaded", v === true)}
+              />
+              自己桶已上传
+            </label>
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <Checkbox
+                checked={form.uploaded_beijing}
+                onCheckedChange={(v) => set("uploaded_beijing", v === true)}
+              />
+              北京桶已上传
+            </label>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={busy}>
+            取消
+          </Button>
+          <Button onClick={submit} disabled={busy}>
+            {busy ? "保存中…" : "保存"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }

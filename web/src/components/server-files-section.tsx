@@ -1,12 +1,13 @@
 import * as React from "react"
-import { Download, FileIcon, FolderOpen, Trash2 } from "lucide-react"
+import { Download, FileIcon, FolderOpen, RefreshCw, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
-import { type ServerFile } from "@/lib/types"
+import { type Datasource, type ServerFile } from "@/lib/types"
 import { deleteServerFile, getServerFiles, serverFileDownloadUrl } from "@/lib/api"
 import { formatBytes } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { UploadDialog, DownloadDialog } from "@/components/action-dialogs"
 import {
   Table,
   TableBody,
@@ -20,7 +21,15 @@ import {
  * 本地文件区块：展示 SERVER_FILE_ROOT 目录里的文件列表，
  * 支持下载（服务器→浏览器）与删除，显示每个文件大小和目录总大小。
  */
-export function ServerFilesSection() {
+export function ServerFilesSection({
+  defaultPrefix,
+  scripts,
+  onUploaded,
+}: {
+  defaultPrefix: string
+  scripts: Datasource[]
+  onUploaded: () => void
+}) {
   const [files, setFiles] = React.useState<ServerFile[]>([])
   const [root, setRoot] = React.useState<string | null>(null)
   const [totalSize, setTotalSize] = React.useState(0)
@@ -69,11 +78,25 @@ export function ServerFilesSection() {
             {files.length} 个 · 共 {formatBytes(totalSize)}
           </Badge>
         </div>
-        {root && (
-          <code className="max-w-[40ch] truncate font-mono text-xs text-muted-foreground">
-            {root}
-          </code>
-        )}
+        <div className="flex items-center gap-2">
+          {root && (
+            <code className="hidden max-w-[40ch] truncate font-mono text-xs text-muted-foreground sm:inline">
+              {root}
+            </code>
+          )}
+          <UploadDialog
+            defaultPrefix={defaultPrefix}
+            scripts={scripts}
+            onDone={() => {
+              load()
+              onUploaded()
+            }}
+          />
+          <DownloadDialog onDone={load} />
+          <Button variant="ghost" size="icon" onClick={load} title="刷新本地文件" disabled={loading}>
+            <RefreshCw className={loading ? "size-4 animate-spin" : "size-4"} />
+          </Button>
+        </div>
       </div>
 
       <div className="overflow-x-auto">

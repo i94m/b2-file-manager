@@ -24,15 +24,15 @@ function StatRow({ label, children }: { label: string; children: React.ReactNode
 }
 
 /**
- * 任务进度徽章：当 file 关联的 job 正在进行时显示蓝色百分比 + hover 详情。
- * 无活跃 job 时返回 null，由调用方决定 fallback（PresenceIcon 等）。
+ * 任务进度徽章：当 file 关联的 job 正在上传/下载时显示蓝色 百分比+速率 + hover 详情。
+ * 仅在 status=uploading 时渲染（queued 由调用方处理）。无活跃 job 时返回 null。
  */
 export function JobProgressBadge({ file }: { file: FileItem }) {
   const { jobs, stats } = useJobs()
   const [cancelling, setCancelling] = React.useState(false)
 
   const job = file.job_id ? jobs[file.job_id] : undefined
-  const active = job && (job.status === "uploading" || job.status === "queued")
+  const active = job && job.status === "uploading"
   const stat = job ? stats[job.id] : undefined
 
   if (!active || !stat) return null
@@ -55,26 +55,23 @@ export function JobProgressBadge({ file }: { file: FileItem }) {
   return (
     <HoverCard openDelay={150} closeDelay={100}>
       <HoverCardTrigger asChild>
-        <button className="inline-flex cursor-default items-center gap-1.5 rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-950 dark:text-blue-300">
+        <button className="inline-flex cursor-default items-center gap-1.5 rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-medium tabular-nums text-blue-700 dark:bg-blue-950 dark:text-blue-300">
           <span className="size-1.5 animate-pulse rounded-full bg-blue-500" />
-          {percent.toFixed(1)}%
+          {percent.toFixed(0)}% {stat.rate > 0 ? formatRate(stat.rate) : ""}
         </button>
       </HoverCardTrigger>
       <HoverCardContent className="w-72" align="start">
         <div className="space-y-2">
           <div className="flex items-center justify-between border-b pb-2">
-            <span className="max-w-[12rem] truncate text-sm font-medium">
-              {file.filename || job.object_key}
-            </span>
             <Badge className="bg-blue-100 text-blue-700 hover:bg-blue-100 dark:bg-blue-950 dark:text-blue-300">
               {percent.toFixed(1)}%
             </Badge>
+            <span className="text-xs text-muted-foreground">
+              {stat.rate > 0 ? formatRate(stat.rate) : "—"}
+            </span>
           </div>
           <StatRow label="已传输">
             {formatBytes(job.progress)} / {formatBytes(job.size)}
-          </StatRow>
-          <StatRow label="速率">
-            {stat.rate > 0 ? formatRate(stat.rate) : "—"}
           </StatRow>
           <StatRow label="剩余">{formatBytes(stat.remaining)}</StatRow>
           <StatRow label="预计">{formatDuration(stat.etaSec)}</StatRow>
