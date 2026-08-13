@@ -63,7 +63,7 @@ TRANSFER_CONFIG = TransferConfig(
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
-socketio = SocketIO(app, async_mode="threading")
+socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 
 _CLIENT = None
 BUCKET_PRIVATE: bool | None = None

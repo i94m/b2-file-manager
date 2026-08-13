@@ -15,6 +15,7 @@ import { deleteObject, downloadServer, downloadUrl, uploadToCloud } from "@/lib/
 import { useJobs } from "@/lib/use-jobs"
 import { JobProgressBadge } from "@/components/progress-cell"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Table,
   TableBody,
@@ -28,6 +29,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 
 /** 骨架行各列的宽度类（按 columns 顺序对齐，模拟真实数据宽度）。 */
 const SKELETON_WIDTHS = [
+  "w-4",    // select
   "w-28",   // 原始名称
   "w-16",   // 大小（右对齐）
   "w-12",   // 本地
@@ -118,8 +120,28 @@ export function FilesDataTable({
     return map
   }, [scripts])
 
+  const [rowSelection, setRowSelection] = React.useState<Record<string, boolean>>({})
+
   const columns = React.useMemo<ColumnDef<FileItem>[]>(
     () => [
+      {
+        id: "select",
+        header: ({ table }) => (
+          <Checkbox
+            checked={table.getIsAllPageRowsSelected()}
+            indeterminate={table.getIsSomePageRowsSelected()}
+            onCheckedChange={(v) => table.toggleAllPageRowsSelected(v)}
+            aria-label="全选"
+          />
+        ),
+        cell: ({ row }) => (
+          <Checkbox
+            checked={row.getIsSelected()}
+            onCheckedChange={(v) => row.toggleSelected(v)}
+            aria-label="选择"
+          />
+        ),
+      },
       {
         accessorKey: "filename",
         header: "原始名称",
@@ -187,15 +209,69 @@ export function FilesDataTable({
     columns,
     getCoreRowModel: getCoreRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
-    manualPagination: true, // 后端分页
+    manualPagination: true,
     pageCount: Math.max(1, Math.ceil(total / pageSize)),
-    state: { pagination: { pageIndex: page - 1, pageSize } },
+    getRowId: (row) => String(row.id),
+    enableRowSelection: true,
+    onRowSelectionChange: setRowSelection,
+    state: { pagination: { pageIndex: page - 1, pageSize }, rowSelection },
   })
 
   const pageCount = Math.max(1, Math.ceil(total / pageSize))
 
+  const selectedFiles = table.getSelectedRowModel().rows.map((r) => r.original)
+  const downloadable = selectedFiles.filter((f) => !f.local_path)
+  const uploadable = selectedFiles.filter((f) => f.local_path && f.uploaded === 0)
+
+  const [batchBusy, setBatchBusy] = React.useState(false)
+
+  const batchDownload = async () => {
+    if (!downloadable.length) {
+      toast("选中的文件都已在服务器上")
+      return
+    }
+    setBatchBusy(true)
+    const results = await Promise.allSettled(downloadable.map((f) => downloadServer(f.id)))
+    const ok = results.filter((r) => r.status === "fulfilled").length
+    toast.success(`已入队 ${ok} 个下载任务`)
+    setRowSelection({})
+    setBatchBusy(false)
+    onDeleted()
+  }
+
+  const batchUpload = async () => {
+    if (!uploadable.length) {
+      toast("没有可上传的文件（需先下载到服务器）")
+      return
+    }
+    setBatchBusy(true)
+    const results = await Promise.allSettled(uploadable.map((f) => uploadToCloud(f.id)))
+    const ok = results.filter((r) => r.status === "fulfilled").length
+    toast.success(`已入队 ${ok} 个上传任务`)
+    setRowSelection({})
+    setBatchBusy(false)
+    onDeleted()
+  }
+
   return (
     <div className="space-y-3">
+      {/* 批量操作栏 */}
+      {selectedFiles.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/50 px-4 py-2">
+          <span className="text-sm font-medium">已选 {selectedFiles.length} 项</span>
+          <Button size="sm" variant="outline" onClick={batchDownload} disabled={batchBusy}>
+            <HardDriveDownload className="size-3.5" />
+            批量下载到服务器{downloadable.length > 0 && `（${downloadable.length}）`}
+          </Button>
+          <Button size="sm" variant="outline" onClick={batchUpload} disabled={batchBusy}>
+            <CloudUpload className="size-3.5" />
+            批量上传到云{uploadable.length > 0 && `（${uploadable.length}）`}
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setRowSelection({})} disabled={batchBusy}>
+            取消选择
+          </Button>
+        </div>
+      )}
       <div className="rounded-lg border">
         <Table>
           <TableHeader>
@@ -221,7 +297,7 @@ export function FilesDataTable({
                         className={cn(
                           "h-4",
                           SKELETON_WIDTHS[j] ?? "w-20",
-                          j === 1 && "ml-auto", // 大小列右对齐
+                          j === 2 && "ml-auto", // 大小列右对齐
                         )}
                       />
                     </TableCell>

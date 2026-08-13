@@ -165,7 +165,6 @@ function AppShell() {
                 <span className="size-1.5 rounded-full bg-blue-500" />
                 Bucket: <code className="font-mono font-medium text-foreground">{bucket || "…"}</code>
               </span>
-              <JobStatusBar />
             </div>
           </div>
           <ThemeToggle />
@@ -231,6 +230,11 @@ function AppShell() {
           onPageChange={setPage}
           onDeleted={loadFiles}
         />
+
+        {/* 任务状态栏 */}
+        <div className="mt-4">
+          <JobStatusBar />
+        </div>
 
         {/* 本地文件（SERVER_FILE_ROOT） */}
         <div className="mt-6">
