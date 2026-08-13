@@ -11,18 +11,21 @@ import {
   TableRow,
 } from "@/components/ui/table"
 
-/** 连接状态指示器（放顶部 header）。 */
+/** 连接状态指示器（放顶部 header）：表示任务进度实时推送通道（Socket.IO）。 */
 export function ConnectionStatus() {
   const { connected } = useJobs()
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-full border bg-card px-3 py-1 text-xs text-muted-foreground">
+    <span
+      className="inline-flex items-center gap-1.5 rounded-full border bg-card px-3 py-1 text-xs text-muted-foreground"
+      title={connected ? "任务进度实时推送通道：已连接" : "任务进度实时推送通道：连接中…"}
+    >
       <span
         className={cn(
           "size-2 rounded-full",
           connected ? "bg-emerald-500" : "bg-muted-foreground/40",
         )}
       />
-      {connected ? "已连接" : "连接中…"}
+      {connected ? "实时推送·已连接" : "实时推送·连接中…"}
     </span>
   )
 }
@@ -31,6 +34,8 @@ const KIND_LABEL: Record<string, string> = {
   fetch: "下载",
   download: "下载",
   upload: "上传",
+  upload_beijing: "上传(北京)",
+  download_beijing: "下载(北京)",
 }
 
 /** 最近任务结果表格（放文件列表下方）。 */

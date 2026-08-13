@@ -1,4 +1,4 @@
-import type { AppInfo, Datasource, FileItem, FilesResponse, ServerFilesResponse } from "./types"
+import type { AppInfo, BucketHealth, Datasource, FileItem, FilesResponse, ServerFilesResponse } from "./types"
 
 /**
  * apikey 全程从 URL ?apikey= 取，不缓存到 localStorage。
@@ -29,6 +29,12 @@ async function handle<T>(res: Response): Promise<T> {
 export async function checkAuth(): Promise<AppInfo> {
   const res = await fetch("/api/auth", { headers: headers() })
   return handle<AppInfo>(res)
+}
+
+/** GET /api/bucket-health — 检测自己桶 / 北京桶的连通性。 */
+export async function getBucketHealth(): Promise<BucketHealth> {
+  const res = await fetch("/api/bucket-health", { headers: headers() })
+  return handle<BucketHealth>(res)
 }
 
 /** GET /api/files — 分页文件列表。 */
@@ -99,6 +105,15 @@ export async function uploadToCloud(fileId: number): Promise<FormResult> {
   return handle<FormResult>(res)
 }
 
+/** POST /api/files/:id/upload-beijing — 上传本地文件到北京桶。 */
+export async function uploadToBeijing(fileId: number): Promise<FormResult> {
+  const res = await fetch(`/api/files/${fileId}/upload-beijing`, {
+    method: "POST",
+    headers: headers(true),
+  })
+  return handle<FormResult>(res)
+}
+
 /** POST /api/jobs/:id/cancel — 请求取消一个进行中的任务。 */
 export async function cancelJob(
   jobId: number,
@@ -119,6 +134,15 @@ export async function downloadServer(fileId: number): Promise<FormResult> {
   return handle<FormResult>(res)
 }
 
+/** POST /api/files/:id/download-server-beijing — 从北京桶下载对象到服务器。 */
+export async function downloadServerBeijing(fileId: number): Promise<FormResult> {
+  const res = await fetch(`/api/files/${fileId}/download-server-beijing`, {
+    method: "POST",
+    headers: headers(true),
+  })
+  return handle<FormResult>(res)
+}
+
 /** POST /server-download — 从 bucket 下载对象到服务器目录。 */
 export async function serverDownload(
   key: string,
@@ -131,10 +155,26 @@ export async function serverDownload(
   return handle<FormResult>(res)
 }
 
-/** PATCH /api/files/:id — 手动修改 本地/云存储 状态。 */
+/** PATCH /api/files/:id 的请求体（所有字段可选）。 */
+export interface FileUpdateData {
+  filename?: string
+  object_key?: string
+  md5?: string
+  size?: number
+  bucket?: string
+  source_url?: string
+  local_path?: string | null
+  uploaded?: boolean
+  uploaded_beijing?: boolean
+  status?: string
+  datasource_id?: number | null
+  error?: string | null
+}
+
+/** PATCH /api/files/:id — 编辑文件记录（支持所有可编辑字段）。 */
 export async function updateFile(
   fileId: number,
-  data: { local_path?: string | null; uploaded?: boolean },
+  data: FileUpdateData,
 ): Promise<{ status: string; file_id: number; file: FileItem }> {
   const res = await fetch(`/api/files/${fileId}`, {
     method: "PATCH",
@@ -144,7 +184,7 @@ export async function updateFile(
   return handle(res)
 }
 
-/** DELETE /api/files/:id — 删除文件记录（同时从 bucket 删除对象）。 */
+/** DELETE /api/files/:id — 删除文件记录（仅删除数据库记录，不影响桶中对象）。 */
 export async function deleteFile(fileId: number): Promise<{ deleted: boolean; file_id: number }> {
   const res = await fetch(`/api/files/${fileId}`, {
     method: "DELETE",
@@ -164,8 +204,9 @@ export async function deleteObject(key: string): Promise<{ deleted: boolean; key
 }
 
 /** 下载链接（浏览器直跳，后端流式返回，走 query apikey）。 */
-export function downloadUrl(key: string): string {
-  return `/download?key=${encodeURIComponent(key)}&apikey=${encodeURIComponent(getApiKey())}`
+export function downloadUrl(key: string, bucket?: "self" | "beijing"): string {
+  const bucketParam = bucket === "beijing" ? "&bucket=beijing" : ""
+  return `/download?key=${encodeURIComponent(key)}${bucketParam}&apikey=${encodeURIComponent(getApiKey())}`
 }
 
 /** GET /api/server-files — 本地文件列表（SERVER_FILE_ROOT）。 */

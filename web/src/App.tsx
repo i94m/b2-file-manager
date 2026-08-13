@@ -19,12 +19,9 @@ import {
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { FilesDataTable } from "@/components/files-data-table"
-import {
-  DownloadDialog,
-  FetchUrlDialog,
-  UploadDialog,
-} from "@/components/action-dialogs"
+import { FetchUrlDialog } from "@/components/action-dialogs"
 import { ConnectionStatus, JobsTable } from "@/components/job-status-bar"
+import { BucketStatusBadges } from "@/components/bucket-status-badges"
 import { ServerFilesSection } from "@/components/server-files-section"
 
 function ThemeToggle() {
@@ -48,6 +45,8 @@ function AppShell() {
   const defaultPrefix = appInfo?.default_prefix ?? ""
   const bucketPrivateNote = appInfo?.bucket_private_note ?? ""
   const bucketPrivate = appInfo?.bucket_private ?? null
+  const beijingEnabled = appInfo?.beijing_enabled ?? false
+  const beijingBucket = appInfo?.beijing_bucket ?? ""
 
   const [files, setFiles] = React.useState<FileItem[]>([])
   const [scripts, setScripts] = React.useState<Datasource[]>([])
@@ -159,13 +158,14 @@ function AppShell() {
         {/* Header */}
         <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">B2 文件管理</h1>
+            <h1 className="text-2xl font-bold tracking-tight">文件同步助手</h1>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-              <span className="inline-flex items-center gap-1.5 rounded-full border bg-card px-3 py-1 text-xs">
-                <span className="size-1.5 rounded-full bg-blue-500" />
-                Bucket: <code className="font-mono font-medium text-foreground">{bucket || "…"}</code>
-              </span>
-              <ConnectionStatus />
+              <BucketStatusBadges
+                selfBucket={bucket}
+                beijingEnabled={beijingEnabled}
+                beijingBucket={beijingBucket}
+                trailing={<ConnectionStatus />}
+              />
             </div>
           </div>
           <ThemeToggle />
@@ -185,12 +185,6 @@ function AppShell() {
             scripts={scripts}
             onDone={refresh}
           />
-          <UploadDialog
-            defaultPrefix={defaultPrefix}
-            scripts={scripts}
-            onDone={refresh}
-          />
-          <DownloadDialog onDone={refresh} />
 
           <div className="ml-auto flex flex-wrap items-center gap-2">
             <div className="relative">
@@ -228,6 +222,7 @@ function AppShell() {
           page={page}
           pageSize={pageSize}
           loading={loading}
+          beijingEnabled={beijingEnabled}
           onPageChange={setPage}
           onDeleted={loadFiles}
         />
@@ -239,7 +234,11 @@ function AppShell() {
 
         {/* 本地文件（SERVER_FILE_ROOT） */}
         <div className="mt-6">
-          <ServerFilesSection />
+          <ServerFilesSection
+            defaultPrefix={defaultPrefix}
+            scripts={scripts}
+            onUploaded={refresh}
+          />
         </div>
       </main>
     </div>

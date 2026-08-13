@@ -9,6 +9,7 @@ export interface FileItem {
   bucket: string
   source_url: string | null
   uploaded: number // 0/1
+  uploaded_beijing: number // 0/1（北京桶，独立于 uploaded）
   status: string // pending | synced | failed | deleted
   datasource_id: number | null
   local_path: string | null // 已下载到服务器 SERVER_FILE_ROOT 的相对路径
@@ -57,6 +58,38 @@ export interface AppInfo {
   default_prefix: string
   bucket_private: boolean | null
   bucket_private_note: string
+  beijing_enabled: boolean
+  beijing_bucket: string
+}
+
+/** GET /api/bucket-health 的单项结果。 */
+export interface BucketHealthEntry {
+  ok: boolean
+  error: string | null
+  /** head_bucket 耗时（毫秒）；连不通时可能为 null。 */
+  latency_ms: number | null
+  /** head_bucket 的 HTTP 状态码。 */
+  status_code: number | null
+  /** 实际使用的 S3 endpoint URL。 */
+  endpoint: string | null
+  /** 寻址风格：auto / virtual / path。 */
+  addressing_style: string | null
+  /** 桶所在 region。 */
+  region: string | null
+  /** 版本控制状态：Enabled / Suspended / Disabled。 */
+  versioning: string | null
+  /** 是否公开读（ACL 含 AllUsers）；null = 无法检测。 */
+  public: boolean | null
+  /** 冗余模式（single-az / multi-az），部分服务才返回。 */
+  redundancy: string | null
+  /** 默认存储类，部分服务才返回。 */
+  storage_class: string | null
+}
+
+/** GET /api/bucket-health 的响应。 */
+export interface BucketHealth {
+  self: BucketHealthEntry
+  beijing: BucketHealthEntry | null
 }
 
 /** Socket.IO job_update 事件（与后端 job_payload 对齐）。 */
