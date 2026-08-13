@@ -6,12 +6,13 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Loader2, Pencil, Trash2 } from "lucide-react"
+import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Loader2, Pencil, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { type Datasource, type FileItem } from "@/lib/types"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
 import {
+  cancelJob,
   deleteFile,
   downloadServer,
   downloadUrl,
@@ -20,6 +21,7 @@ import {
   uploadToCloud,
 } from "@/lib/api"
 import { useJobs } from "@/lib/use-jobs"
+import { useConfirm } from "@/lib/use-confirm"
 import { JobProgressBadge } from "@/components/progress-cell"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -160,9 +162,213 @@ function IconBtn({
   )
 }
 
-/** 排队中黄字。 */
-function QueuedLabel() {
-  return <StatusText tone="queued">排队中</StatusText>
+/** ── 上传目录历史（localStorage）── */
+const DIR_HISTORY_KEY = "upload-dir-history"
+const MAX_DIR_HISTORY = 8
+
+function loadDirHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(DIR_HISTORY_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw)
+    return Array.isArray(arr) ? arr.slice(0, MAX_DIR_HISTORY) : []
+  } catch {
+    return []
+  }
+}
+
+function pushDirHistory(dir: string) {
+  const trimmed = dir.trim().replace(/^\/+|\/+$/g, "")
+  if (!trimmed) return
+  const current = loadDirHistory()
+  const updated = [trimmed, ...current.filter((d) => d !== trimmed)].slice(0, MAX_DIR_HISTORY)
+  try {
+    localStorage.setItem(DIR_HISTORY_KEY, JSON.stringify(updated))
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 小型取消任务按钮（排队 / 上传中均可点击取消）。 */
+function CancelJobBtn({ file }: { file: FileItem }) {
+  const { jobs } = useJobs()
+  const [cancelling, setCancelling] = React.useState(false)
+  const [confirm, confirmDialog] = useConfirm()
+  const job = file.job_id ? jobs[file.job_id] : undefined
+  if (!job) return null
+
+  const handleCancel = async () => {
+    if (!await confirm({
+      title: "取消任务",
+      description: `确认取消任务「${job.filename}」？`,
+      confirmText: "取消任务",
+      destructive: true,
+    })) return
+    setCancelling(true)
+    try {
+      const r = await cancelJob(job.id)
+      toast(r.message)
+    } catch (e) {
+      toast.error("取消失败", { description: (e as Error).message })
+    } finally {
+      setCancelling(false)
+    }
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={handleCancel}
+        disabled={cancelling}
+        className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-destructive disabled:opacity-50"
+        title="取消任务"
+      >
+        {cancelling ? <Loader2 className="size-3 animate-spin" /> : <X className="size-3" />}
+      </button>
+      {confirmDialog}
+    </>
+  )
+}
+
+/** 排队中黄字 + 取消按钮。 */
+function QueuedLabel({ file }: { file: FileItem }) {
+  return (
+    <div className="flex items-center gap-0.5">
+      <StatusText tone="queued">排队中</StatusText>
+      <CancelJobBtn file={file} />
+    </div>
+  )
+}
+
+/** 校验目录输入（与后端 clean_prefix 规则一致：禁止 '..' 路径穿越）。 */
+function validateDir(value: string): string | null {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  const parts = trimmed.replace(/\\/g, "/").split("/")
+  if (parts.some((p) => p === "..")) return "目录不能包含 '..'"
+  return null
+}
+
+/** 校验文件名：非空、无路径分隔符、不能是 '.' 或 '..'。 */
+function validateFilename(value: string): string | null {
+  const trimmed = value.trim()
+  if (!trimmed) return "文件名不能为空"
+  if (/[/\\]/.test(trimmed)) return "文件名不能包含路径分隔符"
+  if (trimmed === "." || trimmed === "..") return "文件名无效"
+  return null
+}
+
+/** 上传到桶 Dialog：输入目录 + 文件名，下方有最近目录历史快捷填充。 */
+function UploadKeyDialog({
+  file,
+  bucket,
+  onClose,
+  onDone,
+}: {
+  file: FileItem
+  bucket: "self" | "beijing"
+  onClose: () => void
+  onDone: () => void
+}) {
+  const [history] = React.useState(() => loadDirHistory())
+  const [dir, setDir] = React.useState(history[0] ?? "")
+  const [filename, setFilename] = React.useState(file.filename ?? "")
+  const [busy, setBusy] = React.useState(false)
+
+  const dirError = validateDir(dir)
+  const nameError = validateFilename(filename)
+  const hasError = !!dirError || !!nameError
+
+  const submit = async () => {
+    if (hasError) return
+    const cleanDir = dir.trim().replace(/^\/+|\/+$/g, "")
+    const cleanName = filename.trim()
+    const key = cleanDir ? `${cleanDir}/${cleanName}` : cleanName
+    setBusy(true)
+    try {
+      const fn = bucket === "beijing" ? uploadToBeijing : uploadToCloud
+      const r = await fn(file.id, key)
+      toast.success(r.message)
+      if (cleanDir) pushDirHistory(cleanDir)
+      onDone()
+    } catch (e) {
+      toast.error("上传失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const onEnter = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !hasError) submit()
+  }
+
+  return (
+    <Dialog open onOpenChange={(v) => { if (!v && !busy) onClose() }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>
+            上传到{bucket === "beijing" ? "北京桶" : "自己桶"}
+          </DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <div className="space-y-2">
+            <Label htmlFor="upload-dir">目录</Label>
+            <Input
+              id="upload-dir"
+              value={dir}
+              onChange={(e) => setDir(e.target.value)}
+              onKeyDown={onEnter}
+              placeholder="如 backups/2026"
+              className={cn("font-mono text-sm", dirError && "border-destructive focus-visible:ring-destructive")}
+              autoFocus
+            />
+            {dirError && (
+              <p className="text-xs text-destructive">{dirError}</p>
+            )}
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="upload-name">文件名</Label>
+            <Input
+              id="upload-name"
+              value={filename}
+              onChange={(e) => setFilename(e.target.value)}
+              onKeyDown={onEnter}
+              className={cn("font-mono text-sm", nameError && "border-destructive focus-visible:ring-destructive")}
+            />
+            {nameError && (
+              <p className="text-xs text-destructive">{nameError}</p>
+            )}
+          </div>
+          {history.length > 0 && (
+            <div className="space-y-1.5">
+              <span className="text-xs text-muted-foreground">最近目录（点击填充）</span>
+              <div className="flex flex-wrap gap-1.5">
+                {history.map((d) => (
+                  <button
+                    key={d}
+                    type="button"
+                    onClick={() => setDir(d)}
+                    className="rounded bg-muted px-2 py-1 font-mono text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  >
+                    {d}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={busy}>
+            取消
+          </Button>
+          <Button onClick={submit} disabled={busy || hasError}>
+            {busy ? "提交中…" : "上传"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 /** 单元格内的紧凑操作按钮（图标+文字），失败时 hover 展示错误。 */
@@ -205,8 +411,13 @@ function LocalCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void 
   const job = file.job_id ? jobs[file.job_id] : undefined
   const isMyJob = job && (job.kind === "fetch" || job.kind === "download")
 
-  if (isMyJob && job!.status === "queued") return <QueuedLabel />
-  if (isMyJob && job!.status === "uploading") return <JobProgressBadge file={file} />
+  if (isMyJob && job!.status === "queued") return <QueuedLabel file={file} />
+  if (isMyJob && job!.status === "uploading") return (
+    <div className="flex items-center gap-0.5">
+      <JobProgressBadge file={file} />
+      <CancelJobBtn file={file} />
+    </div>
+  )
 
   if (file.local_path) return <StatusText tone="active">已存在</StatusText>
 
@@ -230,12 +441,17 @@ function LocalCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void 
 /** 自己桶列：排队→黄字 / 上传中→进度 / 已存在→绿字+下载 / 有本地→上传按钮。 */
 function CloudCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void }) {
   const { jobs } = useJobs()
-  const [busy, setBusy] = React.useState(false)
+  const [dialogOpen, setDialogOpen] = React.useState(false)
   const job = file.job_id ? jobs[file.job_id] : undefined
   const isMyJob = job && job.kind === "upload"
 
-  if (isMyJob && job!.status === "queued") return <QueuedLabel />
-  if (isMyJob && job!.status === "uploading") return <JobProgressBadge file={file} />
+  if (isMyJob && job!.status === "queued") return <QueuedLabel file={file} />
+  if (isMyJob && job!.status === "uploading") return (
+    <div className="flex items-center gap-0.5">
+      <JobProgressBadge file={file} />
+      <CancelJobBtn file={file} />
+    </div>
+  )
 
   const failed = file.status === "failed" && !!file.local_path && !file.uploaded
 
@@ -249,19 +465,28 @@ function CloudCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void 
   }
 
   if (file.local_path) {
-    const handleUpload = async () => {
-      setBusy(true)
-      try {
-        const r = await uploadToCloud(file.id)
-        toast.success(r.message)
-        onUpdated()
-      } catch (e) {
-        toast.error("上传失败", { description: (e as Error).message })
-      } finally {
-        setBusy(false)
-      }
-    }
-    return <CellButton icon={CloudUpload} label="上传" title="上传到自己桶" onClick={handleUpload} busy={busy} error={failed ? file.error : undefined} />
+    return (
+      <>
+        <CellButton
+          icon={CloudUpload}
+          label="上传"
+          title="上传到自己桶"
+          onClick={() => setDialogOpen(true)}
+          error={failed ? file.error : undefined}
+        />
+        {dialogOpen && (
+          <UploadKeyDialog
+            file={file}
+            bucket="self"
+            onClose={() => setDialogOpen(false)}
+            onDone={() => {
+              setDialogOpen(false)
+              onUpdated()
+            }}
+          />
+        )}
+      </>
+    )
   }
 
   return <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
@@ -270,12 +495,17 @@ function CloudCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void 
 /** 北京桶列：与 CloudCell 对称，读 uploaded_beijing，检测 upload_beijing 任务。 */
 function BeijingCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void }) {
   const { jobs } = useJobs()
-  const [busy, setBusy] = React.useState(false)
+  const [dialogOpen, setDialogOpen] = React.useState(false)
   const job = file.job_id ? jobs[file.job_id] : undefined
   const isMyJob = job && job.kind === "upload_beijing"
 
-  if (isMyJob && job!.status === "queued") return <QueuedLabel />
-  if (isMyJob && job!.status === "uploading") return <JobProgressBadge file={file} />
+  if (isMyJob && job!.status === "queued") return <QueuedLabel file={file} />
+  if (isMyJob && job!.status === "uploading") return (
+    <div className="flex items-center gap-0.5">
+      <JobProgressBadge file={file} />
+      <CancelJobBtn file={file} />
+    </div>
+  )
 
   const failed = file.status === "failed" && !!file.local_path && !file.uploaded_beijing
 
@@ -289,19 +519,28 @@ function BeijingCell({ file, onUpdated }: { file: FileItem; onUpdated: () => voi
   }
 
   if (file.local_path) {
-    const handleUpload = async () => {
-      setBusy(true)
-      try {
-        const r = await uploadToBeijing(file.id)
-        toast.success(r.message)
-        onUpdated()
-      } catch (e) {
-        toast.error("上传失败", { description: (e as Error).message })
-      } finally {
-        setBusy(false)
-      }
-    }
-    return <CellButton icon={CloudUpload} label="上传" title="上传到北京桶" onClick={handleUpload} busy={busy} error={failed ? file.error : undefined} />
+    return (
+      <>
+        <CellButton
+          icon={CloudUpload}
+          label="上传"
+          title="上传到北京桶"
+          onClick={() => setDialogOpen(true)}
+          error={failed ? file.error : undefined}
+        />
+        {dialogOpen && (
+          <UploadKeyDialog
+            file={file}
+            bucket="beijing"
+            onClose={() => setDialogOpen(false)}
+            onDone={() => {
+              setDialogOpen(false)
+              onUpdated()
+            }}
+          />
+        )}
+      </>
+    )
   }
 
   return <StatusText error={failed ? file.error : undefined}>待上传</StatusText>

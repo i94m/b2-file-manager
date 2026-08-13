@@ -4,6 +4,7 @@ import { toast } from "sonner"
 
 import { type Datasource } from "@/lib/types"
 import { uploadFile, urlUpload, serverDownload } from "@/lib/api"
+import { addPrefix, getLastPrefix, validatePrefix } from "@/lib/prefix"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -16,6 +17,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { PrefixInput } from "@/components/prefix-input"
 import {
   Select,
   SelectContent,
@@ -31,15 +33,15 @@ interface CommonProps {
 }
 
 /**
- * prefix 输入：初始取后端返回的 .env 默认值（异步到达），用户手动输入后不再覆盖。
- * 解决 defaultPrefix 异步加载导致 useState 初始值为空的问题。
+ * prefix 输入：初始值优先取 localStorage 历史，其次后端 .env 默认值。
+ * 用户手动输入后不再覆盖（解决 defaultPrefix 异步加载覆盖输入的问题）。
  */
 function usePrefix(defaultPrefix: string) {
-  const [prefix, setPrefix] = React.useState(defaultPrefix)
+  const [prefix, setPrefix] = React.useState(() => getLastPrefix() || defaultPrefix)
   const dirty = React.useRef(false)
   React.useEffect(() => {
     if (!dirty.current && defaultPrefix) {
-      setPrefix(defaultPrefix)
+      setPrefix(getLastPrefix() || defaultPrefix)
     }
   }, [defaultPrefix])
   const onChange = React.useCallback((v: string) => {
@@ -50,24 +52,36 @@ function usePrefix(defaultPrefix: string) {
 }
 
 /** 录入链接 Dialog。 */
-export function FetchUrlDialog({ scripts, onDone }: CommonProps) {
+export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
   const [open, setOpen] = React.useState(false)
   const [url, setUrl] = React.useState("")
-  const [prefix, setPrefix] = React.useState("")
+  const { prefix, setPrefix } = usePrefix(defaultPrefix)
   const [datasourceId, setDatasourceId] = React.useState("")
   const [busy, setBusy] = React.useState(false)
 
+  const prefixValid = validatePrefix(prefix).valid
+  const urlFilename = React.useMemo(() => {
+    try {
+      const u = new URL(url.trim())
+      const name = u.pathname.split("/").filter(Boolean).pop() ?? ""
+      return name || undefined
+    } catch {
+      return undefined
+    }
+  }, [url])
+
   const submit = async () => {
     if (!url.trim()) return
+    const normalized = validatePrefix(prefix).normalized
     setBusy(true)
     try {
       const r = await urlUpload(url.trim(), {
-        prefix: prefix.trim() || undefined,
+        prefix: normalized || undefined,
         datasourceId: datasourceId ? Number(datasourceId) : undefined,
       })
       toast(r.message)
+      if (normalized) addPrefix(normalized)
       setUrl("")
-      setPrefix("")
       setOpen(false)
       onDone()
     } catch (e) {
@@ -103,15 +117,13 @@ export function FetchUrlDialog({ scripts, onDone }: CommonProps) {
               onKeyDown={(e) => e.key === "Enter" && submit()}
             />
           </div>
-          <div className="grid grid-cols-[1fr_200px] items-end gap-3">
+          <div className="grid grid-cols-[1fr_200px] items-start gap-3">
             <div className="space-y-2">
               <Label htmlFor="fetch-dir">目录（可选）</Label>
-              <Input
-                id="fetch-dir"
-                placeholder="如 backups/2026"
+              <PrefixInput
                 value={prefix}
-                onChange={(e) => setPrefix(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && submit()}
+                onChange={setPrefix}
+                filename={urlFilename}
               />
             </div>
             <div className="space-y-2">
@@ -135,7 +147,7 @@ export function FetchUrlDialog({ scripts, onDone }: CommonProps) {
           <Button variant="outline" onClick={() => setOpen(false)} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || !url.trim()}>
+          <Button onClick={submit} disabled={busy || !url.trim() || !prefixValid}>
             {busy ? "提交中…" : "录入"}
           </Button>
         </DialogFooter>
@@ -152,15 +164,19 @@ export function UploadDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
   const [datasourceId, setDatasourceId] = React.useState("")
   const [busy, setBusy] = React.useState(false)
 
+  const prefixValid = validatePrefix(prefix).valid
+
   const submit = async () => {
     if (!file) return
+    const normalized = validatePrefix(prefix).normalized
     setBusy(true)
     try {
       const r = await uploadFile(file, {
-        prefix: prefix || undefined,
+        prefix: normalized || undefined,
         datasourceId: datasourceId ? Number(datasourceId) : undefined,
       })
       toast.success(r.message)
+      if (normalized) addPrefix(normalized)
       setFile(null)
       setOpen(false)
       onDone()
@@ -194,12 +210,11 @@ export function UploadDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-2">
-              <Label htmlFor="upload-prefix">前缀（可选）</Label>
-              <Input
-                id="upload-prefix"
-                placeholder="如 backups/2026"
+              <Label htmlFor="upload-prefix">目录（可选）</Label>
+              <PrefixInput
                 value={prefix}
-                onChange={(e) => setPrefix(e.target.value)}
+                onChange={setPrefix}
+                filename={file?.name}
               />
             </div>
             <div className="space-y-2">
@@ -223,7 +238,7 @@ export function UploadDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
           <Button variant="outline" onClick={() => setOpen(false)} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || !file}>
+          <Button onClick={submit} disabled={busy || !file || !prefixValid}>
             {busy ? "上传中…" : "上传"}
           </Button>
         </DialogFooter>

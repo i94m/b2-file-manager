@@ -27,6 +27,23 @@ export interface FilesResponse {
   page_size: number
 }
 
+/** 桶对象列表里的一项（GET /api/objects 返回）。 */
+export interface BucketObject {
+  key: string
+  size: number
+  last_modified: number
+}
+
+/** GET /api/objects 的响应。 */
+export interface ObjectsResponse {
+  prefix: string
+  bucket: string
+  objects: BucketObject[]
+  total: number
+  page: number
+  page_size: number
+}
+
 /** 本地文件列表里的一项（SERVER_FILE_ROOT 目录）。 */
 export interface ServerFile {
   path: string

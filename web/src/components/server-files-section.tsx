@@ -4,6 +4,7 @@ import { toast } from "sonner"
 
 import { type Datasource, type ServerFile } from "@/lib/types"
 import { deleteServerFile, getServerFiles, serverFileDownloadUrl } from "@/lib/api"
+import { useConfirm } from "@/lib/use-confirm"
 import { formatBytes } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -35,6 +36,7 @@ export function ServerFilesSection({
   const [totalSize, setTotalSize] = React.useState(0)
   const [loading, setLoading] = React.useState(true)
   const [busyPath, setBusyPath] = React.useState<string | null>(null)
+  const [confirm, confirmDialog] = useConfirm()
 
   const load = React.useCallback(async () => {
     setLoading(true)
@@ -55,7 +57,12 @@ export function ServerFilesSection({
   }, [load])
 
   const handleDelete = async (f: ServerFile) => {
-    if (!confirm(`确认删除本地文件 ${f.path}？此操作不可撤销。`)) return
+    if (!await confirm({
+      title: "删除本地文件",
+      description: `确认删除本地文件 ${f.path}？此操作不可撤销。`,
+      confirmText: "删除",
+      destructive: true,
+    })) return
     setBusyPath(f.path)
     try {
       await deleteServerFile(f.path)
@@ -158,6 +165,7 @@ export function ServerFilesSection({
           </TableBody>
         </Table>
       </div>
+      {confirmDialog}
     </section>
   )
 }

@@ -446,16 +446,27 @@ def default_prefix() -> str:
     与 bucket_prefix() 的区别：
       - bucket_prefix()：全局固定的应用隔离前缀，不暴露给用户、不可在表单覆盖；
       - default_prefix()：仅作为表单默认值，用户上传/录入时可随意修改。
-    两者最终在 uuid_object_key() 拼接为：BUCKET_PREFIX/<default_prefix>/UUID.ext
+    两者最终在 build_object_key() 拼接为：BUCKET_PREFIX/<default_prefix>/<原始文件名>
     """
     return os.environ.get("DEFAULT_PREFIX") or os.environ.get("B2_PREFIX", "")
 
 
-def uuid_object_key(prefix: str, filename: str) -> str:
-    """生成 BUCKET_PREFIX/<prefix>/UUID.后缀 的对象 key，保留原始文件扩展名。"""
-    ext = PurePosixPath(filename).suffix
-    parts = [p for p in (bucket_prefix(), prefix, f"{uuid.uuid4().hex}{ext}") if p]
+def build_object_key(prefix: str, filename: str) -> str:
+    """生成 BUCKET_PREFIX/<prefix>/<原始文件名> 的对象 key，保留原始文件名。"""
+    parts = [p for p in (bucket_prefix(), prefix, filename) if p]
     return "/".join(parts)
+
+
+def object_exists(client, bucket_name: str, object_key: str) -> bool:
+    """head_object 成功即存在；404/NotFound 视为不存在；其它异常抛出。"""
+    try:
+        client.head_object(Bucket=bucket_name, Key=object_key)
+        return True
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
 
 
 def job_payload(job: dict) -> dict:
@@ -1082,7 +1093,7 @@ def socket_connect():
     emit("jobs_snapshot", [job_payload(job) for job in recent_jobs()])
 
 
-def list_objects(prefix: str, limit: int = 50, client=None, bucket_name: str | None = None) -> list[dict]:
+def list_objects(prefix: str, limit: int | None = 50, client=None, bucket_name: str | None = None) -> list[dict]:
     prefix = prefix.strip("/")
     if prefix:
         prefix += "/"
@@ -1104,7 +1115,9 @@ def list_objects(prefix: str, limit: int = 50, client=None, bucket_name: str | N
                 "last_modified": int(last_modified.timestamp()) if last_modified else 0,
             })
     objects.sort(key=lambda obj: obj["last_modified"], reverse=True)
-    return objects[:limit]
+    if limit is not None:
+        objects = objects[:limit]
+    return objects
 
 
 def stream_body(body, chunk_size: int = 1024 * 1024):
@@ -1196,7 +1209,8 @@ def index():
 def upload():
     """上传本地文件到 bucket。
 
-    表单字段：file（必填）、prefix（可选）、datasource_id（可选）。
+    表单字段：file（必填）、prefix（可选）、key（可选，自定义完整 object key）、
+    bucket（可选，self|beijing）、datasource_id（可选）。
     React (Accept: application/json) 调用时返回 JSON，旧表单则 flash + redirect。
     """
     blocked = require_auth()
@@ -1208,13 +1222,34 @@ def upload():
     if file is None or not file.filename:
         return respond("error", "请选择要上传的文件。", apikey, "error", 400)
 
-    try:
-        prefix = clean_prefix(request.form.get("prefix") or default_prefix())
-    except argparse.ArgumentTypeError as exc:
-        return respond("error", str(exc), apikey, "error", 400)
-
     filename = Path(file.filename.replace("\\", "/")).name
-    object_key = uuid_object_key(prefix, filename)
+
+    # 目标桶：self（默认）或 beijing
+    bucket = (request.form.get("bucket") or "self").strip()
+    if bucket == "beijing":
+        if not beijing_enabled():
+            return respond("error", "北京桶未启用。", apikey, "error", 400)
+        kind = "upload_beijing"
+    else:
+        bucket = "self"
+        kind = "upload"
+
+    # 自定义完整 key 优先；否则按 prefix 生成 key（保留原始文件名）
+    custom_key = (request.form.get("key") or "").strip().lstrip("/")
+    if custom_key:
+        object_key = custom_key
+    else:
+        try:
+            prefix = clean_prefix(request.form.get("prefix") or default_prefix())
+        except argparse.ArgumentTypeError as exc:
+            return respond("error", str(exc), apikey, "error", 400)
+        object_key = build_object_key(prefix, filename)
+
+    # 同名拒传：目标 key 已存在则报错，不创建 job、不入队
+    client, bucket_name = resolve_bucket(bucket)
+    if object_exists(client, bucket_name, object_key):
+        return respond("error", f"同名文件已存在：{object_key}", apikey, "error", 400)
+
     datasource_id = request.form.get("datasource_id", type=int)
     incoming = UPLOAD_DIR / f"incoming-{secrets.token_hex(8)}.part"
 
@@ -1225,9 +1260,9 @@ def upload():
             raise ValueError("文件内容为空。")
         with get_db() as conn:
             cursor = conn.execute(
-                "INSERT INTO jobs (filename, object_key, size, status, created_at) "
-                "VALUES (?, ?, ?, 'queued', ?)",
-                (filename, object_key, size, time.time()),
+                "INSERT INTO jobs (kind, filename, object_key, size, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'queued', ?)",
+                (kind, filename, object_key, size, time.time()),
             )
             job_id = cursor.lastrowid
         os.replace(incoming, UPLOAD_DIR / f"{job_id}.part")
@@ -1269,7 +1304,10 @@ def server_upload():
     if not source.is_file():
         return respond("error", f"路径不存在或不是普通文件: {source}", apikey, "error", 400)
 
-    object_key = uuid_object_key(prefix, source.name)
+    object_key = build_object_key(prefix, source.name)
+    # 同名拒传
+    if object_exists(get_client(), os.environ["B2_BUCKET"], object_key):
+        return respond("error", f"同名文件已存在：{object_key}", apikey, "error", 400)
     size = source.stat().st_size
     datasource_id = request.form.get("datasource_id", type=int)
     job_id = insert_job(
@@ -1430,7 +1468,10 @@ def url_upload():
         except argparse.ArgumentTypeError as exc:
             return respond("error", str(exc), apikey, "error", 400)
         filename = PurePosixPath(urlparse(url).path).name or "download"
-        object_key = uuid_object_key(prefix, filename)
+        object_key = build_object_key(prefix, filename)
+        # 同名拒传：登记阶段就拒掉，避免后续 upload-cloud 冲突
+        if object_exists(get_client(), os.environ["B2_BUCKET"], object_key):
+            return respond("error", f"同名文件已存在：{object_key}", apikey, "error", 400)
 
     filename = PurePosixPath(urlparse(url).path).name or "download"
 
@@ -1496,16 +1537,23 @@ def api_file_upload_cloud(file_id: int):
     if not source.exists():
         return jsonify({"error": f"本地文件不存在: {local_path}"}), 400
 
+    body = request.get_json(silent=True) or {}
+    custom_key = (body.get("key") or "").strip().lstrip("/")
+    object_key = custom_key or f["object_key"]
+
     filename = f["filename"] or "download"
     job_id = insert_job(
         kind="upload",
         filename=filename,
-        object_key=f["object_key"],
+        object_key=object_key,
         size=f.get("size") or 0,
         source=str(source),
     )
     with get_db() as conn:
-        conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
+        conn.execute(
+            "UPDATE files SET job_id=?, object_key=?, updated_at=? WHERE id=?",
+            (job_id, object_key, time.time(), file_id),
+        )
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
     return jsonify({
@@ -1621,16 +1669,23 @@ def api_file_upload_beijing(file_id: int):
     if not source.exists():
         return jsonify({"error": f"本地文件不存在: {local_path}"}), 400
 
+    body = request.get_json(silent=True) or {}
+    custom_key = (body.get("key") or "").strip().lstrip("/")
+    object_key = custom_key or f["object_key"]
+
     filename = f["filename"] or "download"
     job_id = insert_job(
         kind="upload_beijing",
         filename=filename,
-        object_key=f["object_key"],
+        object_key=object_key,
         size=f.get("size") or 0,
         source=str(source),
     )
     with get_db() as conn:
-        conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
+        conn.execute(
+            "UPDATE files SET job_id=?, object_key=?, updated_at=? WHERE id=?",
+            (job_id, object_key, time.time(), file_id),
+        )
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
     return jsonify({
@@ -1839,7 +1894,11 @@ def api_submit():
             errors.append({"url": url, "error": "链接必须以 http:// 或 https:// 开头"})
             continue
         filename = PurePosixPath(urlparse(url).path).name or "download"
-        object_key = uuid_object_key(prefix, filename)
+        object_key = build_object_key(prefix, filename)
+        # 同名拒传：冲突放进 errors，不中断其它链接
+        if object_exists(get_client(), os.environ["B2_BUCKET"], object_key):
+            errors.append({"url": url, "error": f"同名文件已存在：{object_key}"})
+            continue
         job_id = insert_job(
             kind="fetch",
             filename=filename,
@@ -2113,6 +2172,56 @@ def api_delete_object():
     return jsonify({"deleted": True, "key": key})
 
 
+@app.post("/api/objects/rename")
+def api_rename_object():
+    """重命名/移动桶内对象（copy + delete）。
+
+    请求体 JSON：
+        {"bucket": "self|beijing", "from_key": "old/path", "to_key": "new/path"}
+
+    返回：
+        {"ok": true, "from_key": "...", "to_key": "..."}
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    body = request.get_json(silent=True) or {}
+    target = (body.get("bucket") or "self").strip()
+    from_key = (body.get("from_key") or "").strip().lstrip("/")
+    to_key = (body.get("to_key") or "").strip().lstrip("/")
+
+    if not from_key or not to_key:
+        return jsonify({"error": "缺少 from_key 或 to_key"}), 400
+    if from_key == to_key:
+        return jsonify({"error": "新名称与原名称相同"}), 400
+
+    try:
+        client, bucket_name = resolve_bucket(target)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    source = {"Bucket": bucket_name, "Key": from_key}
+    try:
+        client.copy_object(Bucket=bucket_name, Key=to_key, CopySource=source)
+        client.delete_object(Bucket=bucket_name, Key=from_key)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return jsonify({"error": f"源对象不存在: {from_key}"}), 404
+        return jsonify({"error": str(exc)}), 502
+    except (BotoCoreError, OSError) as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    # 同步更新 files 表的 object_key
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE files SET object_key=?, updated_at=? WHERE object_key=?",
+            (to_key, time.time(), from_key),
+        )
+
+    return jsonify({"ok": True, "from_key": from_key, "to_key": to_key})
+
+
 @app.delete("/api/files/<int:file_id>")
 def api_delete_file(file_id: int):
     """删除文件记录（仅删除数据库记录，不删除任何桶中的文件对象）。"""
@@ -2220,16 +2329,37 @@ def api_objects():
     blocked = require_auth()
     if blocked:
         return blocked
+    target = request.args.get("bucket", "self").strip() or "self"
     raw_prefix = request.args.get("prefix", "") or default_prefix()
+    q = (request.args.get("q") or "").strip()
+    page = max(1, request.args.get("page", 1, type=int))
+    page_size = max(1, min(200, request.args.get("page_size", 50, type=int)))
     try:
         prefix = clean_prefix(raw_prefix)
     except argparse.ArgumentTypeError as exc:
         return jsonify({"error": str(exc)}), 400
     try:
-        objects = list_objects(prefix)
+        client, bucket_name = resolve_bucket(target)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    try:
+        all_objects = list_objects(prefix, limit=None, client=client, bucket_name=bucket_name)
     except (BotoCoreError, ClientError) as exc:
         return jsonify({"error": str(exc)}), 502
-    return jsonify({"prefix": prefix, "objects": objects})
+    if q:
+        ql = q.lower()
+        all_objects = [o for o in all_objects if ql in o["key"].lower()]
+    total = len(all_objects)
+    start = (page - 1) * page_size
+    objects = all_objects[start:start + page_size]
+    return jsonify({
+        "prefix": prefix,
+        "bucket": target,
+        "objects": objects,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    })
 
 
 @app.post("/scripts")

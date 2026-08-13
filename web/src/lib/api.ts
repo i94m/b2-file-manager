@@ -1,4 +1,4 @@
-import type { AppInfo, BucketHealth, Datasource, FileItem, FilesResponse, ServerFilesResponse } from "./types"
+import type { AppInfo, BucketHealth, Datasource, FileItem, FilesResponse, ObjectsResponse, ServerFilesResponse } from "./types"
 
 /**
  * apikey 全程从 URL ?apikey= 取，不缓存到 localStorage。
@@ -73,11 +73,13 @@ export interface FormResult {
 /** POST /upload — 本地文件上传到 bucket（FormData）。 */
 export async function uploadFile(
   file: File,
-  opts: { prefix?: string; datasourceId?: number } = {},
+  opts: { prefix?: string; key?: string; bucket?: "self" | "beijing"; datasourceId?: number } = {},
 ): Promise<FormResult> {
   const form = new FormData()
   form.append("file", file)
   if (opts.prefix) form.append("prefix", opts.prefix)
+  if (opts.key) form.append("key", opts.key)
+  if (opts.bucket) form.append("bucket", opts.bucket)
   if (opts.datasourceId) form.append("datasource_id", String(opts.datasourceId))
   const res = await fetch("/upload", { method: "POST", headers: headers(true), body: form })
   return handle<FormResult>(res)
@@ -96,20 +98,22 @@ export async function urlUpload(
   return handle<FormResult>(res)
 }
 
-/** POST /api/files/:id/upload-cloud — 上传本地文件到云 bucket。 */
-export async function uploadToCloud(fileId: number): Promise<FormResult> {
+/** POST /api/files/:id/upload-cloud — 上传本地文件到云 bucket（可指定自定义 key）。 */
+export async function uploadToCloud(fileId: number, key?: string): Promise<FormResult> {
   const res = await fetch(`/api/files/${fileId}/upload-cloud`, {
     method: "POST",
-    headers: headers(true),
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify(key ? { key } : {}),
   })
   return handle<FormResult>(res)
 }
 
-/** POST /api/files/:id/upload-beijing — 上传本地文件到北京桶。 */
-export async function uploadToBeijing(fileId: number): Promise<FormResult> {
+/** POST /api/files/:id/upload-beijing — 上传本地文件到北京桶（可指定自定义 key）。 */
+export async function uploadToBeijing(fileId: number, key?: string): Promise<FormResult> {
   const res = await fetch(`/api/files/${fileId}/upload-beijing`, {
     method: "POST",
-    headers: headers(true),
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify(key ? { key } : {}),
   })
   return handle<FormResult>(res)
 }
@@ -207,6 +211,38 @@ export async function deleteObject(key: string): Promise<{ deleted: boolean; key
 export function downloadUrl(key: string, bucket?: "self" | "beijing"): string {
   const bucketParam = bucket === "beijing" ? "&bucket=beijing" : ""
   return `/download?key=${encodeURIComponent(key)}${bucketParam}&apikey=${encodeURIComponent(getApiKey())}`
+}
+
+/** POST /api/objects/rename — 重命名/移动桶内对象（copy + delete）。 */
+export async function renameObject(
+  fromKey: string,
+  toKey: string,
+  bucket: "self" | "beijing" = "self",
+): Promise<{ ok: boolean; from_key: string; to_key: string }> {
+  const res = await fetch("/api/objects/rename", {
+    method: "POST",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify({ bucket, from_key: fromKey, to_key: toKey }),
+  })
+  return handle(res)
+}
+
+/** GET /api/objects — 列出桶内对象（按前缀 + 文件名筛选）。bucket 默认 self，可选 beijing。 */
+export async function getObjects(
+  prefix: string,
+  bucket: "self" | "beijing" = "self",
+  page = 1,
+  pageSize = 50,
+  q?: string,
+): Promise<ObjectsResponse> {
+  const qs = new URLSearchParams()
+  if (prefix) qs.set("prefix", prefix)
+  if (q) qs.set("q", q)
+  qs.set("bucket", bucket)
+  qs.set("page", String(page))
+  qs.set("page_size", String(pageSize))
+  const res = await fetch(`/api/objects?${qs}`, { headers: headers() })
+  return handle<ObjectsResponse>(res)
 }
 
 /** GET /api/server-files — 本地文件列表（SERVER_FILE_ROOT）。 */

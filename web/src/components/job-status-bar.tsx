@@ -1,7 +1,12 @@
-import { Ban, CheckCircle2, Loader2, XCircle } from "lucide-react"
+import * as React from "react"
+import { Ban, CheckCircle2, Loader2, X, XCircle } from "lucide-react"
+import { toast } from "sonner"
 
 import { useJobs } from "@/lib/use-jobs"
-import { cn, formatBytes, formatTime } from "@/lib/utils"
+import { cancelJob } from "@/lib/api"
+import { useConfirm } from "@/lib/use-confirm"
+import { cn, formatBytes, formatRate, formatTime } from "@/lib/utils"
+import { Button } from "@/components/ui/button"
 import {
   Table,
   TableBody,
@@ -40,7 +45,7 @@ const KIND_LABEL: Record<string, string> = {
 
 /** 最近任务结果表格（放文件列表下方）。 */
 export function JobsTable() {
-  const { jobs } = useJobs()
+  const { jobs, stats } = useJobs()
 
   const recent = Object.values(jobs)
     .sort((a, b) => b.id - a.id)
@@ -58,13 +63,16 @@ export function JobsTable() {
             <TableHead>文件名</TableHead>
             <TableHead className="w-16">类型</TableHead>
             <TableHead className="w-20 text-right">大小</TableHead>
-            <TableHead className="w-24">进度</TableHead>
-            <TableHead className="w-36">时间</TableHead>
+            <TableHead className="w-40">进度</TableHead>
+            <TableHead className="w-32">时间</TableHead>
+            <TableHead className="w-16 text-right">操作</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {recent.map((j) => {
+            const stat = stats[j.id]
             const pct = j.size > 0 ? Math.min(100, (j.progress / j.size) * 100) : 0
+            const isActive = j.status === "queued" || j.status === "uploading"
             return (
               <TableRow key={j.id}>
                 <TableCell>
@@ -92,16 +100,30 @@ export function JobsTable() {
                   {formatBytes(j.size)}
                 </TableCell>
                 <TableCell className="text-xs tabular-nums text-muted-foreground">
-                  {j.status === "done"
-                    ? "完成"
-                    : j.status === "failed"
-                      ? "失败"
-                      : j.status === "cancelled"
-                        ? "已取消"
-                        : `${pct.toFixed(0)}%`}
+                  {j.status === "done" ? (
+                    "完成"
+                  ) : j.status === "failed" ? (
+                    <span className="text-destructive">失败</span>
+                  ) : j.status === "cancelled" ? (
+                    "已取消"
+                  ) : j.status === "uploading" && stat ? (
+                    <div className="space-y-0.5">
+                      <div className="text-blue-600 dark:text-blue-400">
+                        {pct.toFixed(0)}%{stat.rate > 0 ? ` · ${formatRate(stat.rate)}` : ""}
+                      </div>
+                      <div className="text-[10px] text-muted-foreground">
+                        {formatBytes(j.progress)} / {formatBytes(j.size)}
+                      </div>
+                    </div>
+                  ) : (
+                    `${pct.toFixed(0)}%`
+                  )}
                 </TableCell>
                 <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                   {formatTime(j.created_at)}
+                </TableCell>
+                <TableCell className="text-right">
+                  {isActive && <CancelBtn jobId={j.id} filename={j.filename} />}
                 </TableCell>
               </TableRow>
             )
@@ -109,5 +131,43 @@ export function JobsTable() {
         </TableBody>
       </Table>
     </div>
+  )
+}
+
+function CancelBtn({ jobId, filename }: { jobId: number; filename: string }) {
+  const [cancelling, setCancelling] = React.useState(false)
+  const [confirm, confirmDialog] = useConfirm()
+  const handleCancel = async () => {
+    if (!await confirm({
+      title: "取消任务",
+      description: `确认取消任务「${filename}」？`,
+      confirmText: "取消任务",
+      destructive: true,
+    })) return
+    setCancelling(true)
+    try {
+      const r = await cancelJob(jobId)
+      toast(r.message)
+    } catch (e) {
+      toast.error("取消失败", { description: (e as Error).message })
+    } finally {
+      setCancelling(false)
+    }
+  }
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-6 px-1.5 text-xs text-muted-foreground hover:text-destructive"
+        onClick={handleCancel}
+        disabled={cancelling}
+        title="取消任务"
+      >
+        {cancelling ? <Loader2 className="size-3 animate-spin" /> : <X className="size-3" />}
+        取消
+      </Button>
+      {confirmDialog}
+    </>
   )
 }

@@ -23,6 +23,7 @@ import { FetchUrlDialog } from "@/components/action-dialogs"
 import { ConnectionStatus, JobsTable } from "@/components/job-status-bar"
 import { BucketStatusBadges } from "@/components/bucket-status-badges"
 import { ServerFilesSection } from "@/components/server-files-section"
+import { BucketBrowserSection } from "@/components/bucket-browser-section"
 
 function ThemeToggle() {
   const { resolvedTheme, setTheme } = useTheme()
@@ -214,7 +215,8 @@ function AppShell() {
           </div>
         </div>
 
-        {/* 文件库 DataTable */}
+        {/* 源文件管理 */}
+        <h2 className="mb-3 text-lg font-semibold">源文件管理</h2>
         <FilesDataTable
           data={files}
           scripts={scripts}
@@ -230,6 +232,22 @@ function AppShell() {
         {/* 任务记录表格 */}
         <div className="mt-4">
           <JobsTable />
+        </div>
+
+        {/* 桶对象浏览（自己桶 / 北京桶 并列） */}
+        <div className="mt-6 flex flex-col gap-4 lg:flex-row">
+          <BucketBrowserSection
+            title={`自己桶 · ${bucket}`}
+            bucket="self"
+            defaultPrefix={defaultPrefix}
+          />
+          {beijingEnabled && (
+            <BucketBrowserSection
+              title={`北京桶 · ${beijingBucket}`}
+              bucket="beijing"
+              defaultPrefix={defaultPrefix}
+            />
+          )}
         </div>
 
         {/* 本地文件（SERVER_FILE_ROOT） */}
