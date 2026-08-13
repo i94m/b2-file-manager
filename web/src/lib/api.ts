@@ -131,6 +131,15 @@ export async function serverDownload(
   return handle<FormResult>(res)
 }
 
+/** DELETE /api/files/:id — 删除文件记录（同时从 bucket 删除对象）。 */
+export async function deleteFile(fileId: number): Promise<{ deleted: boolean; file_id: number }> {
+  const res = await fetch(`/api/files/${fileId}`, {
+    method: "DELETE",
+    headers: headers(true),
+  })
+  return handle(res)
+}
+
 /** DELETE /api/objects — 删除 bucket 对象。 */
 export async function deleteObject(key: string): Promise<{ deleted: boolean; key: string }> {
   const res = await fetch("/api/objects", {

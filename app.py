@@ -1803,6 +1803,31 @@ def api_delete_object():
     return jsonify({"deleted": True, "key": key})
 
 
+@app.delete("/api/files/<int:file_id>")
+def api_delete_file(file_id: int):
+    """删除文件记录：同时从 bucket 删除对象（如存在）并从数据库移除记录。"""
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
+    f = dict(row)
+
+    # 已上传的对象先从 bucket 删除（忽略已不存在的）
+    if f.get("uploaded") and f.get("object_key"):
+        try:
+            get_client().delete_object(Bucket=os.environ["B2_BUCKET"], Key=f["object_key"])
+        except (ClientError, BotoCoreError, OSError):
+            pass
+
+    with get_db() as conn:
+        conn.execute("DELETE FROM files WHERE id=?", (file_id,))
+
+    return jsonify({"deleted": True, "file_id": file_id})
+
+
 @app.get("/api/objects")
 def api_objects():
     blocked = require_auth()

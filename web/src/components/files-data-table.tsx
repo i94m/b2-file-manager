@@ -6,12 +6,12 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight, CircleCheck, CircleX, CloudUpload, Download, HardDriveDownload, Trash2 } from "lucide-react"
+import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { type Datasource, type FileItem } from "@/lib/types"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
-import { deleteObject, downloadServer, downloadUrl, uploadToCloud } from "@/lib/api"
+import { deleteFile, downloadServer, downloadUrl, uploadToCloud } from "@/lib/api"
 import { useJobs } from "@/lib/use-jobs"
 import { JobProgressBadge } from "@/components/progress-cell"
 import { Button } from "@/components/ui/button"
@@ -64,25 +64,25 @@ function Truncate({ value, className }: { value: string | null; className?: stri
   )
 }
 
-/** 本地 / 云 存在状态：绿色=存在，暗色=不存在，红色=失败（hover 显示错误）。 */
-function PresenceIcon({ active, error }: { active: boolean; error?: string | null }) {
+/** 本地 / 云存储 存在状态：绿色"已存在" / 红色"不存在"（失败时 hover 显示错误）。 */
+function PresenceLabel({ active, error }: { active: boolean; error?: string | null }) {
   if (active) {
-    return <CircleCheck className="size-4 text-emerald-600" fill="currentColor" stroke="white" />
+    return <span className="text-xs font-medium text-emerald-600">已存在</span>
   }
   if (error) {
     return (
       <Tooltip>
         <TooltipTrigger asChild>
-          <CircleX className="size-4 text-red-500" fill="currentColor" stroke="white" />
+          <span className="cursor-help text-xs font-medium text-red-500">不存在</span>
         </TooltipTrigger>
         <TooltipContent className="max-w-xs break-all">{error}</TooltipContent>
       </Tooltip>
     )
   }
-  return <CircleX className="size-4 text-muted-foreground/40" fill="currentColor" stroke="white" />
+  return <span className="text-xs font-medium text-red-500">不存在</span>
 }
 
-/** 本地列：正在下载/抓取时显示进度，否则显示存在图标（含失败提示）。 */
+/** 本地列：正在下载/抓取时显示进度，否则显示存在状态文字。 */
 function LocalCell({ file }: { file: FileItem }) {
   const { jobs } = useJobs()
   const job = file.job_id ? jobs[file.job_id] : undefined
@@ -90,10 +90,10 @@ function LocalCell({ file }: { file: FileItem }) {
     (job.kind === "fetch" || job.kind === "download")
   if (active) return <JobProgressBadge file={file} />
   const failed = file.status === "failed" && !file.local_path
-  return <PresenceIcon active={!!file.local_path} error={failed ? file.error : undefined} />
+  return <PresenceLabel active={!!file.local_path} error={failed ? file.error : undefined} />
 }
 
-/** 云列：正在上传时显示进度，否则显示存在图标（含失败提示）。 */
+/** 云存储列：正在上传时显示进度，否则显示存在状态文字。 */
 function CloudCell({ file }: { file: FileItem }) {
   const { jobs } = useJobs()
   const job = file.job_id ? jobs[file.job_id] : undefined
@@ -101,7 +101,7 @@ function CloudCell({ file }: { file: FileItem }) {
     job.kind === "upload"
   if (active) return <JobProgressBadge file={file} />
   const failed = file.status === "failed" && !!file.local_path && !file.uploaded
-  return <PresenceIcon active={file.uploaded === 1} error={failed ? file.error : undefined} />
+  return <PresenceLabel active={file.uploaded === 1} error={failed ? file.error : undefined} />
 }
 
 export function FilesDataTable({
@@ -163,7 +163,7 @@ export function FilesDataTable({
       },
       {
         id: "cloud",
-        header: "云",
+        header: "云存储",
         cell: ({ row }) => <CloudCell file={row.original} />,
       },
       {
@@ -384,11 +384,11 @@ function RowActions({ file, onDeleted }: { file: FileItem; onDeleted: () => void
   }
 
   const handleDelete = async () => {
-    if (!confirm(`确认删除对象 ${file.object_key}？此操作不可撤销。`)) return
+    if (!confirm(`确认删除「${file.filename || file.object_key}」？此操作不可撤销。`)) return
     setBusy(true)
     try {
-      await deleteObject(file.object_key)
-      toast.success("已删除", { description: file.object_key })
+      await deleteFile(file.id)
+      toast.success("已删除")
       onDeleted()
     } catch (e) {
       toast.error("删除失败", { description: (e as Error).message })
