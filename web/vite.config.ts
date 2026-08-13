@@ -3,6 +3,9 @@ import { defineConfig } from "vite"
 import react from "@vitejs/plugin-react"
 import tailwindcss from "@tailwindcss/vite"
 
+// 后端服务地址（开发期反代目标，与生产 nginx 一致）
+const backendOrigin = "http://127.0.0.1:5000"
+
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -13,20 +16,20 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    // 开发期把后端接口反代到 Flask（127.0.0.1:8000，与生产 nginx 一致），
+    // 开发期把后端接口反代到 Flask（与生产 nginx 一致），
     // 前端始终用相对路径，无需 CORS。
     proxy: {
-      "/api": "http://127.0.0.1:8000",
+      "/api": backendOrigin,
       "/socket.io": {
-        target: "http://127.0.0.1:8000",
+        target: backendOrigin,
         ws: true,
       },
-      "/download": "http://127.0.0.1:8000",
-      "/upload": "http://127.0.0.1:8000",
-      "/server-upload": "http://127.0.0.1:8000",
-      "/server-download": "http://127.0.0.1:8000",
-      "/url-upload": "http://127.0.0.1:8000",
-      "/scripts": "http://127.0.0.1:8000",
+      "/download": backendOrigin,
+      "/upload": backendOrigin,
+      "/server-upload": backendOrigin,
+      "/server-download": backendOrigin,
+      "/url-upload": backendOrigin,
+      "/scripts": backendOrigin,
     },
   },
 })

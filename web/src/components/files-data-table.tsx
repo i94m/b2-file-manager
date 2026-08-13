@@ -6,13 +6,14 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight, Download, HardDriveDownload, Trash2, Upload } from "lucide-react"
+import { ChevronLeft, ChevronRight, CircleCheck, CircleX, CloudUpload, Download, HardDriveDownload, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { type Datasource, type FileItem } from "@/lib/types"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
-import { deleteObject, downloadServer, downloadUrl, triggerUpload } from "@/lib/api"
-import { ProgressCell } from "@/components/progress-cell"
+import { deleteObject, downloadServer, downloadUrl, uploadToCloud } from "@/lib/api"
+import { useJobs } from "@/lib/use-jobs"
+import { JobProgressBadge } from "@/components/progress-cell"
 import { Button } from "@/components/ui/button"
 import {
   Table,
@@ -23,6 +24,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 
 /** 骨架行各列的宽度类（按 columns 顺序对齐，模拟真实数据宽度）。 */
 const SKELETON_WIDTHS = [
@@ -31,13 +33,13 @@ const SKELETON_WIDTHS = [
   "w-40",   // MD5
   "w-16",   // 大小（右对齐）
   "w-16",   // Bucket
-  "w-14",   // 状态
+  "w-12",   // 本地
+  "w-12",   // 云
   "w-16",   // 脚本
   "w-32",   // 来源
   "w-24",   // 创建时间
   "w-8",    // 操作
 ]
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 
 interface FilesDataTableProps {
   data: FileItem[]
@@ -61,6 +63,46 @@ function Truncate({ value, className }: { value: string | null; className?: stri
       <TooltipContent className="max-w-sm break-all">{value}</TooltipContent>
     </Tooltip>
   )
+}
+
+/** 本地 / 云 存在状态：绿色=存在，暗色=不存在，红色=失败（hover 显示错误）。 */
+function PresenceIcon({ active, error }: { active: boolean; error?: string | null }) {
+  if (active) {
+    return <CircleCheck className="size-4 text-emerald-600" fill="currentColor" stroke="white" />
+  }
+  if (error) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <CircleX className="size-4 text-red-500" fill="currentColor" stroke="white" />
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs break-all">{error}</TooltipContent>
+      </Tooltip>
+    )
+  }
+  return <CircleX className="size-4 text-muted-foreground/40" fill="currentColor" stroke="white" />
+}
+
+/** 本地列：正在下载/抓取时显示进度，否则显示存在图标（含失败提示）。 */
+function LocalCell({ file }: { file: FileItem }) {
+  const { jobs } = useJobs()
+  const job = file.job_id ? jobs[file.job_id] : undefined
+  const active = job && (job.status === "uploading" || job.status === "queued") &&
+    (job.kind === "fetch" || job.kind === "download")
+  if (active) return <JobProgressBadge file={file} />
+  const failed = file.status === "failed" && !file.local_path
+  return <PresenceIcon active={!!file.local_path} error={failed ? file.error : undefined} />
+}
+
+/** 云列：正在上传时显示进度，否则显示存在图标（含失败提示）。 */
+function CloudCell({ file }: { file: FileItem }) {
+  const { jobs } = useJobs()
+  const job = file.job_id ? jobs[file.job_id] : undefined
+  const active = job && (job.status === "uploading" || job.status === "queued") &&
+    job.kind === "upload"
+  if (active) return <JobProgressBadge file={file} />
+  const failed = file.status === "failed" && !!file.local_path && !file.uploaded
+  return <PresenceIcon active={file.uploaded === 1} error={failed ? file.error : undefined} />
 }
 
 export function FilesDataTable({
@@ -122,9 +164,14 @@ export function FilesDataTable({
         ),
       },
       {
-        id: "status",
-        header: "状态",
-        cell: ({ row }) => <ProgressCell file={row.original} />,
+        id: "local",
+        header: "本地",
+        cell: ({ row }) => <LocalCell file={row.original} />,
+      },
+      {
+        id: "cloud",
+        header: "云",
+        cell: ({ row }) => <CloudCell file={row.original} />,
       },
       {
         accessorKey: "datasource_id",
@@ -263,19 +310,6 @@ export function FilesDataTable({
 function RowActions({ file, onDeleted }: { file: FileItem; onDeleted: () => void }) {
   const [busy, setBusy] = React.useState(false)
 
-  const handleUpload = async () => {
-    setBusy(true)
-    try {
-      const r = await triggerUpload(file.id)
-      toast.success(r.message)
-      onDeleted()
-    } catch (e) {
-      toast.error("上传失败", { description: (e as Error).message })
-    } finally {
-      setBusy(false)
-    }
-  }
-
   const handleDownloadServer = async () => {
     setBusy(true)
     try {
@@ -284,6 +318,19 @@ function RowActions({ file, onDeleted }: { file: FileItem; onDeleted: () => void
       onDeleted()
     } catch (e) {
       toast.error("下载失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleUploadCloud = async () => {
+    setBusy(true)
+    try {
+      const r = await uploadToCloud(file.id)
+      toast.success(r.message)
+      onDeleted()
+    } catch (e) {
+      toast.error("上传失败", { description: (e as Error).message })
     } finally {
       setBusy(false)
     }
@@ -305,33 +352,35 @@ function RowActions({ file, onDeleted }: { file: FileItem; onDeleted: () => void
 
   return (
     <div className="flex items-center justify-end gap-1">
-      {file.uploaded === 0 && (
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={handleUpload}
-          disabled={busy}
-          title="上传到 Bucket"
-        >
-          <Upload className="size-3.5" /> 上传
-        </Button>
-      )}
-      {file.uploaded === 1 && !file.local_path && (
+      {!file.local_path && (
         <Button
           variant="ghost"
           size="sm"
           onClick={handleDownloadServer}
           disabled={busy}
-          title="下载到服务器 SERVER_FILE_ROOT"
+          title="下载到服务器"
         >
           <HardDriveDownload className="size-3.5" /> 下载到服务器
         </Button>
       )}
-      <Button asChild variant="ghost" size="sm" title="下载">
-        <a href={downloadUrl(file.object_key)}>
-          <Download className="size-3.5" /> 下载
-        </a>
-      </Button>
+      {file.local_path && file.uploaded === 0 && (
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={handleUploadCloud}
+          disabled={busy}
+          title="上传到云"
+        >
+          <CloudUpload className="size-3.5" /> 上传到云
+        </Button>
+      )}
+      {file.uploaded === 1 && (
+        <Button asChild variant="ghost" size="sm" title="下载">
+          <a href={downloadUrl(file.object_key)}>
+            <Download className="size-3.5" /> 下载
+          </a>
+        </Button>
+      )}
       <Button
         variant="ghost"
         size="sm"

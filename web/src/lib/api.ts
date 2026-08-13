@@ -90,9 +90,9 @@ export async function urlUpload(
   return handle<FormResult>(res)
 }
 
-/** POST /api/upload-file/:id — 手动触发一个已登记 file 的上传。 */
-export async function triggerUpload(fileId: number): Promise<FormResult> {
-  const res = await fetch(`/api/upload-file/${fileId}`, {
+/** POST /api/files/:id/upload-cloud — 上传本地文件到云 bucket。 */
+export async function uploadToCloud(fileId: number): Promise<FormResult> {
+  const res = await fetch(`/api/files/${fileId}/upload-cloud`, {
     method: "POST",
     headers: headers(true),
   })

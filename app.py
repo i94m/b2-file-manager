@@ -739,6 +739,16 @@ def process_job(job_id: int) -> None:
                     dest = Path(destination)
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(source_path), dest)
+                    # 回写 local_path（相对 SERVER_FILE_ROOT）作为已下载标识
+                    root = server_root()
+                    if root is not None:
+                        try:
+                            rel = dest.resolve().relative_to(root).as_posix()
+                        except ValueError:
+                            rel = dest.name
+                    else:
+                        rel = dest.name
+                    update_file_by_job(job_id, local_path=rel)
                 else:
                     sync_to_bucket(source_path, object_key, job_id, size, md5, filename, source)
             else:
@@ -1294,15 +1304,12 @@ def url_upload():
     )
 
 
-@app.post("/api/upload-file/<int:file_id>")
-def api_upload_file(file_id: int):
-    """手动触发一个已登记 file 的上传（录入链接后由用户在列表点「上传」）。
+@app.post("/api/files/<int:file_id>/upload-cloud")
+def api_file_upload_cloud(file_id: int):
+    """把服务器本地文件上传到 bucket。
 
-    校验：
-      - file 存在
-      - 尚未上传（uploaded=0）
-      - 有 source_url（录入链接产生的）
-    然后建一个 fetch job 入队，worker 会从 source_url 抓取并上传到 bucket。
+    要求 files.local_path 存在（先下载到服务器）且尚未 uploaded=1。
+    建 kind=upload job 入队，worker 从本地路径读取并上传到 bucket。
     """
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
@@ -1312,20 +1319,27 @@ def api_upload_file(file_id: int):
     if row is None:
         return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
     f = dict(row)
-    if f.get("uploaded"):
-        return jsonify({"error": "该文件已上传，无需重复上传"}), 400
-    source_url = f.get("source_url")
-    if not source_url:
-        return jsonify({"error": "该记录没有来源链接，无法自动抓取上传"}), 400
 
-    object_key = f["object_key"]
+    if f.get("uploaded"):
+        return jsonify({"error": "该文件已上传到云"}), 400
+    local_path = f.get("local_path")
+    if not local_path:
+        return jsonify({"error": "本地文件不存在，请先下载到服务器"}), 400
+
+    try:
+        source = resolve_local_path(local_path)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not source.exists():
+        return jsonify({"error": f"本地文件不存在: {local_path}"}), 400
+
     filename = f["filename"] or "download"
     job_id = insert_job(
-        kind="fetch",
+        kind="upload",
         filename=filename,
-        object_key=object_key,
-        size=0,
-        source=source_url,
+        object_key=f["object_key"],
+        size=f.get("size") or 0,
+        source=str(source),
     )
     with get_db() as conn:
         conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
@@ -1333,7 +1347,7 @@ def api_upload_file(file_id: int):
     emit_job_update(job_id)
     return jsonify({
         "status": "ok",
-        "message": f"「{filename}」已加入上传队列。",
+        "message": f"「{filename}」上传到云的任务已加入队列。",
         "job_id": job_id,
         "file_id": file_id,
     })
@@ -1341,10 +1355,11 @@ def api_upload_file(file_id: int):
 
 @app.post("/api/files/<int:file_id>/download-server")
 def api_file_download_server(file_id: int):
-    """把 bucket 中的对象下载到服务器 SERVER_FILE_ROOT 目录（保留原始文件名）。
+    """下载文件到服务器 SERVER_FILE_ROOT（保留原始文件名）。
 
-    从文件列表一键触发：目标路径自动取 SERVER_FILE_ROOT/<filename>，
-    建 kind=download job 入队，worker 下载成功后回写 files.local_path。
+    - 已在 bucket（uploaded=1）：从 bucket 下载（kind=download）。
+    - 有 source_url 且未上传：从 URL 抓取到服务器（kind=fetch + destination）。
+    成功后 worker 回写 files.local_path。
     """
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
@@ -1354,6 +1369,10 @@ def api_file_download_server(file_id: int):
     if row is None:
         return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
     f = dict(row)
+
+    if f.get("local_path"):
+        return jsonify({"error": "该文件已在服务器上"}), 400
+
     object_key = f["object_key"]
     filename = f["filename"] or "download"
 
@@ -1363,25 +1382,39 @@ def api_file_download_server(file_id: int):
     root.mkdir(parents=True, exist_ok=True)
     destination = root / filename
 
-    # 校验 bucket 对象存在并取真实大小
-    try:
-        metadata = get_client().head_object(Bucket=os.environ["B2_BUCKET"], Key=object_key)
-        size = int(metadata["ContentLength"])
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        if code in ("404", "NoSuchKey", "NotFound"):
-            return jsonify({"error": f"bucket 中不存在对象: {object_key}"}), 404
-        return jsonify({"error": str(exc)}), 502
-    except (BotoCoreError, OSError) as exc:
-        return jsonify({"error": str(exc)}), 502
+    if f.get("uploaded"):
+        # bucket → server：校验对象存在并取真实大小
+        try:
+            metadata = get_client().head_object(Bucket=os.environ["B2_BUCKET"], Key=object_key)
+            size = int(metadata["ContentLength"])
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return jsonify({"error": f"bucket 中不存在对象: {object_key}"}), 404
+            return jsonify({"error": str(exc)}), 502
+        except (BotoCoreError, OSError) as exc:
+            return jsonify({"error": str(exc)}), 502
 
-    job_id = insert_job(
-        kind="download",
-        filename=filename,
-        object_key=object_key,
-        size=size,
-        destination=str(destination),
-    )
+        job_id = insert_job(
+            kind="download",
+            filename=filename,
+            object_key=object_key,
+            size=size,
+            destination=str(destination),
+        )
+    elif f.get("source_url"):
+        # URL → server
+        job_id = insert_job(
+            kind="fetch",
+            filename=filename,
+            object_key=object_key,
+            size=0,
+            source=f["source_url"],
+            destination=str(destination),
+        )
+    else:
+        return jsonify({"error": "无可下载来源（既不在 bucket 也无来源链接）"}), 400
+
     with get_db() as conn:
         conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
     JOB_QUEUE.put(job_id)

@@ -50,10 +50,10 @@ function usePrefix(defaultPrefix: string) {
 }
 
 /** 录入链接 Dialog。 */
-export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
+export function FetchUrlDialog({ scripts, onDone }: CommonProps) {
   const [open, setOpen] = React.useState(false)
   const [url, setUrl] = React.useState("")
-  const { prefix, setPrefix } = usePrefix(defaultPrefix)
+  const [prefix, setPrefix] = React.useState("")
   const [datasourceId, setDatasourceId] = React.useState("")
   const [busy, setBusy] = React.useState(false)
 
@@ -62,11 +62,12 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
     setBusy(true)
     try {
       const r = await urlUpload(url.trim(), {
-        prefix: prefix || undefined,
+        prefix: prefix.trim() || undefined,
         datasourceId: datasourceId ? Number(datasourceId) : undefined,
       })
       toast(r.message)
       setUrl("")
+      setPrefix("")
       setOpen(false)
       onDone()
     } catch (e) {
@@ -102,14 +103,15 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
               onKeyDown={(e) => e.key === "Enter" && submit()}
             />
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-[1fr_200px] items-end gap-3">
             <div className="space-y-2">
-              <Label htmlFor="fetch-prefix">前缀（可选）</Label>
+              <Label htmlFor="fetch-dir">目录（可选）</Label>
               <Input
-                id="fetch-prefix"
+                id="fetch-dir"
                 placeholder="如 backups/2026"
                 value={prefix}
                 onChange={(e) => setPrefix(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submit()}
               />
             </div>
             <div className="space-y-2">
