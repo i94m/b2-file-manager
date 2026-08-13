@@ -37,8 +37,8 @@ from flask import (
     flash,
     jsonify,
     redirect,
-    render_template,
     request,
+    send_file,
     url_for,
 )
 from flask_socketio import SocketIO, emit
@@ -166,6 +166,27 @@ def resolve_server_path(raw: str) -> Path:
     return path
 
 
+def resolve_local_path(raw: str) -> Path:
+    """解析本地文件列表里的路径（相对 SERVER_FILE_ROOT 或绝对路径）并校验在目录内。
+
+    列表接口返回的是相对路径（如 a.txt、sub/c.txt），下载/删除时直接用它。
+    """
+    if not raw or not raw.strip():
+        raise ValueError("请输入路径")
+    root = server_root()
+    if root is None:
+        raise ValueError("未配置 SERVER_FILE_ROOT")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    path = candidate.resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        raise ValueError(f"路径必须在 SERVER_FILE_ROOT 目录内: {root}") from None
+    return path
+
+
 def list_server_files() -> tuple[str | None, list[dict]]:
     root = server_root()
     if root is None:
@@ -223,21 +244,37 @@ def init_db() -> None:
             ("source", "TEXT"),
             ("destination", "TEXT"),
             ("note", "TEXT"),
+            ("cancelled", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+        # 数据源表（原 scripts，已改名/改字段）：
+        #   name        数据源名称
+        #   script_path 脚本路径（允许空，仅记录备注，系统不执行）
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS scripts (
+            CREATE TABLE IF NOT EXISTS datasources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                command TEXT NOT NULL,
+                script_path TEXT,
                 description TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             )
             """
         )
+        # 旧库迁移：把旧 scripts 表的数据搬到 datasources（command → script_path）
+        has_old_scripts = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='scripts'"
+        ).fetchone()
+        if has_old_scripts:
+            old_count = conn.execute("SELECT COUNT(*) AS c FROM scripts").fetchone()["c"]
+            if old_count > 0:
+                conn.execute(
+                    "INSERT OR IGNORE INTO datasources (id, name, script_path, description, created_at, updated_at) "
+                    "SELECT id, name, command, description, created_at, updated_at FROM scripts"
+                )
+            conn.execute("DROP TABLE scripts")
         file_info = conn.execute("PRAGMA table_info(files)").fetchall()
         file_columns = {row["name"] for row in file_info}
         md5_col = next((row for row in file_info if row["name"] == "md5"), None)
@@ -253,7 +290,8 @@ def init_db() -> None:
                 source_url TEXT,
                 uploaded INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
-                script_id INTEGER,
+                datasource_id INTEGER,
+                local_path TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 synced_at REAL,
@@ -275,25 +313,32 @@ def init_db() -> None:
             conn.execute(
                 "INSERT INTO files "
                 "(id, job_id, object_key, filename, md5, size, bucket, source_url, "
-                " uploaded, status, script_id, created_at, updated_at, synced_at, error) "
+                " uploaded, status, datasource_id, created_at, updated_at, synced_at, error) "
                 f"SELECT id, {src('job_id', 'NULL')}, object_key, filename, md5, size, "
                 f"{src('bucket', empty_bucket)}, source_url, {src('uploaded', '0')}, status, "
-                f"{src('script_id', 'NULL')}, created_at, {src('updated_at', 'created_at')}, "
-                "synced_at, error FROM files_old"
+                f"{src('datasource_id', src('script_id', 'NULL'))}, created_at, "
+                f"{src('updated_at', 'created_at')}, synced_at, error FROM files_old"
             )
             conn.execute("DROP TABLE files_old")
         else:
             conn.execute(files_ddl.replace("CREATE TABLE files", "CREATE TABLE IF NOT EXISTS files", 1))
+            # 建表后重新读取列（file_columns 是建表前的快照，全新库时为空集，
+            # 不重读会导致对已存在列重复 ADD COLUMN 而报 duplicate column name）
+            file_columns = {row["name"] for row in conn.execute("PRAGMA table_info(files)")}
             for name, definition in (
                 ("job_id", "INTEGER"),
                 ("md5", "TEXT"),
                 ("bucket", "TEXT NOT NULL DEFAULT ''"),
                 ("uploaded", "INTEGER NOT NULL DEFAULT 0"),
-                ("script_id", "INTEGER"),
+                ("datasource_id", "INTEGER"),
+                ("local_path", "TEXT"),
                 ("updated_at", "REAL"),
             ):
                 if name not in file_columns:
                     conn.execute(f"ALTER TABLE files ADD COLUMN {name} {definition}")
+            # 旧库迁移：把 script_id 的数据迁到 datasource_id，然后删掉 script_id 列
+            if "datasource_id" not in file_columns and "script_id" in file_columns:
+                conn.execute("UPDATE files SET datasource_id = script_id WHERE script_id IS NOT NULL")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_md5 ON files(md5)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_job ON files(job_id)")
         conn.execute(
@@ -330,10 +375,32 @@ def insert_job(
         return cursor.lastrowid
 
 
+def bucket_prefix() -> str:
+    """读取并清洗 BUCKET_PREFIX，默认 files/。
+
+    所有上传对象 key 都会前置该前缀，便于在同一个 bucket 中隔离本应用的数据。
+    变量缺省时用默认值 files/；显式设为空字符串则不添加前缀。
+    """
+    return clean_prefix(os.environ.get("BUCKET_PREFIX", "files/"))
+
+
+def default_prefix() -> str:
+    """表单「前缀」输入框的默认值。
+
+    优先读 DEFAULT_PREFIX；旧配置名 B2_PREFIX 仍向后兼容。
+    与 bucket_prefix() 的区别：
+      - bucket_prefix()：全局固定的应用隔离前缀，不暴露给用户、不可在表单覆盖；
+      - default_prefix()：仅作为表单默认值，用户上传/录入时可随意修改。
+    两者最终在 uuid_object_key() 拼接为：BUCKET_PREFIX/<default_prefix>/UUID.ext
+    """
+    return os.environ.get("DEFAULT_PREFIX") or os.environ.get("B2_PREFIX", "")
+
+
 def uuid_object_key(prefix: str, filename: str) -> str:
-    """生成 UUID.后缀 的对象 key，保留原始文件扩展名。"""
+    """生成 BUCKET_PREFIX/<prefix>/UUID.后缀 的对象 key，保留原始文件扩展名。"""
     ext = PurePosixPath(filename).suffix
-    return "/".join(part for part in (prefix, f"{uuid.uuid4().hex}{ext}") if part)
+    parts = [p for p in (bucket_prefix(), prefix, f"{uuid.uuid4().hex}{ext}") if p]
+    return "/".join(parts)
 
 
 def job_payload(job: dict) -> dict:
@@ -350,6 +417,9 @@ def job_payload(job: dict) -> dict:
         "progress": job["progress"],
         "error": job["error"],
         "created_at": job["created_at"],
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "cancelled": bool(job.get("cancelled", 0)),
     }
 
 
@@ -365,11 +435,41 @@ def emit_job_update(job_id: int) -> None:
 # 后台上传队列
 # --------------------------------------------------------------------------
 
+class JobCancelled(Exception):
+    """任务被用户取消时抛出，用于中止 boto3 传输。"""
+
+
+# 进程内已请求取消的 job_id 集合。worker 传输回调每块检查它（比查 DB 快），
+# 命中则抛 JobCancelled 中止 boto3 传输。cancel 接口写入，worker 收尾时移除。
+_CANCELLED: set[int] = set()
+_CANCELLED_LOCK = threading.Lock()
+
+
+def request_cancel(job_id: int) -> None:
+    """请求取消一个 job：标记内存集合 + 更新 DB。"""
+    with _CANCELLED_LOCK:
+        _CANCELLED.add(job_id)
+    with get_db() as conn:
+        conn.execute("UPDATE jobs SET cancelled=1 WHERE id=?", (job_id,))
+
+
+def is_cancelled(job_id: int) -> bool:
+    return job_id in _CANCELLED
+
+
+def clear_cancel(job_id: int) -> None:
+    with _CANCELLED_LOCK:
+        _CANCELLED.discard(job_id)
+
+
 def make_progress(job_id: int, size: int):
     lock = threading.Lock()
     state = {"progress": 0, "last": 0.0}
 
     def callback(amount: int) -> None:
+        # 每块传输前检查取消标志，命中即中止传输
+        if is_cancelled(job_id):
+            raise JobCancelled(f"任务 {job_id} 已取消")
         with lock:
             if size > 0:
                 state["progress"] = min(size, state["progress"] + amount)
@@ -427,9 +527,12 @@ def download_to_path(object_key: str, size: int, destination: Path, job_id: int)
 
 
 def fetch_url_to_temp(url: str, job_id: int) -> tuple[Path, int, str]:
-    """从 URL 流式下载到临时文件，返回（临时路径, 文件大小, md5）。"""
+    """从 URL 流式下载到系统临时目录（/tmp），返回（临时路径, 文件大小, md5）。
+
+    上传到 bucket 后由 cleanup_job_temp 清理该临时文件。
+    """
     request = Request(url, headers={"User-Agent": "b2-file-manager/0.1"})
-    temp_path = UPLOAD_DIR / f"{job_id}.part"
+    temp_path = Path(tempfile.gettempdir()) / f"b2-fetch-{job_id}.part"
     digest = hashlib.md5()
     with urlopen(request, timeout=60) as response:
         total = int(response.headers.get("Content-Length") or 0)
@@ -496,18 +599,22 @@ def verify_object(object_key: str, size: int) -> None:
 
 def insert_file_pending(
     *,
-    job_id: int,
+    job_id: int | None = None,
     object_key: str,
     filename: str,
     size: int,
     source_url: str | None = None,
-    script_id: int | None = None,
-) -> None:
-    """提交任务时先登记一条 pending 记录，后续由 worker 逐步更新。"""
+    datasource_id: int | None = None,
+) -> int:
+    """登记一条 pending 记录，后续由 worker 逐步更新。
+
+    job_id 为空时表示「只登记未上传」（用户稍后手动触发上传），
+    返回新插入的 file id。
+    """
     now = time.time()
     with get_db() as conn:
-        conn.execute(
-            "INSERT INTO files (job_id, object_key, filename, size, bucket, source_url, script_id, status, created_at, updated_at) "
+        cursor = conn.execute(
+            "INSERT INTO files (job_id, object_key, filename, size, bucket, source_url, datasource_id, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
             (
                 job_id,
@@ -516,11 +623,12 @@ def insert_file_pending(
                 size,
                 os.environ.get("B2_BUCKET", ""),
                 source_url,
-                script_id,
+                datasource_id,
                 now,
                 now,
             ),
         )
+        return int(cursor.lastrowid)
 
 
 def update_file_by_job(job_id: int, **fields) -> None:
@@ -570,6 +678,11 @@ def cleanup_job_temp(job_id: int, kind: str, destination: str | None = None) -> 
         except OSError:
             pass
     else:
+        # 同时清理新路径（/tmp/b2-fetch-*）与旧路径（tmp_uploads/*.part），兼容两种来源
+        try:
+            (Path(tempfile.gettempdir()) / f"b2-fetch-{job_id}.part").unlink(missing_ok=True)
+        except OSError:
+            pass
         try:
             (UPLOAD_DIR / f"{job_id}.part").unlink(missing_ok=True)
         except OSError:
@@ -596,6 +709,22 @@ def process_job(job_id: int) -> None:
     try:
         if kind == "download":
             download_to_path(object_key, size, Path(destination), job_id)
+            # 若该 job 关联了 file 记录（从文件列表「下载到服务器」发起），
+            # 成功后回写 local_path（相对 SERVER_FILE_ROOT 的路径）作为已下载标识
+            with get_db() as conn:
+                linked = conn.execute(
+                    "SELECT id FROM files WHERE job_id=? LIMIT 1", (job_id,)
+                ).fetchone()
+            if linked is not None:
+                root = server_root()
+                if root is not None:
+                    try:
+                        rel = Path(destination).resolve().relative_to(root).as_posix()
+                    except ValueError:
+                        rel = Path(destination).name
+                else:
+                    rel = Path(destination).name
+                update_file_by_job(job_id, local_path=rel)
             final_size = size
         else:
             source_path = (
@@ -624,6 +753,15 @@ def process_job(job_id: int) -> None:
                 (final_size, time.time(), job_id),
             )
         emit_job_update(job_id)
+    except JobCancelled:
+        # 用户取消：标记 cancelled，清理临时文件与 B2 分片
+        update_file_by_job(job_id, status="cancelled", error="任务已取消")
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status='cancelled', error='任务已取消', finished_at=? WHERE id=?",
+                (time.time(), job_id),
+            )
+        emit_job_update(job_id)
     except (BotoCoreError, ClientError, OSError, ValueError, TimeoutError, TypeError) as exc:
         update_file_by_job(job_id, status="failed", error=str(exc))
         with get_db() as conn:
@@ -634,6 +772,7 @@ def process_job(job_id: int) -> None:
         emit_job_update(job_id)
     finally:
         cleanup_job_temp(job_id, kind, destination)
+        clear_cancel(job_id)
 
 
 def worker_loop() -> None:
@@ -700,8 +839,9 @@ def recent_files(limit: int = 500) -> list[dict]:
 
 
 def recent_scripts() -> list[dict]:
+    """数据源列表（原 scripts 表）。"""
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM scripts ORDER BY id DESC").fetchall()
+        rows = conn.execute("SELECT * FROM datasources ORDER BY id DESC").fetchall()
     return [dict(row) for row in rows]
 
 
@@ -742,6 +882,27 @@ def require_auth():
     if not apikey_ok():
         return Response("401 未授权", status=401)
     return None
+
+
+def wants_json() -> bool:
+    """React SPA 通过 fetch 调用（Accept: application/json）时返回 JSON；
+    旧的表单 POST（无此 header）保持 redirect 行为，便于直接 curl/浏览器调试。"""
+    return request.headers.get("Accept", "").startswith("application/json")
+
+
+def respond(status: str, message: str, apikey: str, category: str = "ok",
+            code: int = 200, **extra):
+    """统一封装「表单提交类」路由的成功/失败响应。
+
+    - JSON 请求（React）：返回 JSON，不跳转。
+    - 表单请求（旧）：flash 消息并 redirect 回首页。
+    """
+    if wants_json():
+        payload = {"status": status, "message": message}
+        payload.update(extra)
+        return jsonify(payload), code
+    flash(message, category)
+    return redirect(url_for("index", apikey=apikey))
 
 
 @socketio.on("connect")
@@ -830,50 +991,41 @@ def update_download(
 
 
 @app.get("/")
+@app.get("/")
 def index():
+    """根路由：前端已由 React (Vite) 接管，Flask 仅提供 /api/* 等接口。
+
+    这里返回最小引导信息（鉴权后），便于直接 curl 探活；
+    页面本身由 Vite dev server（开发）或 nginx 托管的 dist/（生产）提供。
+    """
     blocked = require_auth()
     if blocked:
         return blocked
-    apikey = request.args.get("apikey", "")
-    raw_prefix = request.args.get("prefix", "") or os.environ.get("B2_PREFIX", "")
-    try:
-        prefix = clean_prefix(raw_prefix)
-    except argparse.ArgumentTypeError as exc:
-        prefix = ""
-        list_error = str(exc)
-    else:
-        list_error = None
-
-    objects = []
-    try:
-        objects = list_objects(prefix)
-    except (BotoCoreError, ClientError) as exc:
-        list_error = str(exc)
-
-    server_root_text, server_files = list_server_files()
-    scripts = recent_scripts()
-    return render_template(
-        "index.html",
-        apikey=apikey,
-        bucket=os.environ["B2_BUCKET"],
-        default_prefix=os.environ.get("B2_PREFIX", ""),
-        prefix=prefix,
-        objects=objects,
-        list_error=list_error,
-        server_root=server_root_text,
-        server_files=server_files,
-        synced_files=recent_files(),
-        scripts=scripts,
-        scripts_by_id={script["id"]: script["name"] for script in scripts},
-        bucket_private=BUCKET_PRIVATE,
-        bucket_private_note=BUCKET_PRIVATE_NOTE,
-        format_bytes=format_bytes,
-        format_time=format_time,
-    )
+    return jsonify({
+        "app": "b2-file-manager",
+        "bucket": os.environ["B2_BUCKET"],
+        "default_prefix": default_prefix(),
+        "bucket_private": BUCKET_PRIVATE,
+        "bucket_private_note": BUCKET_PRIVATE_NOTE,
+        "endpoints": [
+            "GET /api/files",
+            "GET /api/scripts",
+            "GET /api/jobs",
+            "GET /api/objects",
+            "POST /api/submit",
+            "POST /upload",
+            "GET /download",
+        ],
+    })
 
 
 @app.post("/upload")
 def upload():
+    """上传本地文件到 bucket。
+
+    表单字段：file（必填）、prefix（可选）、datasource_id（可选）。
+    React (Accept: application/json) 调用时返回 JSON，旧表单则 flash + redirect。
+    """
     blocked = require_auth()
     if blocked:
         return blocked
@@ -881,18 +1033,16 @@ def upload():
 
     file = request.files.get("file")
     if file is None or not file.filename:
-        flash("请选择要上传的文件。", "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", "请选择要上传的文件。", apikey, "error", 400)
 
     try:
-        prefix = clean_prefix(request.form.get("prefix") or os.environ.get("B2_PREFIX", ""))
+        prefix = clean_prefix(request.form.get("prefix") or default_prefix())
     except argparse.ArgumentTypeError as exc:
-        flash(str(exc), "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", str(exc), apikey, "error", 400)
 
     filename = Path(file.filename.replace("\\", "/")).name
     object_key = uuid_object_key(prefix, filename)
-    script_id = request.form.get("script_id", type=int)
+    datasource_id = request.form.get("datasource_id", type=int)
     incoming = UPLOAD_DIR / f"incoming-{secrets.token_hex(8)}.part"
 
     try:
@@ -913,17 +1063,18 @@ def upload():
             object_key=object_key,
             filename=filename,
             size=size,
-            script_id=script_id,
+            datasource_id=datasource_id,
         )
     except (OSError, ValueError, sqlite3.Error) as exc:
         incoming.unlink(missing_ok=True)
-        flash(f"接收文件失败: {exc}", "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", f"接收文件失败: {exc}", apikey, "error", 500)
 
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
-    flash(f"「{filename}」已加入上传队列（{format_bytes(size)}）。", "ok")
-    return redirect(url_for("index", apikey=apikey))
+    return respond(
+        "ok", f"「{filename}」已加入上传队列（{format_bytes(size)}）。", apikey,
+        job_id=job_id, object_key=object_key, filename=filename, size=size,
+    )
 
 
 @app.post("/server-upload")
@@ -934,23 +1085,20 @@ def server_upload():
     apikey = request.args.get("apikey", "")
     raw_path = (request.form.get("path") or "").strip()
     try:
-        prefix = clean_prefix(request.form.get("prefix") or os.environ.get("B2_PREFIX", ""))
+        prefix = clean_prefix(request.form.get("prefix") or default_prefix())
     except argparse.ArgumentTypeError as exc:
-        flash(str(exc), "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", str(exc), apikey, "error", 400)
 
     try:
         source = resolve_server_path(raw_path)
     except ValueError as exc:
-        flash(str(exc), "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", str(exc), apikey, "error", 400)
     if not source.is_file():
-        flash(f"路径不存在或不是普通文件: {source}", "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", f"路径不存在或不是普通文件: {source}", apikey, "error", 400)
 
     object_key = uuid_object_key(prefix, source.name)
     size = source.stat().st_size
-    script_id = request.form.get("script_id", type=int)
+    datasource_id = request.form.get("datasource_id", type=int)
     job_id = insert_job(
         kind="upload",
         filename=source.name,
@@ -963,12 +1111,14 @@ def server_upload():
         object_key=object_key,
         filename=source.name,
         size=size,
-        script_id=script_id,
+        datasource_id=datasource_id,
     )
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
-    flash(f"「{source}」已加入上传队列（{format_bytes(size)}）。", "ok")
-    return redirect(url_for("index", apikey=apikey))
+    return respond(
+        "ok", f"「{source}」已加入上传队列（{format_bytes(size)}）。", apikey,
+        job_id=job_id, object_key=object_key, filename=source.name, size=size,
+    )
 
 
 @app.post("/server-download")
@@ -981,16 +1131,13 @@ def server_download():
     raw_destination = (request.form.get("destination") or "").strip()
 
     if not key:
-        flash("请填写要下载的 bucket 对象名（key）。", "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", "请填写要下载的 bucket 对象名（key）。", apikey, "error", 400)
     try:
         destination = resolve_server_path(raw_destination)
     except ValueError as exc:
-        flash(str(exc), "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", str(exc), apikey, "error", 400)
     if destination.is_dir():
-        flash("目标路径是已存在的目录，请填写完整的文件路径。", "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", "目标路径是已存在的目录，请填写完整的文件路径。", apikey, "error", 400)
 
     try:
         metadata = get_client().head_object(Bucket=os.environ["B2_BUCKET"], Key=key)
@@ -999,13 +1146,12 @@ def server_download():
         code = str(exc.response.get("Error", {}).get("Code", ""))
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         if code in ("404", "NoSuchKey", "NotFound") or status == 404:
-            flash(f"对象不存在: {key}", "error")
+            msg = f"对象不存在: {key}"
         else:
-            flash(f"查询对象失败: {exc}", "error")
-        return redirect(url_for("index", apikey=apikey))
+            msg = f"查询对象失败: {exc}"
+        return respond("error", msg, apikey, "error", 400)
     except (BotoCoreError, OSError) as exc:
-        flash(f"查询对象失败: {exc}", "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", f"查询对象失败: {exc}", apikey, "error", 400)
 
     job_id = insert_job(
         kind="download",
@@ -1016,8 +1162,71 @@ def server_download():
     )
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
-    flash(f"「{key}」下载到 {destination} 的任务已加入队列。", "ok")
-    return redirect(url_for("index", apikey=apikey))
+    return respond(
+        "ok", f"「{key}」下载到 {destination} 的任务已加入队列。", apikey,
+        job_id=job_id, object_key=key, size=size,
+    )
+
+
+@app.get("/api/server-files")
+def api_server_files():
+    """本地文件列表（SERVER_FILE_ROOT 目录），含总大小。
+
+    返回：
+        {
+          "root": "/abs/path",        // 目录路径；未配置 SERVER_FILE_ROOT 时为 null
+          "total_size": 123456,       // 所有文件字节数总和
+          "files": [ {"path": "...", "size": 123, "absolute": "/abs"} ]
+        }
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    root, files = list_server_files()
+    if root is None:
+        return jsonify({"root": None, "total_size": 0, "files": []})
+    return jsonify({
+        "root": root,
+        "total_size": sum(f["size"] for f in files),
+        "files": files,
+    })
+
+
+@app.get("/server-file/download")
+def server_file_download():
+    """把 SERVER_FILE_ROOT 里的文件通过浏览器下载到用户电脑。"""
+    if not apikey_ok():
+        return Response("401 未授权", status=401)
+    raw = (request.args.get("path") or "").strip()
+    try:
+        path = resolve_local_path(raw)
+    except ValueError as exc:
+        return Response(f"400 {exc}", status=400)
+    if not path.is_file():
+        return Response("404 文件不存在", status=404)
+    return send_file(
+        path,
+        as_attachment=True,
+        download_name=path.name,
+    )
+
+
+@app.delete("/api/server-files")
+def api_server_file_delete():
+    """删除 SERVER_FILE_ROOT 里的一个本地文件。"""
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    raw = (request.args.get("path") or "").strip()
+    try:
+        path = resolve_local_path(raw)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not path.is_file():
+        return jsonify({"error": f"文件不存在: {path}"}), 404
+    try:
+        path.unlink()
+    except OSError as exc:
+        return jsonify({"error": f"删除失败: {exc}"}), 500
+    return jsonify({"deleted": True, "path": raw})
 
 
 @app.post("/url-upload")
@@ -1028,57 +1237,161 @@ def url_upload():
     apikey = request.args.get("apikey", "")
     url = (request.form.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
-        flash("请填写以 http:// 或 https:// 开头的链接。", "error")
-        return redirect(url_for("index", apikey=apikey))
+        return respond("error", "请填写以 http:// 或 https:// 开头的链接。", apikey, "error", 400)
 
     target = (request.form.get("target") or "bucket").strip()
     destination = None
     object_key = ""
-    script_id = request.form.get("script_id", type=int)
+    datasource_id = request.form.get("datasource_id", type=int)
     if target == "server":
         raw_destination = (request.form.get("destination") or "").strip()
         try:
             destination = resolve_server_path(raw_destination)
         except ValueError as exc:
-            flash(str(exc), "error")
-            return redirect(url_for("index", apikey=apikey))
+            return respond("error", str(exc), apikey, "error", 400)
         if destination.is_dir():
-            flash("目标路径是已存在的目录，请填写完整的文件路径。", "error")
-            return redirect(url_for("index", apikey=apikey))
+            return respond("error", "目标路径是已存在的目录，请填写完整的文件路径。", apikey, "error", 400)
     else:
         try:
-            prefix = clean_prefix(request.form.get("prefix") or os.environ.get("B2_PREFIX", ""))
+            prefix = clean_prefix(request.form.get("prefix") or default_prefix())
         except argparse.ArgumentTypeError as exc:
-            flash(str(exc), "error")
-            return redirect(url_for("index", apikey=apikey))
+            return respond("error", str(exc), apikey, "error", 400)
         filename = PurePosixPath(urlparse(url).path).name or "download"
         object_key = uuid_object_key(prefix, filename)
 
     filename = PurePosixPath(urlparse(url).path).name or "download"
+
+    if target == "server":
+        # 下载到服务器路径：自动入队处理（保持原逻辑）
+        job_id = insert_job(
+            kind="fetch",
+            filename=filename,
+            object_key=object_key,
+            size=0,
+            source=url,
+            destination=str(destination),
+        )
+        JOB_QUEUE.put(job_id)
+        emit_job_update(job_id)
+        return respond(
+            "ok", f"「{url}」下载到 {destination} 的任务已加入队列。", apikey,
+            job_id=job_id, object_key=object_key, filename=filename,
+        )
+
+    # 录入到 bucket：只登记一条 pending 记录，不自动下载/上传。
+    # 用户在列表点「上传」时才触发（POST /api/upload-file/<file_id>）。
+    file_id = insert_file_pending(
+        job_id=None,
+        object_key=object_key,
+        filename=filename,
+        size=0,
+        source_url=url,
+        datasource_id=datasource_id,
+    )
+    return respond(
+        "ok", f"「{filename}」已登记。", apikey,
+        file_id=file_id, object_key=object_key, filename=filename,
+    )
+
+
+@app.post("/api/upload-file/<int:file_id>")
+def api_upload_file(file_id: int):
+    """手动触发一个已登记 file 的上传（录入链接后由用户在列表点「上传」）。
+
+    校验：
+      - file 存在
+      - 尚未上传（uploaded=0）
+      - 有 source_url（录入链接产生的）
+    然后建一个 fetch job 入队，worker 会从 source_url 抓取并上传到 bucket。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
+    f = dict(row)
+    if f.get("uploaded"):
+        return jsonify({"error": "该文件已上传，无需重复上传"}), 400
+    source_url = f.get("source_url")
+    if not source_url:
+        return jsonify({"error": "该记录没有来源链接，无法自动抓取上传"}), 400
+
+    object_key = f["object_key"]
+    filename = f["filename"] or "download"
     job_id = insert_job(
         kind="fetch",
         filename=filename,
         object_key=object_key,
         size=0,
-        source=url,
-        destination=str(destination) if destination else None,
+        source=source_url,
     )
-    if not destination:
-        insert_file_pending(
-            job_id=job_id,
-            object_key=object_key,
-            filename=filename,
-            size=0,
-            source_url=url,
-            script_id=script_id,
-        )
+    with get_db() as conn:
+        conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
-    if destination:
-        flash(f"「{url}」下载到 {destination} 的任务已加入队列。", "ok")
-    else:
-        flash(f"「{url}」抓取到 b2://{os.environ['B2_BUCKET']}/{object_key} 的任务已加入队列。", "ok")
-    return redirect(url_for("index", apikey=apikey))
+    return jsonify({
+        "status": "ok",
+        "message": f"「{filename}」已加入上传队列。",
+        "job_id": job_id,
+        "file_id": file_id,
+    })
+
+
+@app.post("/api/files/<int:file_id>/download-server")
+def api_file_download_server(file_id: int):
+    """把 bucket 中的对象下载到服务器 SERVER_FILE_ROOT 目录（保留原始文件名）。
+
+    从文件列表一键触发：目标路径自动取 SERVER_FILE_ROOT/<filename>，
+    建 kind=download job 入队，worker 下载成功后回写 files.local_path。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
+    f = dict(row)
+    object_key = f["object_key"]
+    filename = f["filename"] or "download"
+
+    root = server_root()
+    if root is None:
+        return jsonify({"error": "未配置 SERVER_FILE_ROOT"}), 400
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / filename
+
+    # 校验 bucket 对象存在并取真实大小
+    try:
+        metadata = get_client().head_object(Bucket=os.environ["B2_BUCKET"], Key=object_key)
+        size = int(metadata["ContentLength"])
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return jsonify({"error": f"bucket 中不存在对象: {object_key}"}), 404
+        return jsonify({"error": str(exc)}), 502
+    except (BotoCoreError, OSError) as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    job_id = insert_job(
+        kind="download",
+        filename=filename,
+        object_key=object_key,
+        size=size,
+        destination=str(destination),
+    )
+    with get_db() as conn:
+        conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
+    JOB_QUEUE.put(job_id)
+    emit_job_update(job_id)
+    return jsonify({
+        "status": "ok",
+        "message": f"「{filename}」下载到服务器 {destination} 的任务已加入队列。",
+        "job_id": job_id,
+        "file_id": file_id,
+    })
 
 
 @app.get("/download")
@@ -1194,7 +1507,7 @@ def api_submit():
     if len(raw_urls) > 50:
         return jsonify({"error": "单次最多提交 50 个链接"}), 400
 
-    prefix_raw = body.get("prefix") or os.environ.get("B2_PREFIX", "")
+    prefix_raw = body.get("prefix") or default_prefix()
     try:
         prefix = clean_prefix(prefix_raw)
     except argparse.ArgumentTypeError as exc:
@@ -1297,6 +1610,128 @@ def api_jobs():
     return jsonify([job_payload(job) for job in recent_jobs()])
 
 
+@app.post("/api/jobs/<int:job_id>/cancel")
+def api_job_cancel(job_id: int):
+    """请求取消一个任务（上传/下载/抓取）。
+
+    仅对 queued/uploading 状态的任务有效；已结束的任务忽略。
+    返回当前 job 状态，取消后 worker 会通过 job_update 推送 cancelled。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"任务 {job_id} 不存在"}), 404
+    job = dict(row)
+    if job["status"] not in ("queued", "uploading"):
+        return jsonify({
+            "error": f"任务已处于 {job['status']} 状态，无法取消",
+            "job": job_payload(job),
+        }), 400
+
+    request_cancel(job_id)
+
+    # 若任务还在队列中尚未被 worker 取出，直接标记取消，避免 worker 取出后白跑
+    if job["status"] == "queued":
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE jobs SET status='cancelled', error='任务已取消', finished_at=? WHERE id=?",
+                (time.time(), job_id),
+            )
+        clear_cancel(job_id)
+        emit_job_update(job_id)
+
+    with get_db() as conn:
+        updated = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    return jsonify({"status": "ok", "message": "已请求取消。", "job": job_payload(dict(updated))})
+
+
+@app.get("/api/auth")
+def api_auth():
+    """鉴权探测：返回应用基本信息（bucket、安全状态、默认前缀）。
+
+    前端 AuthGuard 用它校验 apikey 是否有效（无 key → 401）。
+    单独端点而非复用 / ：因为前端 Vite dev server / nginx 的 / 是 SPA 入口，
+    不会被代理到后端，无法用于鉴权探测。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    return jsonify({
+        "app": "b2-file-manager",
+        "bucket": os.environ["B2_BUCKET"],
+        "default_prefix": default_prefix(),
+        "bucket_private": BUCKET_PRIVATE,
+        "bucket_private_note": BUCKET_PRIVATE_NOTE,
+    })
+
+
+@app.get("/api/files")
+def api_files():
+    """文件库分页列表（DataTable 数据源）。
+
+    查询参数：
+        page      页码，从 1 起（默认 1）
+        page_size 每页条数，1~200（默认 20）
+        q         可选，按 filename / object_key / source_url 模糊匹配
+        status    可选，按 status 精确过滤
+
+    返回：
+        {
+          "items": [ {...file 列...} ],
+          "total": 123, "page": 1, "page_size": 20
+        }
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    page = max(1, request.args.get("page", 1, type=int))
+    page_size = min(200, max(1, request.args.get("page_size", 20, type=int)))
+    offset = (page - 1) * page_size
+    q = (request.args.get("q") or "").strip()
+    status = (request.args.get("status") or "").strip()
+
+    where_sql = ""
+    params: list = []
+    conditions: list[str] = []
+    if q:
+        like = f"%{q}%"
+        conditions.append(
+            "(filename LIKE ? OR object_key LIKE ? OR source_url LIKE ? OR md5 LIKE ?)"
+        )
+        params.extend([like, like, like, like])
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if conditions:
+        where_sql = "WHERE " + " AND ".join(conditions)
+
+    with get_db() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) AS c FROM files {where_sql}", params
+        ).fetchone()["c"]
+        rows = conn.execute(
+            f"SELECT * FROM files {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, page_size, offset],
+        ).fetchall()
+
+    return jsonify({
+        "items": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    })
+
+
+@app.get("/api/scripts")
+def api_scripts():
+    """数据源列表（供文件表格「数据源」列做 id→名称映射）。"""
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    return jsonify(recent_scripts())
+
+
 @app.delete("/api/objects")
 def api_delete_object():
     """删除 bucket 中的一个对象。
@@ -1340,7 +1775,7 @@ def api_objects():
     blocked = require_auth()
     if blocked:
         return blocked
-    raw_prefix = request.args.get("prefix", "") or os.environ.get("B2_PREFIX", "")
+    raw_prefix = request.args.get("prefix", "") or default_prefix()
     try:
         prefix = clean_prefix(raw_prefix)
     except argparse.ArgumentTypeError as exc:
@@ -1354,39 +1789,39 @@ def api_objects():
 
 @app.post("/scripts")
 def add_script():
+    """新增数据源（名称必填，脚本路径允许为空）。"""
     blocked = require_auth()
     if blocked:
         return blocked
     apikey = request.args.get("apikey", "")
     name = (request.form.get("name") or "").strip()
-    command = (request.form.get("command") or "").strip()
+    script_path = (request.form.get("script_path") or "").strip()
     description = (request.form.get("description") or "").strip()
-    if not name or not command:
-        flash("脚本名称和命令必填。", "error")
-        return redirect(url_for("index", apikey=apikey))
+    if not name:
+        return respond("error", "数据源名称必填。", apikey, "error", 400)
     now = time.time()
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO scripts (name, command, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (name, command, description or None, now, now),
+            "INSERT INTO datasources (name, script_path, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (name, script_path or None, description or None, now, now),
         )
-    flash(f"脚本「{name}」已添加。", "ok")
-    return redirect(url_for("index", apikey=apikey))
+    return respond("ok", f"数据源「{name}」已添加。", apikey)
 
 
 @app.post("/scripts/delete")
 def delete_script():
+    """删除数据源，同时解除 files 的关联。"""
     blocked = require_auth()
     if blocked:
         return blocked
     apikey = request.args.get("apikey", "")
-    script_id = request.form.get("id", type=int)
-    if script_id:
+    datasource_id = request.form.get("id", type=int)
+    if datasource_id:
         with get_db() as conn:
-            conn.execute("DELETE FROM scripts WHERE id=?", (script_id,))
-            conn.execute("UPDATE files SET script_id=NULL WHERE script_id=?", (script_id,))
-        flash("脚本已删除。", "ok")
-    return redirect(url_for("index", apikey=apikey))
+            conn.execute("DELETE FROM datasources WHERE id=?", (datasource_id,))
+            conn.execute("UPDATE files SET datasource_id=NULL WHERE datasource_id=?", (datasource_id,))
+        return respond("ok", "数据源已删除。", apikey)
+    return respond("error", "缺少数据源 id。", apikey, "error", 400)
 
 
 def main() -> int:
