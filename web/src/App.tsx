@@ -1,6 +1,6 @@
 import * as React from "react"
 import { ThemeProvider, useTheme } from "next-themes"
-import { JobsProvider } from "@/lib/use-jobs"
+import { JobsProvider, useJobs } from "@/lib/use-jobs"
 import { AuthGuard } from "@/components/auth-guard"
 import { RefreshCw, Search, Moon, Sun } from "lucide-react"
 
@@ -122,6 +122,36 @@ function AppShell() {
     await loadFiles()
     setRefreshing(false)
   }
+
+  // 任务完成时自动静默刷新文件列表（不闪骨架屏）
+  const { jobs } = useJobs()
+  const terminalRef = React.useRef<Set<number>>(new Set())
+  React.useEffect(() => {
+    let hasNew = false
+    for (const job of Object.values(jobs)) {
+      if (["done", "failed", "cancelled", "error"].includes(job.status)) {
+        if (!terminalRef.current.has(job.id)) {
+          terminalRef.current.add(job.id)
+          hasNew = true
+        }
+      }
+    }
+    if (!hasNew) return
+    const t = setTimeout(() => {
+      getFiles({
+        page,
+        page_size: pageSize,
+        q: debouncedQ || undefined,
+        status: status === "all" ? undefined : status,
+      })
+        .then((data) => {
+          setFiles(data.items)
+          setTotal(data.total)
+        })
+        .catch((e) => console.error(e))
+    }, 500)
+    return () => clearTimeout(t)
+  }, [jobs, page, pageSize, debouncedQ, status])
 
   return (
     <div className="min-h-screen bg-background">
