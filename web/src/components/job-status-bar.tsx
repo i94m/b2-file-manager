@@ -1,9 +1,9 @@
 import * as React from "react"
-import { Ban, CheckCircle2, Loader2, X, XCircle } from "lucide-react"
+import { Ban, CheckCircle2, Loader2, Pause, Play, X, XCircle } from "lucide-react"
 import { toast } from "sonner"
 
 import { useJobs } from "@/lib/use-jobs"
-import { cancelJob } from "@/lib/api"
+import { cancelJob, pauseJob, resumeJob } from "@/lib/api"
 import { useConfirm } from "@/lib/use-confirm"
 import { cn, formatBytes, formatRate, formatTime } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -106,6 +106,10 @@ export function JobsTable() {
                     <span className="text-destructive">失败</span>
                   ) : j.status === "cancelled" ? (
                     "已取消"
+                  ) : j.paused ? (
+                    <span className="text-amber-600 dark:text-amber-400">
+                      已暂停 · {pct.toFixed(0)}%
+                    </span>
                   ) : j.status === "uploading" && stat ? (
                     <div className="space-y-0.5">
                       <div className="text-blue-600 dark:text-blue-400">
@@ -123,7 +127,7 @@ export function JobsTable() {
                   {formatTime(j.created_at)}
                 </TableCell>
                 <TableCell className="text-right">
-                  {isActive && <CancelBtn jobId={j.id} filename={j.filename} />}
+                  {isActive && <JobActions job={j} />}
                 </TableCell>
               </TableRow>
             )
@@ -134,40 +138,63 @@ export function JobsTable() {
   )
 }
 
-function CancelBtn({ jobId, filename }: { jobId: number; filename: string }) {
-  const [cancelling, setCancelling] = React.useState(false)
+function JobActions({ job }: { job: { id: number; filename: string; paused: boolean } }) {
+  const [busy, setBusy] = React.useState(false)
   const [confirm, confirmDialog] = useConfirm()
+  const handlePauseResume = async () => {
+    setBusy(true)
+    try {
+      const r = job.paused ? await resumeJob(job.id) : await pauseJob(job.id)
+      toast(r.message)
+    } catch (e) {
+      toast.error("操作失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
   const handleCancel = async () => {
     if (!await confirm({
       title: "取消任务",
-      description: `确认取消任务「${filename}」？`,
+      description: `确认取消任务「${job.filename}」？`,
       confirmText: "取消任务",
       destructive: true,
     })) return
-    setCancelling(true)
+    setBusy(true)
     try {
-      const r = await cancelJob(jobId)
+      const r = await cancelJob(job.id)
       toast(r.message)
     } catch (e) {
       toast.error("取消失败", { description: (e as Error).message })
     } finally {
-      setCancelling(false)
+      setBusy(false)
     }
   }
   return (
-    <>
+    <div className="inline-flex items-center gap-1">
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-6 px-1.5 text-xs text-muted-foreground"
+        onClick={handlePauseResume}
+        disabled={busy}
+        title={job.paused ? "继续" : "暂停"}
+      >
+        {busy ? <Loader2 className="size-3 animate-spin" /> :
+          job.paused ? <Play className="size-3" /> : <Pause className="size-3" />}
+        {job.paused ? "继续" : "暂停"}
+      </Button>
       <Button
         variant="ghost"
         size="sm"
         className="h-6 px-1.5 text-xs text-muted-foreground hover:text-destructive"
         onClick={handleCancel}
-        disabled={cancelling}
+        disabled={busy}
         title="取消任务"
       >
-        {cancelling ? <Loader2 className="size-3 animate-spin" /> : <X className="size-3" />}
+        <X className="size-3" />
         取消
       </Button>
       {confirmDialog}
-    </>
+    </div>
   )
 }

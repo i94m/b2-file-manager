@@ -129,6 +129,28 @@ export async function cancelJob(
   return handle(res)
 }
 
+/** POST /api/jobs/:id/pause — 暂停一个排队中或上传中的任务。 */
+export async function pauseJob(
+  jobId: number,
+): Promise<FormResult & { job?: unknown }> {
+  const res = await fetch(`/api/jobs/${jobId}/pause`, {
+    method: "POST",
+    headers: headers(true),
+  })
+  return handle(res)
+}
+
+/** POST /api/jobs/:id/resume — 恢复一个已暂停的任务。 */
+export async function resumeJob(
+  jobId: number,
+): Promise<FormResult & { job?: unknown }> {
+  const res = await fetch(`/api/jobs/${jobId}/resume`, {
+    method: "POST",
+    headers: headers(true),
+  })
+  return handle(res)
+}
+
 /** POST /api/files/:id/download-server — 下载 bucket 对象到服务器 SERVER_FILE_ROOT。 */
 export async function downloadServer(fileId: number): Promise<FormResult> {
   const res = await fetch(`/api/files/${fileId}/download-server`, {
@@ -145,6 +167,19 @@ export async function downloadServerBeijing(fileId: number): Promise<FormResult>
     headers: headers(true),
   })
   return handle<FormResult>(res)
+}
+
+/** POST /api/files/:id/check — 重新检测文件在指定位置是否存在。 */
+export async function checkFileExists(
+  fileId: number,
+  target: "local" | "cloud" | "beijing",
+): Promise<{ target: string; exists: boolean; file?: FileItem }> {
+  const res = await fetch(`/api/files/${fileId}/check`, {
+    method: "POST",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify({ target }),
+  })
+  return handle(res)
 }
 
 /** POST /server-download — 从 bucket 下载对象到服务器目录。 */

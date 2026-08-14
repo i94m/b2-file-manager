@@ -50,6 +50,11 @@ function AppShell() {
   const beijingBucket = appInfo?.beijing_bucket ?? ""
 
   const [files, setFiles] = React.useState<FileItem[]>([])
+
+  /** 单条文件记录更新（检测存在性等轻量操作，不触发全表重载）。 */
+  const patchFile = React.useCallback((updated: FileItem) => {
+    setFiles((prev) => prev.map((f) => (f.id === updated.id ? updated : f)))
+  }, [])
   const [scripts, setScripts] = React.useState<Datasource[]>([])
   const [total, setTotal] = React.useState(0)
   const [page, setPage] = React.useState(1)
@@ -227,6 +232,7 @@ function AppShell() {
           beijingEnabled={beijingEnabled}
           onPageChange={setPage}
           onDeleted={loadFiles}
+          onFileUpdated={patchFile}
         />
 
         {/* 任务记录表格 */}

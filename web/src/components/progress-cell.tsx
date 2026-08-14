@@ -1,4 +1,5 @@
 import * as React from "react"
+import { Pause } from "lucide-react"
 
 import { type FileItem } from "@/lib/types"
 import { useJobs } from "@/lib/use-jobs"
@@ -16,6 +17,15 @@ export function JobProgressBadge({ file }: { file: FileItem }) {
   const stat = job ? stats[job.id] : undefined
 
   if (!active || !stat) return null
+
+  if (job.paused) {
+    return (
+      <span className="inline-flex cursor-default items-center gap-1.5 rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium tabular-nums text-amber-700 dark:bg-amber-950 dark:text-amber-300">
+        <Pause className="size-3" />
+        已暂停 {stat.percent.toFixed(0)}%
+      </span>
+    )
+  }
 
   const percent = stat.percent
   return (

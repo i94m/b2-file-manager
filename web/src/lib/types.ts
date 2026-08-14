@@ -124,6 +124,7 @@ export interface JobUpdate {
   started_at: number | null
   finished_at: number | null
   cancelled: boolean
+  paused: boolean
 }
 
 /** 单个 job 的实时进度统计（由前端基于 job_update 序列推算）。 */

@@ -6,16 +6,19 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Loader2, Pencil, Trash2, X } from "lucide-react"
+import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Loader2, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { type Datasource, type FileItem } from "@/lib/types"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
 import {
   cancelJob,
+  checkFileExists,
   deleteFile,
   downloadServer,
   downloadUrl,
+  pauseJob,
+  resumeJob,
   updateFile,
   uploadToBeijing,
   uploadToCloud,
@@ -88,6 +91,7 @@ interface FilesDataTableProps {
   beijingEnabled: boolean
   onPageChange: (page: number) => void
   onDeleted: () => void
+  onFileUpdated?: (file: FileItem) => void
 }
 
 /** 截断长文本 + tooltip 显示完整值。 */
@@ -189,13 +193,25 @@ function pushDirHistory(dir: string) {
   }
 }
 
-/** 小型取消任务按钮（排队 / 上传中均可点击取消）。 */
+/** 小型任务操作按钮组：暂停/恢复 + 取消（排队 / 上传中均可点击）。 */
 function CancelJobBtn({ file }: { file: FileItem }) {
   const { jobs } = useJobs()
-  const [cancelling, setCancelling] = React.useState(false)
+  const [busy, setBusy] = React.useState(false)
   const [confirm, confirmDialog] = useConfirm()
   const job = file.job_id ? jobs[file.job_id] : undefined
   if (!job) return null
+
+  const handlePauseResume = async () => {
+    setBusy(true)
+    try {
+      const r = job.paused ? await resumeJob(job.id) : await pauseJob(job.id)
+      toast(r.message)
+    } catch (e) {
+      toast.error("操作失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const handleCancel = async () => {
     if (!await confirm({
@@ -204,30 +220,84 @@ function CancelJobBtn({ file }: { file: FileItem }) {
       confirmText: "取消任务",
       destructive: true,
     })) return
-    setCancelling(true)
+    setBusy(true)
     try {
       const r = await cancelJob(job.id)
       toast(r.message)
     } catch (e) {
       toast.error("取消失败", { description: (e as Error).message })
     } finally {
-      setCancelling(false)
+      setBusy(false)
     }
   }
+
+  const btnClass = "inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
 
   return (
     <>
       <button
         type="button"
+        onClick={handlePauseResume}
+        disabled={busy}
+        className={btnClass}
+        title={job.paused ? "继续" : "暂停"}
+      >
+        {busy ? <Loader2 className="size-3 animate-spin" /> :
+          job.paused ? <Play className="size-3" /> : <Pause className="size-3" />}
+      </button>
+      <button
+        type="button"
         onClick={handleCancel}
-        disabled={cancelling}
-        className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-destructive disabled:opacity-50"
+        disabled={busy}
+        className={cn(btnClass, "hover:text-destructive")}
         title="取消任务"
       >
-        {cancelling ? <Loader2 className="size-3 animate-spin" /> : <X className="size-3" />}
+        <X className="size-3" />
       </button>
       {confirmDialog}
     </>
+  )
+}
+
+/** 重新检测文件是否存在的图标按钮（本地 / 自己桶 / 北京桶通用）。 */
+function CheckExistBtn({
+  fileId,
+  target,
+  onFileUpdated,
+}: {
+  fileId: number
+  target: "local" | "cloud" | "beijing"
+  onFileUpdated?: (file: FileItem) => void
+}) {
+  const [busy, setBusy] = React.useState(false)
+  const handleCheck = async () => {
+    setBusy(true)
+    try {
+      const r = await checkFileExists(fileId, target)
+      if (r.exists) {
+        toast.success("文件存在")
+      } else {
+        toast("文件不存在，已更新状态", { description: "可重新下载或上传" })
+      }
+      if (r.file && onFileUpdated) {
+        onFileUpdated(r.file)
+      }
+    } catch (e) {
+      toast.error("检测失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <button
+      type="button"
+      onClick={handleCheck}
+      disabled={busy}
+      className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+      title="重新检测"
+    >
+      {busy ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
+    </button>
   )
 }
 
@@ -405,7 +475,7 @@ function CellButton({
 }
 
 /** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿字 / 否则→下载按钮。 */
-function LocalCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void }) {
+function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [busy, setBusy] = React.useState(false)
   const job = file.job_id ? jobs[file.job_id] : undefined
@@ -419,7 +489,12 @@ function LocalCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void 
     </div>
   )
 
-  if (file.local_path) return <StatusText tone="active">已存在</StatusText>
+  if (file.local_path) return (
+    <div className="flex items-center gap-0.5">
+      <StatusText tone="active">已存在</StatusText>
+      <CheckExistBtn fileId={file.id} target="local" onFileUpdated={onFileUpdated} />
+    </div>
+  )
 
   const handleDownload = async () => {
     setBusy(true)
@@ -435,11 +510,16 @@ function LocalCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void 
   }
 
   const failed = file.status === "failed"
-  return <CellButton icon={HardDriveDownload} label="下载" title="下载到服务器" onClick={handleDownload} busy={busy} error={failed ? file.error : undefined} />
+  return (
+    <div className="flex items-center gap-0.5">
+      <CellButton icon={HardDriveDownload} label="下载" title="下载到服务器" onClick={handleDownload} busy={busy} error={failed ? file.error : undefined} />
+      <CheckExistBtn fileId={file.id} target="local" onFileUpdated={onFileUpdated} />
+    </div>
+  )
 }
 
 /** 自己桶列：排队→黄字 / 上传中→进度 / 已存在→绿字+下载 / 有本地→上传按钮。 */
-function CloudCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void }) {
+function CloudCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const job = file.job_id ? jobs[file.job_id] : undefined
@@ -458,7 +538,10 @@ function CloudCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void 
   if (file.uploaded === 1) {
     return (
       <div className="flex flex-col items-center gap-0.5">
-        <StatusText tone="active">已存在</StatusText>
+        <div className="flex items-center gap-0.5">
+          <StatusText tone="active">已存在</StatusText>
+          <CheckExistBtn fileId={file.id} target="cloud" onFileUpdated={onFileUpdated} />
+        </div>
         <IconBtn icon={Download} title="下载(自己桶)" href={downloadUrl(file.object_key)} />
       </div>
     )
@@ -467,13 +550,16 @@ function CloudCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void 
   if (file.local_path) {
     return (
       <>
-        <CellButton
-          icon={CloudUpload}
-          label="上传"
-          title="上传到自己桶"
-          onClick={() => setDialogOpen(true)}
-          error={failed ? file.error : undefined}
-        />
+        <div className="flex items-center gap-0.5">
+          <CellButton
+            icon={CloudUpload}
+            label="上传"
+            title="上传到自己桶"
+            onClick={() => setDialogOpen(true)}
+            error={failed ? file.error : undefined}
+          />
+          <CheckExistBtn fileId={file.id} target="cloud" onFileUpdated={onFileUpdated} />
+        </div>
         {dialogOpen && (
           <UploadKeyDialog
             file={file}
@@ -489,11 +575,16 @@ function CloudCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void 
     )
   }
 
-  return <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
+  return (
+    <div className="flex items-center gap-0.5">
+      <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
+      <CheckExistBtn fileId={file.id} target="cloud" onFileUpdated={onFileUpdated} />
+    </div>
+  )
 }
 
 /** 北京桶列：与 CloudCell 对称，读 uploaded_beijing，检测 upload_beijing 任务。 */
-function BeijingCell({ file, onUpdated }: { file: FileItem; onUpdated: () => void }) {
+function BeijingCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const job = file.job_id ? jobs[file.job_id] : undefined
@@ -512,7 +603,10 @@ function BeijingCell({ file, onUpdated }: { file: FileItem; onUpdated: () => voi
   if (file.uploaded_beijing === 1) {
     return (
       <div className="flex flex-col items-center gap-0.5">
-        <StatusText tone="active">已存在</StatusText>
+        <div className="flex items-center gap-0.5">
+          <StatusText tone="active">已存在</StatusText>
+          <CheckExistBtn fileId={file.id} target="beijing" onFileUpdated={onFileUpdated} />
+        </div>
         <IconBtn icon={Download} title="下载(北京桶)" href={downloadUrl(file.object_key, "beijing")} />
       </div>
     )
@@ -521,13 +615,16 @@ function BeijingCell({ file, onUpdated }: { file: FileItem; onUpdated: () => voi
   if (file.local_path) {
     return (
       <>
-        <CellButton
-          icon={CloudUpload}
-          label="上传"
-          title="上传到北京桶"
-          onClick={() => setDialogOpen(true)}
-          error={failed ? file.error : undefined}
-        />
+        <div className="flex items-center gap-0.5">
+          <CellButton
+            icon={CloudUpload}
+            label="上传"
+            title="上传到北京桶"
+            onClick={() => setDialogOpen(true)}
+            error={failed ? file.error : undefined}
+          />
+          <CheckExistBtn fileId={file.id} target="beijing" onFileUpdated={onFileUpdated} />
+        </div>
         {dialogOpen && (
           <UploadKeyDialog
             file={file}
@@ -543,7 +640,12 @@ function BeijingCell({ file, onUpdated }: { file: FileItem; onUpdated: () => voi
     )
   }
 
-  return <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
+  return (
+    <div className="flex items-center gap-0.5">
+      <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
+      <CheckExistBtn fileId={file.id} target="beijing" onFileUpdated={onFileUpdated} />
+    </div>
+  )
 }
 
 export function FilesDataTable({
@@ -556,6 +658,7 @@ export function FilesDataTable({
   beijingEnabled,
   onPageChange,
   onDeleted,
+  onFileUpdated,
 }: FilesDataTableProps) {
   const datasourceName = React.useMemo(() => {
     const map = new Map<number, string>()
@@ -631,19 +734,19 @@ export function FilesDataTable({
         {
           id: "local",
           header: () => <div className="min-w-[4rem] text-center">本地</div>,
-          cell: ({ row }) => <div className="flex justify-center"><LocalCell file={row.original} onUpdated={onDeleted} /></div>,
+          cell: ({ row }) => <div className="flex justify-center"><LocalCell file={row.original} onUpdated={onDeleted} onFileUpdated={onFileUpdated} /></div>,
         },
         {
           id: "cloud",
           header: () => <div className="min-w-[4rem] text-center">自己桶</div>,
-          cell: ({ row }) => <div className="flex justify-center"><CloudCell file={row.original} onUpdated={onDeleted} /></div>,
+          cell: ({ row }) => <div className="flex justify-center"><CloudCell file={row.original} onUpdated={onDeleted} onFileUpdated={onFileUpdated} /></div>,
         },
       ]
       if (beijingEnabled) {
         cols.push({
           id: "beijing",
           header: () => <div className="min-w-[4rem] text-center">北京桶</div>,
-          cell: ({ row }) => <div className="flex justify-center"><BeijingCell file={row.original} onUpdated={onDeleted} /></div>,
+          cell: ({ row }) => <div className="flex justify-center"><BeijingCell file={row.original} onUpdated={onDeleted} onFileUpdated={onFileUpdated} /></div>,
         })
       }
       cols.push(
@@ -664,7 +767,7 @@ export function FilesDataTable({
       )
       return cols
     },
-    [datasourceName, onDeleted, beijingEnabled],
+    [datasourceName, onDeleted, onFileUpdated, beijingEnabled],
   )
 
   const table = useReactTable({

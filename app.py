@@ -15,7 +15,7 @@ import os
 import queue
 import secrets
 import shutil
-import sqlite3
+from db import get_db, Error as DBError
 import sys
 import tempfile
 import threading
@@ -46,11 +46,11 @@ from flask_socketio import SocketIO, emit
 from backblaze_upload import clean_prefix, normalize_endpoint
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "jobs.db"
 UPLOAD_DIR = BASE_DIR / "tmp_uploads"
 MAX_JOBS_SHOWN = 50
 DEFAULT_REGION = "us-east-1"
 JOB_QUEUE: queue.Queue[int] = queue.Queue()
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "3"))
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -98,6 +98,10 @@ def validate_config() -> str | None:
         )
     if not os.environ.get("B2_ENDPOINT") and not os.environ.get("B2_REGION"):
         return "Endpoint/Region 配置无效: B2_ENDPOINT 与 B2_REGION 至少配置一个"
+    required_db = ("DB_HOST", "DB_USERNAME", "DB_DATABASE")
+    missing_db = [name for name in required_db if not os.environ.get(name)]
+    if missing_db:
+        return "缺少数据库配置: " + ", ".join(missing_db)
     try:
         resolve_endpoint()
     except ValueError as exc:
@@ -257,15 +261,28 @@ def list_server_files() -> tuple[str | None, list[dict]]:
 
 
 # --------------------------------------------------------------------------
-# SQLite 任务记录
+# 数据库任务记录（MySQL via PyMySQL）
 # --------------------------------------------------------------------------
 
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    return conn
+
+def _drop_index_if_exists(conn, index_name, table_name):
+    exists = conn.execute(
+        "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+        (table_name, index_name),
+    ).fetchone()
+    if exists:
+        conn.execute(f"DROP INDEX {index_name} ON {table_name}")
+
+
+def _create_unique_index_if_not_exists(conn, index_name, table_name, columns):
+    exists = conn.execute(
+        "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+        (table_name, index_name),
+    ).fetchone()
+    if not exists:
+        conn.execute(f"CREATE UNIQUE INDEX {index_name} ON {table_name} ({columns})")
 
 
 def init_db() -> None:
@@ -274,30 +291,34 @@ def init_db() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL DEFAULT 'upload',
-                filename TEXT NOT NULL,
-                object_key TEXT NOT NULL,
-                source TEXT,
-                destination TEXT,
-                size INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'queued',
-                progress INTEGER NOT NULL DEFAULT 0,
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                kind VARCHAR(20) NOT NULL DEFAULT 'upload',
+                filename VARCHAR(512) NOT NULL,
+                object_key VARCHAR(1024) NOT NULL,
+                source VARCHAR(1024),
+                destination VARCHAR(1024),
+                size BIGINT NOT NULL DEFAULT 0,
+                status VARCHAR(20) NOT NULL DEFAULT 'queued',
+                progress BIGINT NOT NULL DEFAULT 0,
                 error TEXT,
-                created_at REAL NOT NULL,
-                started_at REAL,
-                finished_at REAL
+                created_at DOUBLE NOT NULL,
+                started_at DOUBLE,
+                finished_at DOUBLE,
+                note TEXT,
+                cancelled TINYINT NOT NULL DEFAULT 0,
+                paused TINYINT NOT NULL DEFAULT 0
             )
             """
         )
         # 兼容旧库：补齐新增列
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+        columns = {row["Field"] for row in conn.execute("SHOW COLUMNS FROM jobs")}
         for name, definition in (
-            ("kind", "TEXT NOT NULL DEFAULT 'upload'"),
-            ("source", "TEXT"),
-            ("destination", "TEXT"),
+            ("kind", "VARCHAR(20) NOT NULL DEFAULT 'upload'"),
+            ("source", "VARCHAR(1024)"),
+            ("destination", "VARCHAR(1024)"),
             ("note", "TEXT"),
-            ("cancelled", "INTEGER NOT NULL DEFAULT 0"),
+            ("cancelled", "TINYINT NOT NULL DEFAULT 0"),
+            ("paused", "TINYINT NOT NULL DEFAULT 0"),
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
@@ -307,57 +328,68 @@ def init_db() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS datasources (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                script_path TEXT,
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                name VARCHAR(255) NOT NULL,
+                script_path VARCHAR(1024),
                 description TEXT,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                created_at DOUBLE NOT NULL,
+                updated_at DOUBLE NOT NULL
             )
             """
         )
         # 旧库迁移：把旧 scripts 表的数据搬到 datasources（command → script_path）
         has_old_scripts = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='scripts'"
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'scripts'"
         ).fetchone()
         if has_old_scripts:
             old_count = conn.execute("SELECT COUNT(*) AS c FROM scripts").fetchone()["c"]
             if old_count > 0:
                 conn.execute(
-                    "INSERT OR IGNORE INTO datasources (id, name, script_path, description, created_at, updated_at) "
+                    "INSERT IGNORE INTO datasources (id, name, script_path, description, created_at, updated_at) "
                     "SELECT id, name, command, description, created_at, updated_at FROM scripts"
                 )
             conn.execute("DROP TABLE scripts")
-        file_info = conn.execute("PRAGMA table_info(files)").fetchall()
-        file_columns = {row["name"] for row in file_info}
-        md5_col = next((row for row in file_info if row["name"] == "md5"), None)
+        # 检查 files 表是否存在（SHOW COLUMNS 在表不存在时会报错）
+        files_exists = conn.execute(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'files'"
+        ).fetchone()
+        if files_exists:
+            file_info = conn.execute("SHOW COLUMNS FROM files").fetchall()
+            file_columns = {row["Field"] for row in file_info}
+            md5_col = next((row for row in file_info if row["Field"] == "md5"), None)
+        else:
+            file_info = []
+            file_columns = set()
+            md5_col = None
         files_ddl = """
             CREATE TABLE files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id INTEGER,
-                object_key TEXT NOT NULL,
-                filename TEXT,
-                md5 TEXT,
-                size INTEGER NOT NULL DEFAULT 0,
-                bucket TEXT NOT NULL DEFAULT '',
-                source_url TEXT,
-                uploaded INTEGER NOT NULL DEFAULT 0,
-                uploaded_beijing INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'pending',
-                datasource_id INTEGER,
-                local_path TEXT,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                synced_at REAL,
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                job_id INT,
+                object_key VARCHAR(1024) NOT NULL,
+                filename VARCHAR(512),
+                md5 VARCHAR(32),
+                size BIGINT NOT NULL DEFAULT 0,
+                bucket VARCHAR(255) NOT NULL DEFAULT '',
+                source_url VARCHAR(2048),
+                uploaded TINYINT NOT NULL DEFAULT 0,
+                uploaded_beijing TINYINT NOT NULL DEFAULT 0,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                datasource_id INT,
+                local_path VARCHAR(1024),
+                created_at DOUBLE NOT NULL,
+                updated_at DOUBLE NOT NULL,
+                synced_at DOUBLE,
                 error TEXT
             )
         """
-        if md5_col is not None and md5_col["notnull"] == 1:
+        if md5_col is not None and md5_col["Null"] == "NO":
             # 旧版 files 表：md5 NOT NULL。重建为可空（pending 记录先无 md5），并保留已有数据。
-            conn.execute("DROP INDEX IF EXISTS idx_files_md5")
-            conn.execute("DROP INDEX IF EXISTS idx_files_job")
+            _drop_index_if_exists(conn, "idx_files_md5", "files")
+            _drop_index_if_exists(conn, "idx_files_job", "files")
             conn.execute("ALTER TABLE files RENAME TO files_old")
-            old_columns = {row["name"] for row in conn.execute("PRAGMA table_info(files_old)")}
+            old_columns = {row["Field"] for row in conn.execute("SHOW COLUMNS FROM files_old")}
 
             def src(name: str, fallback: str) -> str:
                 return name if name in old_columns else fallback
@@ -378,24 +410,24 @@ def init_db() -> None:
             conn.execute(files_ddl.replace("CREATE TABLE files", "CREATE TABLE IF NOT EXISTS files", 1))
             # 建表后重新读取列（file_columns 是建表前的快照，全新库时为空集，
             # 不重读会导致对已存在列重复 ADD COLUMN 而报 duplicate column name）
-            file_columns = {row["name"] for row in conn.execute("PRAGMA table_info(files)")}
+            file_columns = {row["Field"] for row in conn.execute("SHOW COLUMNS FROM files")}
             for name, definition in (
-                ("job_id", "INTEGER"),
-                ("md5", "TEXT"),
-                ("bucket", "TEXT NOT NULL DEFAULT ''"),
-                ("uploaded", "INTEGER NOT NULL DEFAULT 0"),
-                ("uploaded_beijing", "INTEGER NOT NULL DEFAULT 0"),
-                ("datasource_id", "INTEGER"),
-                ("local_path", "TEXT"),
-                ("updated_at", "REAL"),
+                ("job_id", "INT"),
+                ("md5", "VARCHAR(32)"),
+                ("bucket", "VARCHAR(255) NOT NULL DEFAULT ''"),
+                ("uploaded", "TINYINT NOT NULL DEFAULT 0"),
+                ("uploaded_beijing", "TINYINT NOT NULL DEFAULT 0"),
+                ("datasource_id", "INT"),
+                ("local_path", "VARCHAR(1024)"),
+                ("updated_at", "DOUBLE"),
             ):
                 if name not in file_columns:
                     conn.execute(f"ALTER TABLE files ADD COLUMN {name} {definition}")
-            # 旧库迁移：把 script_id 的数据迁到 datasource_id，然后删掉 script_id 列
+            # 旧库迁移：把 script_id 的数据迁到 datasource_id
             if "datasource_id" not in file_columns and "script_id" in file_columns:
                 conn.execute("UPDATE files SET datasource_id = script_id WHERE script_id IS NOT NULL")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_md5 ON files(md5)")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_job ON files(job_id)")
+        _create_unique_index_if_not_exists(conn, "idx_files_md5", "files", "md5")
+        _create_unique_index_if_not_exists(conn, "idx_files_job", "files", "job_id")
         conn.execute(
             "UPDATE files SET uploaded=1, status='synced', "
             "updated_at=COALESCE(updated_at, created_at), "
@@ -486,6 +518,7 @@ def job_payload(job: dict) -> dict:
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
         "cancelled": bool(job.get("cancelled", 0)),
+        "paused": bool(job.get("paused", 0)),
     }
 
 
@@ -528,6 +561,53 @@ def clear_cancel(job_id: int) -> None:
         _CANCELLED.discard(job_id)
 
 
+# 暂停基础设施：用 threading.Event 实现阻塞/唤醒。
+# set() = 放行（未暂停），clear() = 阻塞（已暂停）。
+_PAUSED: set[int] = set()
+_PAUSED_LOCK = threading.Lock()
+_PAUSE_EVENTS: dict[int, threading.Event] = {}
+
+
+def _get_pause_event(job_id: int) -> threading.Event:
+    with _PAUSED_LOCK:
+        ev = _PAUSE_EVENTS.get(job_id)
+        if ev is None:
+            ev = threading.Event()
+            ev.set()  # 初始：未暂停（set = 放行）
+            _PAUSE_EVENTS[job_id] = ev
+        return ev
+
+
+def request_pause(job_id: int) -> None:
+    with _PAUSED_LOCK:
+        _PAUSED.add(job_id)
+    _get_pause_event(job_id).clear()  # clear = 阻塞
+
+
+def request_resume(job_id: int) -> None:
+    with _PAUSED_LOCK:
+        _PAUSED.discard(job_id)
+    _get_pause_event(job_id).set()  # set = 放行
+
+
+def is_paused(job_id: int) -> bool:
+    return job_id in _PAUSED
+
+
+def wait_if_paused(job_id: int) -> None:
+    """暂停时阻塞，每 0.5s 醒来检查取消标志。"""
+    while is_paused(job_id):
+        _get_pause_event(job_id).wait(timeout=0.5)
+        if is_cancelled(job_id):
+            raise JobCancelled(f"任务 {job_id} 暂停期间被取消")
+
+
+def clear_pause(job_id: int) -> None:
+    with _PAUSED_LOCK:
+        _PAUSED.discard(job_id)
+        _PAUSE_EVENTS.pop(job_id, None)
+
+
 def make_progress(job_id: int, size: int):
     lock = threading.Lock()
     state = {"progress": 0, "last": 0.0}
@@ -536,6 +616,7 @@ def make_progress(job_id: int, size: int):
         # 每块传输前检查取消标志，命中即中止传输
         if is_cancelled(job_id):
             raise JobCancelled(f"任务 {job_id} 已取消")
+        wait_if_paused(job_id)  # 暂停时阻塞，恢复后继续
         with lock:
             if size > 0:
                 state["progress"] = min(size, state["progress"] + amount)
@@ -653,7 +734,7 @@ def ensure_unique_md5(md5: str, job_id: int, uploaded_column: str = "uploaded") 
     # uploaded_column 受控于代码内部调用，非用户输入，可安全拼接
     with get_db() as conn:
         row = conn.execute(
-            f"SELECT object_key FROM files WHERE md5=? AND job_id IS NOT ? AND {uploaded_column}=1",
+            f"SELECT object_key FROM files WHERE md5=? AND job_id <> ? AND {uploaded_column}=1",
             (md5, job_id),
         ).fetchone()
     if row is not None:
@@ -781,6 +862,9 @@ def process_job(job_id: int) -> None:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None or row["status"] != "queued":
             return
+        if is_paused(job_id):
+            # 暂停的排队任务跳过（恢复时由 resume 端点重新入队）
+            return
         conn.execute(
             "UPDATE jobs SET status='uploading', started_at=? WHERE id=?",
             (time.time(), job_id),
@@ -881,6 +965,7 @@ def process_job(job_id: int) -> None:
     finally:
         cleanup_job_temp(job_id, kind, destination)
         clear_cancel(job_id)
+        clear_pause(job_id)
 
 
 def worker_loop() -> None:
@@ -898,7 +983,10 @@ def worker_loop() -> None:
 
 def recover_jobs() -> None:
     """重启恢复：上传/下载中的任务标记失败并清理临时文件；排队中的任务继续处理。"""
+    # 重启后内存 _PAUSED 清空，DB 中残留的 paused=1 无意义，重置为 0
     with get_db() as conn:
+        conn.execute("UPDATE jobs SET paused=0 WHERE paused=1")
+        interrupted = conn.execute("SELECT * FROM jobs WHERE status='uploading'").fetchall()
         interrupted = conn.execute("SELECT * FROM jobs WHERE status='uploading'").fetchall()
         for row in interrupted:
             cleanup_job_temp(row["id"], row["kind"], row["destination"])
@@ -1061,14 +1149,23 @@ def apikey_ok() -> bool:
 
 def require_auth():
     if not apikey_ok():
+        if wants_json():
+            return jsonify({"error": "未授权"}), 401
         return Response("401 未授权", status=401)
     return None
 
 
 def wants_json() -> bool:
-    """React SPA 通过 fetch 调用（Accept: application/json）时返回 JSON；
-    旧的表单 POST（无此 header）保持 redirect 行为，便于直接 curl/浏览器调试。"""
-    return request.headers.get("Accept", "").startswith("application/json")
+    """判断是否返回 JSON 响应。
+
+    - Accept: application/json → JSON（React fetch、机器人）
+    - 无 Accept 或 Accept: */* → JSON（机器人/curl 默认）
+    - Accept: text/html... → redirect（旧浏览器表单）
+    """
+    accept = request.headers.get("Accept", "")
+    if not accept or "application/json" in accept or accept.strip() == "*/*":
+        return True
+    return False
 
 
 def respond(status: str, message: str, apikey: str, category: str = "ok",
@@ -1177,7 +1274,6 @@ def update_download(
 
 
 @app.get("/")
-@app.get("/")
 def index():
     """根路由：前端已由 React (Vite) 接管，Flask 仅提供 /api/* 等接口。
 
@@ -1273,7 +1369,7 @@ def upload():
             size=size,
             datasource_id=datasource_id,
         )
-    except (OSError, ValueError, sqlite3.Error) as exc:
+    except (OSError, ValueError, DBError) as exc:
         incoming.unlink(missing_ok=True)
         return respond("error", f"接收文件失败: {exc}", apikey, "error", 500)
 
@@ -1406,14 +1502,14 @@ def api_server_files():
 def server_file_download():
     """把 SERVER_FILE_ROOT 里的文件通过浏览器下载到用户电脑。"""
     if not apikey_ok():
-        return Response("401 未授权", status=401)
+        return jsonify({"error": "未授权"}), 401
     raw = (request.args.get("path") or "").strip()
     try:
         path = resolve_local_path(raw)
     except ValueError as exc:
-        return Response(f"400 {exc}", status=400)
+        return jsonify({"error": str(exc)}), 400
     if not path.is_file():
-        return Response("404 文件不存在", status=404)
+        return jsonify({"error": f"文件不存在: {raw}"}), 404
     return send_file(
         path,
         as_attachment=True,
@@ -1758,6 +1854,155 @@ def api_file_download_server_beijing(file_id: int):
     })
 
 
+@app.post("/api/files/<int:file_id>/check")
+def api_file_check(file_id: int):
+    """重新检测文件在指定位置是否存在，按结果更新记录。
+
+    请求体 JSON：
+        {"target": "local" | "cloud" | "beijing"}
+
+    始终做真实检测（不因 DB 标记为空就跳过）：
+    - local：local_path 为空时回退到 SERVER_FILE_ROOT/filename
+    - cloud/beijing：直接查桶，不因 uploaded=0 就返回 False
+
+    返回：
+        {"target": "...", "exists": true/false, "file": {更新后的记录}}
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    body = request.get_json(silent=True) or {}
+    target = (body.get("target") or "local").strip()
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
+    f = dict(row)
+    now = time.time()
+
+    if target == "local":
+        root = server_root()
+        if root is None:
+            return jsonify({"error": "未配置 SERVER_FILE_ROOT"}), 400
+
+        local_path = f.get("local_path")
+        # local_path 有值 → 检它；无值 → 回退到 root/filename
+        if local_path:
+            try:
+                path = resolve_local_path(local_path)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+        else:
+            filename = f.get("filename") or ""
+            if not filename:
+                return jsonify({"target": "local", "exists": False, "file": f})
+            path = (root / filename).resolve()
+
+        exists = path.is_file()
+        file_size = path.stat().st_size if exists else 0
+        with get_db() as conn:
+            if exists:
+                # 文件在磁盘上 → 补记 local_path（若空）+ 更新 size
+                sets = ["size=?", "updated_at=?"]
+                params = [file_size, now]
+                if not local_path:
+                    try:
+                        rel = path.relative_to(root.resolve()).as_posix()
+                    except ValueError:
+                        rel = path.name
+                    sets.append("local_path=?")
+                    params.append(rel)
+                params.append(file_id)
+                conn.execute(
+                    f"UPDATE files SET {', '.join(sets)} WHERE id=?", params,
+                )
+            elif local_path:
+                # DB 有记录但文件已不在 → 清空 local_path
+                conn.execute(
+                    "UPDATE files SET local_path=NULL, updated_at=? WHERE id=?",
+                    (now, file_id),
+                )
+            row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        f = dict(row)
+        return jsonify({"target": "local", "exists": exists, "file": f})
+
+    if target == "cloud":
+        try:
+            resp = get_client().head_object(
+                Bucket=os.environ["B2_BUCKET"], Key=f["object_key"]
+            )
+            exists = True
+            file_size = resp.get("ContentLength") or 0
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in ("404", "NoSuchKey", "NotFound"):
+                exists = False
+                file_size = 0
+            else:
+                return jsonify({"error": str(exc)}), 502
+        except (BotoCoreError, OSError) as exc:
+            return jsonify({"error": str(exc)}), 502
+        with get_db() as conn:
+            if exists:
+                sets = ["size=?", "updated_at=?"]
+                params = [file_size, now]
+                if not f.get("uploaded"):
+                    sets.extend(["uploaded=1", "status='synced'", "synced_at=?"])
+                    params.append(now)
+                params.append(file_id)
+                conn.execute(
+                    f"UPDATE files SET {', '.join(sets)} WHERE id=?", params,
+                )
+            elif f.get("uploaded"):
+                conn.execute(
+                    "UPDATE files SET uploaded=0, status='pending', updated_at=? WHERE id=?",
+                    (now, file_id),
+                )
+            row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        f = dict(row)
+        return jsonify({"target": "cloud", "exists": exists, "file": f})
+
+    if target == "beijing":
+        if not beijing_enabled():
+            return jsonify({"error": "北京桶未启用"}), 400
+        try:
+            resp = get_beijing_client().head_object(
+                Bucket=os.environ["BEIJING_BUCKET"], Key=f["object_key"]
+            )
+            exists = True
+            file_size = resp.get("ContentLength") or 0
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in ("404", "NoSuchKey", "NotFound"):
+                exists = False
+                file_size = 0
+            else:
+                return jsonify({"error": str(exc)}), 502
+        except (BotoCoreError, OSError) as exc:
+            return jsonify({"error": str(exc)}), 502
+        with get_db() as conn:
+            if exists:
+                sets = ["size=?", "updated_at=?"]
+                params = [file_size, now]
+                if not f.get("uploaded_beijing"):
+                    sets.append("uploaded_beijing=1")
+                params.append(file_id)
+                conn.execute(
+                    f"UPDATE files SET {', '.join(sets)} WHERE id=?", params,
+                )
+            elif f.get("uploaded_beijing"):
+                conn.execute(
+                    "UPDATE files SET uploaded_beijing=0, updated_at=? WHERE id=?",
+                    (now, file_id),
+                )
+            row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        f = dict(row)
+        return jsonify({"target": "beijing", "exists": exists, "file": f})
+
+    return jsonify({"error": f"无效的 target: {target}（可选 local / cloud / beijing）"}), 400
+
+
 @app.get("/download")
 def download():
     blocked = require_auth()
@@ -1765,12 +2010,12 @@ def download():
         return blocked
     key = (request.args.get("key") or "").lstrip("/")
     if not key:
-        return Response("400 缺少 key 参数", status=400)
+        return jsonify({"error": "缺少 key 参数"}), 400
 
     bucket_target = (request.args.get("bucket") or "self").strip()
     if bucket_target == "beijing":
         if not beijing_enabled():
-            return Response("400 北京桶未启用", status=400)
+            return jsonify({"error": "北京桶未启用"}), 400
         client, bucket = resolve_bucket("beijing")
     else:
         client, bucket = resolve_bucket("self")
@@ -1781,10 +2026,10 @@ def download():
         code = str(exc.response.get("Error", {}).get("Code", ""))
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         if code in ("404", "NoSuchKey", "NotFound") or status == 404:
-            return Response(f"404 对象不存在: {key}", status=404)
-        return Response(f"下载失败: {exc}", status=502)
+            return jsonify({"error": f"对象不存在: {key}"}), 404
+        return jsonify({"error": f"下载失败: {exc}"}), 502
     except (BotoCoreError, OSError) as exc:
-        return Response(f"下载失败: {exc}", status=502)
+        return jsonify({"error": f"下载失败: {exc}"}), 502
 
     body = obj["Body"]
     filename = PurePosixPath(key).name or "download"
@@ -1981,9 +2226,8 @@ def api_status(job_id: int):
 
 @app.get("/api/jobs")
 def api_jobs():
-    blocked = require_auth()
-    if blocked:
-        return blocked
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
     return jsonify([job_payload(job) for job in recent_jobs()])
 
 
@@ -2023,6 +2267,60 @@ def api_job_cancel(job_id: int):
     with get_db() as conn:
         updated = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     return jsonify({"status": "ok", "message": "已请求取消。", "job": job_payload(dict(updated))})
+
+
+@app.post("/api/jobs/<int:job_id>/pause")
+def api_job_pause(job_id: int):
+    """请求暂停一个任务（排队中或上传中）。
+
+    暂停后：排队中的任务会被 worker 跳过；上传中的任务在下次回调时阻塞。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"任务 {job_id} 不存在"}), 404
+    job = dict(row)
+    if job["status"] not in ("queued", "uploading"):
+        return jsonify({
+            "error": f"任务已处于 {job['status']} 状态，无法暂停",
+            "job": job_payload(job),
+        }), 400
+
+    request_pause(job_id)
+    with get_db() as conn:
+        conn.execute("UPDATE jobs SET paused=1 WHERE id=?", (job_id,))
+        updated = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    emit_job_update(job_id)
+    return jsonify({"status": "ok", "message": "已暂停", "job": job_payload(dict(updated))})
+
+
+@app.post("/api/jobs/<int:job_id>/resume")
+def api_job_resume(job_id: int):
+    """恢复已暂停的任务。
+
+    - 排队中的任务：被 worker 跳过后需要重新入队
+    - 上传中的任务：解除回调阻塞，传输继续
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"任务 {job_id} 不存在"}), 404
+
+    request_resume(job_id)
+    with get_db() as conn:
+        conn.execute("UPDATE jobs SET paused=0 WHERE id=?", (job_id,))
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    job = dict(row)
+    if job["status"] == "queued":
+        JOB_QUEUE.put(job_id)
+    emit_job_update(job_id)
+    return jsonify({"status": "ok", "message": "已恢复", "job": job_payload(job)})
 
 
 @app.get("/api/auth")
@@ -2326,9 +2624,8 @@ def api_update_file(file_id: int):
 
 @app.get("/api/objects")
 def api_objects():
-    blocked = require_auth()
-    if blocked:
-        return blocked
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
     target = request.args.get("bucket", "self").strip() or "self"
     raw_prefix = request.args.get("prefix", "") or default_prefix()
     q = (request.args.get("q") or "").strip()
@@ -2433,7 +2730,8 @@ def init_runtime() -> None:
     cleanup_stale_multipart()
     if beijing_enabled():
         cleanup_stale_multipart(client=get_beijing_client(), bucket_name=os.environ["BEIJING_BUCKET"])
-    threading.Thread(target=worker_loop, name="upload-worker", daemon=True).start()
+    for i in range(max(1, MAX_WORKERS)):
+        threading.Thread(target=worker_loop, name=f"worker-{i}", daemon=True).start()
 
     global BUCKET_PRIVATE, BUCKET_PRIVATE_NOTE
     BUCKET_PRIVATE, BUCKET_PRIVATE_NOTE = check_bucket_private()

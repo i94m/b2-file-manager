@@ -99,8 +99,8 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
       const prev = ref.current[job.id]
       const now = Date.now()
       const samples = prev ? [...prev.samples] : []
-      // 仅在上传中累计样本（progress 在变化）
-      if (job.status === "uploading") {
+      // 仅在上传中且未暂停时累计样本（progress 在变化）
+      if (job.status === "uploading" && !job.paused) {
         samples.push({ t: now, progress: job.progress })
         if (samples.length > SAMPLE_LIMIT) samples.shift()
       } else if (job.status === "done" || job.status === "error") {
