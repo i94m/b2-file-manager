@@ -71,20 +71,24 @@ queued → uploading → done
 | kind | 含义 |
 |------|------|
 | `fetch` | 从 URL 下载 → 上传到 bucket（或下载到服务器） |
-| `upload` | 本地/服务器文件 → 自己桶1 |
-| `upload_bucket2` | 本地/服务器文件 → 自己桶2 |
-| `upload_beijing` | 本地/服务器文件 → 北京桶 |
-| `download` | 自己桶1 → 服务器路径 |
-| `download_bucket2` | 自己桶2 → 服务器路径 |
-| `download_beijing` | 北京桶 → 服务器路径 |
+| `upload` | 本地/服务器文件 → 指定桶（`bucket_id` 区分目标） |
+| `download` | 指定桶 → 服务器路径（`bucket_id` 区分来源） |
+
+> 历史任务中可能残留 `upload_beijing` / `upload_bucket2` / `download_beijing` / `download_bucket2` 等旧 kind，
+> 启动时已自动迁移为 `upload` / `download` + `bucket_id`。
 
 ### Bucket（桶标识）
 
-| 标识 | 环境变量前缀 | 说明 |
-|------|-------------|------|
-| `self` | `B2_1_*` | 自己桶1（必配） |
-| `bucket2` | `B2_2_*` | 自己桶2（可选，凭证留空则不启用） |
-| `beijing` | `BEIJING_*` | 北京桶（可选，凭证留空则不启用） |
+桶完全由数据库 `buckets` 表驱动（见 [桶管理](#桶管理)），加桶只需调 `POST /api/buckets`，无需改代码。
+
+所有接受 `bucket` / `bucket_id` 参数的接口统一支持两种引用方式：
+
+| 引用 | 示例 | 说明 |
+|------|------|------|
+| 桶 id（数字） | `3` | `GET /api/buckets` 返回的 `id`，推荐 |
+| legacy 别名 | `self` / `bucket2` / `beijing` | 历史遗留的三桶专属别名（仅存量库自动迁移的行带有），老机器人脚本可继续使用 |
+
+缺省（不传）= **默认桶**（第一个添加的桶自动成为默认桶）。
 
 ---
 
@@ -132,6 +136,7 @@ X-API-Key: YOUR_KEY
 |------|------|------|------|
 | `urls` | `string[]` | 是 | 1~50 个 URL，需 `http://` 或 `https://` 开头 |
 | `prefix` | `string` | 否 | 对象 key 前缀（默认读 `DEFAULT_PREFIX` 环境变量） |
+| `bucket` | `string` | 否 | 目标桶：桶 id 或 legacy 别名（缺省 = 默认桶） |
 
 **响应** `200`：
 
@@ -162,7 +167,7 @@ Content-Type: multipart/form-data
 
 file=<二进制>
 prefix=backups/2026
-bucket=self          # 可选：self | bucket2 | beijing
+bucket=3             # 可选：桶 id 或 legacy 别名 self|bucket2|beijing（缺省=默认桶）
 key=custom/path.zip  # 可选：自定义完整 object key（覆盖 prefix）
 datasource_id=3      # 可选
 ```
@@ -197,11 +202,13 @@ X-API-Key: YOUR_KEY
     "filename": "photo.jpg", "object_key": "files/photo.jpg",
     "source": "https://...", "size": 10240, "progress": 5120,
     "error": null, "cancelled": false, "paused": false,
+    "bucket_id": null, "bucket_name": null,
     "created_at": 1234567890, "started_at": 1234567891, "finished_at": null
   },
   "file": {
     "id": 3, "status": "pending", "md5": "abc123", "size": 10240,
     "uploaded": 0, "uploaded_bucket2": 0, "uploaded_beijing": 0,
+    "uploaded_bucket_ids": [1],
     "bucket": "mybucket", "object_key": "files/photo.jpg",
     "synced_at": null, "error": null
   }
@@ -209,6 +216,7 @@ X-API-Key: YOUR_KEY
 ```
 
 > `file` 为 `null` 表示该 job 无关联文件记录。
+> `uploaded_bucket_ids` 是权威字段（已上传桶 id 数组）；`uploaded` / `uploaded_bucket2` / `uploaded_beijing` 三个旧布尔为兼容保留，从 `uploaded_bucket_ids` 派生。
 
 #### GET /api/jobs
 
@@ -312,41 +320,52 @@ PATCH /api/files/3
 X-API-Key: YOUR_KEY
 Content-Type: application/json
 
-{"status": "synced", "uploaded": true, "md5": "newhash"}
+{"status": "synced", "uploaded_bucket_ids": [1, 3], "md5": "newhash"}
 ```
+
+> `uploaded_bucket_ids` 为**替换语义**（整体覆盖已上传桶集合）。
+> 旧布尔 `uploaded` / `uploaded_bucket2` / `uploaded_beijing` 仍可传入（映射到对应桶），等价于 `uploaded_bucket_ids` 的单元素增删。
 
 #### DELETE /api/files/:file_id
 
 删除文件记录（仅数据库，不影响桶中对象）。
 
-#### POST /api/files/:file_id/upload-cloud
+#### POST /api/files/:file_id/upload
 
-将服务器本地文件上传到自己桶1（需先 `download-server`）。
+将服务器本地文件上传到指定桶（需先 `download-server` 或已有本地副本）。
 
-```json
-// 请求体（可选）
-{"key": "custom/object/key"}
+```http
+POST /api/files/3/upload
+X-API-Key: YOUR_KEY
+Content-Type: application/json
+
+{"bucket_id": 3, "key": "custom/object/key"}
 ```
 
-#### POST /api/files/:file_id/upload-bucket2
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `bucket_id` | `number` 或 `string` | 否 | 桶 id 或 legacy 别名（缺省 = 默认桶） |
+| `key` | `string` | 否 | 自定义完整 object key |
 
-上传到自己桶2（需 `B2_2_*` 环境变量已配置）。请求体同 `upload-cloud`。
-
-#### POST /api/files/:file_id/upload-beijing
-
-上传到北京桶（需 `BEIJING_*` 环境变量已配置）。请求体同 `upload-cloud`。
+> 兼容旧路由：`/upload-cloud`、`/upload-bucket2`、`/upload-beijing`（无请求体或同上，固定转发到对应桶）。
 
 #### POST /api/files/:file_id/download-server
 
-从自己桶1下载到服务器 `SERVER_FILE_ROOT`。
+从指定桶下载到服务器 `SERVER_FILE_ROOT`。
 
-#### POST /api/files/:file_id/download-server-bucket2
+```http
+POST /api/files/3/download-server
+X-API-Key: YOUR_KEY
+Content-Type: application/json
 
-从自己桶2下载到服务器。
+{"bucket_id": 3}
+```
 
-#### POST /api/files/:file_id/download-server-beijing
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `bucket_id` | `number` 或 `string` | 否 | 桶 id 或 legacy 别名；缺省时优先默认桶，未上传过默认桶则回退 `source_url` 直接下载 |
 
-从北京桶下载到服务器。
+> 兼容旧路由：`/download-server-bucket2`、`/download-server-beijing`（固定转发到对应桶）。
 
 #### POST /api/files/:file_id/check
 
@@ -363,9 +382,9 @@ Content-Type: application/json
 | target | 检测内容 | 不存在时更新 |
 |--------|----------|-------------|
 | `local` | 服务器本地文件（`SERVER_FILE_ROOT`） | `local_path = NULL` |
-| `cloud` | 自己桶1中的对象 | `uploaded = 0, status = 'pending'` |
-| `bucket2` | 自己桶2中的对象 | `uploaded_bucket2 = 0` |
-| `beijing` | 北京桶中的对象 | `uploaded_beijing = 0` |
+| `cloud` 或缺省 | 默认桶中的对象 | 清默认桶标记；原已上传则 `status = 'pending'` |
+| 桶 id（数字） | 对应桶中的对象 | 清该桶标记（默认桶同上联动 status） |
+| `bucket2` / `beijing` | 对应 legacy 桶中的对象 | 清该桶标记 |
 
 > 检测存在时会顺带更新 `size`（本地取文件 stat，桶内取对象 ContentLength）。
 
@@ -384,11 +403,11 @@ Content-Type: application/json
 列出桶内对象（分页）。
 
 ```http
-GET /api/objects?bucket=self&prefix=backups/&q=2026&page=1&page_size=50
+GET /api/objects?bucket=3&prefix=backups/&q=2026&page=1&page_size=50
 X-API-Key: YOUR_KEY
 ```
 
-> `bucket` 可选 `self`（默认）/ `bucket2` / `beijing`。
+> `bucket` 接受桶 id 或 legacy 别名（缺省 = 默认桶）。
 
 **响应**：
 
@@ -406,28 +425,30 @@ X-API-Key: YOUR_KEY
 删除桶对象。
 
 ```json
-{"key": "path/to/object.zip", "bucket": "self"}
+{"key": "path/to/object.zip", "bucket": 3}
 ```
 
-> `bucket` 可选 `self`（默认）/ `bucket2` / `beijing`。删除成功后本地文件库对应桶的上传标记自动清零（自己桶1 另标记 `status=deleted`）。
+> `bucket` 接受桶 id 或 legacy 别名（缺省 = 默认桶）。删除成功后本地文件库对应桶的上传标记自动清除（默认桶另标记 `status=deleted`）。
 
 #### POST /api/objects/rename
 
 重命名 / 移动桶对象（copy + delete）。
 
 ```json
-{"bucket": "self", "from_key": "old/path", "to_key": "new/path"}
+{"bucket": 3, "from_key": "old/path", "to_key": "new/path"}
 ```
+
+> `bucket` 接受桶 id 或 legacy 别名（缺省 = 默认桶）。
 
 #### GET /download
 
 流式下载桶对象到客户端。
 
 ```http
-GET /download?key=path/to/file.zip&bucket=self&apikey=YOUR_KEY
+GET /download?key=path/to/file.zip&bucket=3&apikey=YOUR_KEY
 ```
 
-> 浏览器直跳用，返回二进制流。`bucket` 可选 `self` / `bucket2` / `beijing`。
+> 浏览器直跳用，返回二进制流。`bucket` 接受桶 id 或 legacy 别名（缺省 = 默认桶）。
 
 ---
 
@@ -445,11 +466,13 @@ GET /download?key=path/to/file.zip&bucket=self&apikey=YOUR_KEY
 
 #### POST /server-upload
 
-上传服务器本地文件到 bucket（FormData：`path` + `prefix`）。
+上传服务器本地文件到 bucket（FormData：`path` + `prefix` + 可选 `bucket`=桶 id/别名）。
 
 #### POST /server-download
 
-从 bucket 下载到服务器路径（FormData：`key` + `destination`）。
+从 bucket 下载到服务器路径（FormData：`key` + 可选 `destination` + 可选 `bucket`=桶 id/别名）。
+
+> `destination` 缺省时落到 `SERVER_FILE_ROOT/<对象文件名>`（需已配置 `SERVER_FILE_ROOT`）。
 
 #### GET /server-file/download
 
@@ -473,13 +496,96 @@ GET /download?key=path/to/file.zip&bucket=self&apikey=YOUR_KEY
   "default_prefix": "",
   "bucket2_enabled": false, "bucket2_bucket": "",
   "beijing_enabled": false, "beijing_bucket": "",
-  "bucket_private": true, "bucket_private_note": "..."
+  "bucket_private": true, "bucket_private_note": "...",
+  "buckets": [
+    {"id": 1, "name": "自己桶1", "bucket_name": "mybucket", "legacy_key": "self", "is_default": true},
+    {"id": 3, "name": "北京桶", "bucket_name": "kkk-oo-a", "legacy_key": "beijing", "is_default": false}
+  ]
 }
 ```
 
+> 旧字段 `bucket2_enabled` / `beijing_enabled` 等从 buckets 表派生保留；新集成建议直接读 `buckets` 数组。
+
 #### GET /api/bucket-health
 
-检测桶连通性 + 元数据（延迟、region、版本控制、公开状态等）。
+检测所有已启用桶的连通性 + 元数据（延迟、region、版本控制、公开状态等）。
+
+```json
+{
+  "buckets": [
+    {"id": 1, "name": "自己桶1", "bucket_name": "mybucket", "legacy_key": "self", "is_default": true,
+     "health": {"ok": true, "latency_ms": 42, "status_code": 200, "...": "..."}}
+  ]
+}
+```
+
+---
+
+### 桶管理
+
+桶凭证存于数据库 `buckets` 表；`application_key` 永远不会出现在响应里。
+
+#### GET /api/buckets
+
+桶列表（含禁用桶；按 默认优先 → `sort_order` → `id` 排序）。
+
+```json
+[
+  {"id": 1, "name": "自己桶1", "bucket_name": "mybucket", "application_key_id": "0051...",
+   "has_application_key": true, "endpoint": null, "region": "us-west-004",
+   "addressing_style": "auto", "legacy_key": "self", "is_default": true,
+   "enabled": true, "sort_order": 0, "created_at": 123, "updated_at": 456}
+]
+```
+
+#### POST /api/buckets
+
+新增桶。首个桶强制为默认桶。
+
+```http
+POST /api/buckets
+X-API-Key: YOUR_KEY
+Content-Type: application/json
+
+{
+  "name": "北京桶",
+  "bucket_name": "kkk-oo-a",
+  "application_key_id": "0051xxx",
+  "application_key": "K005xxx",
+  "endpoint": "tos-s3-cn-beijing.volces.com",
+  "region": "cn-beijing",
+  "addressing_style": "virtual",
+  "sort_order": 10,
+  "is_default": false
+}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `name` | 是 | 显示名 |
+| `bucket_name` | 是 | S3 桶名 |
+| `application_key_id` / `application_key` | 是 | 凭证 |
+| `endpoint` / `region` | 否 | 二者至少一个；都不填则尝试从 keyID 解析 |
+| `addressing_style` | 否 | `auto`（默认）/ `virtual` / `path` |
+| `sort_order` | 否 | 排序值（默认 0） |
+| `is_default` | 否 | 设为默认桶会清掉其它桶的默认标记 |
+
+**响应** `201`：`{"status": "ok", "message": "桶「北京桶」已添加。", "bucket_id": 4}`
+
+#### PATCH /api/buckets/:bucket_id
+
+编辑桶（子集更新）。`application_key` 为空/缺省 = 保留旧值；`endpoint` / `region` 传空字符串 = 清除。
+凭证 / endpoint / 桶名 / 寻址风格变更后缓存客户端自动失效重建。
+清除当前默认桶的 `is_default` 返回 `400`（必须保留一个默认桶）。
+
+#### DELETE /api/buckets/:bucket_id
+
+删除桶。默认桶拒绝删除（`400`）。删除时：该桶排队/传输中任务标记 `failed`（error='桶已删除'）、
+`file_uploads` 关联清除、`jobs.bucket_id` 置空。
+
+#### POST /api/buckets/:bucket_id/test
+
+连通性测试（用临时客户端，不污染缓存）。返回 `BucketHealthEntry`（同 `/api/bucket-health` 的 `health` 项）。
 
 ---
 
@@ -525,7 +631,7 @@ socket.on("job_update", (job) => {
 ```typescript
 interface JobUpdate {
   id: number
-  kind: string           // fetch | upload | upload_bucket2 | upload_beijing | download | download_bucket2 | download_beijing
+  kind: string           // fetch | upload | download
   status: string         // queued | uploading | done | failed | cancelled
   filename: string
   object_key: string
@@ -533,6 +639,8 @@ interface JobUpdate {
   size: number           // 总字节
   error: string | null
   source: string | null
+  bucket_id: number | null    // upload/download 任务的目标桶 id
+  bucket_name: string | null  // 目标桶显示名
   created_at: number     // Unix 时间戳（秒）
   started_at: number | null
   finished_at: number | null

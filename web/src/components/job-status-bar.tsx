@@ -1,12 +1,18 @@
 import * as React from "react"
-import { Ban, CheckCircle2, Loader2, Pause, Play, X, XCircle } from "lucide-react"
+import { Ban, CheckCircle2, Loader2, MoreVertical, Pause, Play, X, XCircle } from "lucide-react"
 import { toast } from "sonner"
 
 import { useJobs } from "@/lib/use-jobs"
 import { cancelJob, pauseJob, resumeJob } from "@/lib/api"
+import type { JobUpdate } from "@/lib/types"
 import { useConfirm } from "@/lib/use-confirm"
 import { cn, formatBytes, formatRate, formatTime } from "@/lib/utils"
-import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Table,
   TableBody,
@@ -39,8 +45,15 @@ const KIND_LABEL: Record<string, string> = {
   fetch: "下载",
   download: "下载",
   upload: "上传",
-  upload_beijing: "上传(北京)",
-  download_beijing: "下载(北京)",
+}
+
+/** 任务类型文案：上传/下载任务追加目标桶名（如「上传(北京桶)」）。 */
+function jobKindLabel(job: JobUpdate): string {
+  const base = KIND_LABEL[job.kind] ?? job.kind
+  if ((job.kind === "upload" || job.kind === "download") && job.bucket_name) {
+    return `${base}(${job.bucket_name})`
+  }
+  return base
 }
 
 /** 最近任务结果表格（放文件列表下方）。 */
@@ -65,7 +78,7 @@ export function JobsTable() {
             <TableHead className="w-20 text-right">大小</TableHead>
             <TableHead className="w-40">进度</TableHead>
             <TableHead className="w-32">时间</TableHead>
-            <TableHead className="w-16 text-right">操作</TableHead>
+            <TableHead className="w-12 text-right">操作</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -94,7 +107,7 @@ export function JobsTable() {
                   </span>
                 </TableCell>
                 <TableCell className="text-xs text-muted-foreground">
-                  {KIND_LABEL[j.kind] ?? j.kind}
+                  {jobKindLabel(j)}
                 </TableCell>
                 <TableCell className="text-right text-xs tabular-nums text-muted-foreground">
                   {formatBytes(j.size)}
@@ -170,30 +183,34 @@ function JobActions({ job }: { job: { id: number; filename: string; paused: bool
     }
   }
   return (
-    <div className="inline-flex items-center gap-1">
-      <Button
-        variant="ghost"
-        size="sm"
-        className="h-6 px-1.5 text-xs text-muted-foreground"
-        onClick={handlePauseResume}
-        disabled={busy}
-        title={job.paused ? "继续" : "暂停"}
-      >
-        {busy ? <Loader2 className="size-3 animate-spin" /> :
-          job.paused ? <Play className="size-3" /> : <Pause className="size-3" />}
-        {job.paused ? "继续" : "暂停"}
-      </Button>
-      <Button
-        variant="ghost"
-        size="sm"
-        className="h-6 px-1.5 text-xs text-muted-foreground hover:text-destructive"
-        onClick={handleCancel}
-        disabled={busy}
-        title="取消任务"
-      >
-        <X className="size-3" />
-        取消
-      </Button>
+    <div className="inline-flex items-center justify-end">
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            title="任务操作"
+            className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+          >
+            <MoreVertical className="size-3.5" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem onClick={handlePauseResume} disabled={busy}>
+            {busy ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : job.paused ? (
+              <Play className="size-3.5" />
+            ) : (
+              <Pause className="size-3.5" />
+            )}
+            {job.paused ? "继续" : "暂停"}
+          </DropdownMenuItem>
+          <DropdownMenuItem variant="destructive" onClick={handleCancel} disabled={busy}>
+            <X className="size-3.5" />
+            取消任务
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
       {confirmDialog}
     </div>
   )

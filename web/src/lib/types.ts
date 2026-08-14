@@ -1,3 +1,13 @@
+/** 桶基础信息（/api/buckets 列表项 / /api/auth 的 buckets 数组）。 */
+export interface BucketInfo {
+  id: number
+  name: string
+  bucket_name: string
+  /** 历史遗留别名 self / bucket2 / beijing（仅存量库迁移行带有，其余为 null）。 */
+  legacy_key: string | null
+  is_default: boolean
+}
+
 /** 后端 files 表的一行（GET /api/files 返回的 item）。 */
 export interface FileItem {
   id: number
@@ -8,9 +18,8 @@ export interface FileItem {
   size: number
   bucket: string
   source_url: string | null
-  uploaded: number // 0/1
-  uploaded_beijing: number // 0/1（北京桶，独立于 uploaded）
-  uploaded_bucket2: number // 0/1（自己桶2，独立于 uploaded）
+  /** 已上传到的桶 id 集合（file_uploads 表派生，替代旧 uploaded_* 三列）。 */
+  uploaded_bucket_ids: number[]
   status: string // pending | synced | failed | deleted
   datasource_id: number | null
   local_path: string | null // 已下载到服务器 SERVER_FILE_ROOT 的相对路径
@@ -76,10 +85,12 @@ export interface AppInfo {
   default_prefix: string
   bucket_private: boolean | null
   bucket_private_note: string
+  /** 旧字段从 buckets 表派生（后端保留，机器人兼容）。 */
   beijing_enabled: boolean
   beijing_bucket: string
   bucket2_enabled: boolean
   bucket2_bucket: string
+  buckets: BucketInfo[]
 }
 
 /** GET /api/bucket-health 的单项结果。 */
@@ -106,11 +117,9 @@ export interface BucketHealthEntry {
   storage_class: string | null
 }
 
-/** GET /api/bucket-health 的响应。 */
+/** GET /api/bucket-health 的响应（按桶动态返回）。 */
 export interface BucketHealth {
-  self: BucketHealthEntry
-  beijing: BucketHealthEntry | null
-  bucket2: BucketHealthEntry | null
+  buckets: Array<BucketInfo & { health: BucketHealthEntry }>
 }
 
 /** Socket.IO job_update 事件（与后端 job_payload 对齐）。 */
@@ -129,6 +138,8 @@ export interface JobUpdate {
   finished_at: number | null
   cancelled: boolean
   paused: boolean
+  bucket_id: number | null
+  bucket_name: string | null
 }
 
 /** 单个 job 的实时进度统计（由前端基于 job_update 序列推算）。 */

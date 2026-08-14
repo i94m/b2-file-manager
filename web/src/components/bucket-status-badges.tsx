@@ -118,19 +118,10 @@ function BucketBadge({
   )
 }
 
+/** 顶部桶连通性徽章：按 /api/bucket-health 返回的 buckets 数组动态渲染。 */
 export function BucketStatusBadges({
-  selfBucket,
-  bucket2Enabled,
-  bucket2Bucket,
-  beijingEnabled,
-  beijingBucket,
   trailing,
 }: {
-  selfBucket: string
-  bucket2Enabled: boolean
-  bucket2Bucket: string
-  beijingEnabled: boolean
-  beijingBucket: string
   /** 渲染在桶徽章之后、刷新按钮之前的额外元素（如连接状态）。 */
   trailing?: React.ReactNode
 }) {
@@ -154,27 +145,18 @@ export function BucketStatusBadges({
 
   return (
     <>
-      <BucketBadge
-        label="Bucket1"
-        bucket={selfBucket}
-        entry={health?.self ?? null}
-        loading={loading}
-      />
-      {bucket2Enabled && (
-        <BucketBadge
-          label="Bucket2"
-          bucket={bucket2Bucket}
-          entry={health?.bucket2 ?? null}
-          loading={loading}
-        />
-      )}
-      {beijingEnabled && (
-        <BucketBadge
-          label="北京桶"
-          bucket={beijingBucket}
-          entry={health?.beijing ?? null}
-          loading={loading}
-        />
+      {loading ? (
+        <BucketBadge label="" bucket="" entry={null} loading />
+      ) : (
+        health?.buckets.map((b) => (
+          <BucketBadge
+            key={b.id}
+            label={b.name}
+            bucket={b.bucket_name}
+            entry={b.health ?? null}
+            loading={false}
+          />
+        ))
       )}
       {trailing}
       <button

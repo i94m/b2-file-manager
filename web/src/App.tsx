@@ -1,6 +1,7 @@
 import * as React from "react"
 import { ThemeProvider, useTheme } from "next-themes"
 import { JobsProvider, useJobs } from "@/lib/use-jobs"
+import { BucketsProvider, useBuckets } from "@/lib/use-buckets"
 import { AuthGuard } from "@/components/auth-guard"
 import { RefreshCw, Search, Moon, Sun } from "lucide-react"
 
@@ -17,6 +18,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Toaster } from "@/components/ui/sonner"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { FilesDataTable } from "@/components/files-data-table"
 import { FetchUrlDialog } from "@/components/action-dialogs"
@@ -24,6 +26,7 @@ import { ConnectionStatus, JobsTable } from "@/components/job-status-bar"
 import { BucketStatusBadges } from "@/components/bucket-status-badges"
 import { ServerFilesSection } from "@/components/server-files-section"
 import { BucketBrowserSection } from "@/components/bucket-browser-section"
+import { BucketManager } from "@/components/bucket-manager"
 
 function ThemeToggle() {
   const { resolvedTheme, setTheme } = useTheme()
@@ -42,14 +45,10 @@ function ThemeToggle() {
 
 function AppShell() {
   const appInfo = useAppInfo()
-  const bucket = appInfo?.bucket ?? ""
+  const { buckets } = useBuckets()
   const defaultPrefix = appInfo?.default_prefix ?? ""
   const bucketPrivateNote = appInfo?.bucket_private_note ?? ""
   const bucketPrivate = appInfo?.bucket_private ?? null
-  const beijingEnabled = appInfo?.beijing_enabled ?? false
-  const beijingBucket = appInfo?.beijing_bucket ?? ""
-  const bucket2Enabled = appInfo?.bucket2_enabled ?? false
-  const bucket2Bucket = appInfo?.bucket2_bucket ?? ""
 
   const [files, setFiles] = React.useState<FileItem[]>([])
 
@@ -168,17 +167,13 @@ function AppShell() {
           <div>
             <h1 className="text-2xl font-bold tracking-tight">文件同步助手</h1>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-              <BucketStatusBadges
-                selfBucket={bucket}
-                bucket2Enabled={bucket2Enabled}
-                bucket2Bucket={bucket2Bucket}
-                beijingEnabled={beijingEnabled}
-                beijingBucket={beijingBucket}
-                trailing={<ConnectionStatus />}
-              />
+              <BucketStatusBadges trailing={<ConnectionStatus />} />
             </div>
           </div>
-          <ThemeToggle />
+          <div className="flex items-center gap-2">
+            <BucketManager />
+            <ThemeToggle />
+          </div>
         </header>
 
         {/* Bucket 公开告警 */}
@@ -229,55 +224,49 @@ function AppShell() {
         <FilesDataTable
           data={files}
           scripts={scripts}
+          buckets={buckets}
           total={total}
           page={page}
           pageSize={pageSize}
           loading={loading}
-          beijingEnabled={beijingEnabled}
-          bucket2Enabled={bucket2Enabled}
-          selfBucketName={bucket}
-          bucket2Name={bucket2Bucket}
-          beijingBucketName={beijingBucket}
           onPageChange={setPage}
           onDeleted={loadFiles}
           onFileUpdated={patchFile}
         />
 
-        {/* 任务记录表格 */}
-        <div className="mt-4">
-          <JobsTable />
-        </div>
-
-        {/* 桶对象浏览（自己桶 / 自己桶2 / 北京桶 并列） */}
-        <div className="mt-6 flex flex-col gap-4 lg:flex-row">
-          <BucketBrowserSection
-            title={`自己桶 · ${bucket}`}
-            bucket="self"
-            defaultPrefix={defaultPrefix}
-          />
-          {bucket2Enabled && (
-            <BucketBrowserSection
-              title={`自己桶2 · ${bucket2Bucket}`}
-              bucket="bucket2"
-              defaultPrefix={defaultPrefix}
-            />
+        {/* 文件库 tabs（本地文件 + 各桶）与 任务记录 并列 */}
+        <div className="mt-6 flex flex-col gap-4 xl:flex-row xl:items-start">
+          <Tabs defaultValue="local" className="min-w-0 flex-1">
+            <TabsList>
+              <TabsTrigger value="local">本地文件</TabsTrigger>
+              {buckets.map((b) => (
+                <TabsTrigger key={b.id} value={String(b.id)} title={b.bucket_name}>
+                  {b.name}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+            <TabsContent value="local">
+              <ServerFilesSection
+                defaultPrefix={defaultPrefix}
+                scripts={scripts}
+                onUploaded={refresh}
+              />
+            </TabsContent>
+            {buckets.map((b) => (
+              <TabsContent key={b.id} value={String(b.id)}>
+                <BucketBrowserSection
+                  title={`${b.name} · ${b.bucket_name}`}
+                  bucketId={b.id}
+                  defaultPrefix={defaultPrefix}
+                />
+              </TabsContent>
+            ))}
+          </Tabs>
+          {Object.keys(jobs).length > 0 && (
+            <div className="min-w-0 flex-1">
+              <JobsTable />
+            </div>
           )}
-          {beijingEnabled && (
-            <BucketBrowserSection
-              title={`北京桶 · ${beijingBucket}`}
-              bucket="beijing"
-              defaultPrefix={defaultPrefix}
-            />
-          )}
-        </div>
-
-        {/* 本地文件（SERVER_FILE_ROOT） */}
-        <div className="mt-6">
-          <ServerFilesSection
-            defaultPrefix={defaultPrefix}
-            scripts={scripts}
-            onUploaded={refresh}
-          />
         </div>
       </main>
     </div>
@@ -288,12 +277,14 @@ export default function App() {
   return (
     <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
       <AuthGuard>
-        <JobsProvider>
-          <TooltipProvider>
-            <AppShell />
-            <Toaster richColors position="top-right" />
-          </TooltipProvider>
-        </JobsProvider>
+        <BucketsProvider>
+          <JobsProvider>
+            <TooltipProvider>
+              <AppShell />
+              <Toaster richColors position="top-right" />
+            </TooltipProvider>
+          </JobsProvider>
+        </BucketsProvider>
       </AuthGuard>
     </ThemeProvider>
   )

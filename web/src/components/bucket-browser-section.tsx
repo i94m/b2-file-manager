@@ -1,9 +1,9 @@
 import * as React from "react"
-import { ChevronLeft, ChevronRight, Cloud, Download, Pencil, Search, Trash2, Upload } from "lucide-react"
+import { ChevronLeft, ChevronRight, Cloud, Download, Loader2, MoreVertical, Pencil, Search, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { type BucketObject } from "@/lib/types"
-import { deleteObject, downloadUrl, getObjects, renameObject, uploadFile } from "@/lib/api"
+import { deleteObject, getObjects, renameObject, serverDownload, uploadFile } from "@/lib/api"
 import { useConfirm } from "@/lib/use-confirm"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -17,6 +17,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Table,
   TableBody,
@@ -34,11 +40,11 @@ const PAGE_SIZE = 20
  */
 export function BucketBrowserSection({
   title,
-  bucket,
+  bucketId,
   defaultPrefix,
 }: {
   title: string
-  bucket: "self" | "beijing" | "bucket2"
+  bucketId: number
   defaultPrefix: string
 }) {
   const [prefix, setPrefix] = React.useState(defaultPrefix)
@@ -53,7 +59,21 @@ export function BucketBrowserSection({
   const [uploadOpen, setUploadOpen] = React.useState(false)
   const [deletingKey, setDeletingKey] = React.useState<string | null>(null)
   const [busyDelete, setBusyDelete] = React.useState(false)
+  const [downloadingKey, setDownloadingKey] = React.useState<string | null>(null)
   const [confirm, confirmDialog] = useConfirm()
+
+  /** 下载到服务器：缺省目标路径 = SERVER_FILE_ROOT/<对象文件名>。 */
+  const handleServerDownload = async (obj: BucketObject) => {
+    setDownloadingKey(obj.key)
+    try {
+      const r = await serverDownload(obj.key, undefined, bucketId)
+      toast.success(r.message)
+    } catch (e) {
+      toast.error("下载失败", { description: (e as Error).message })
+    } finally {
+      setDownloadingKey(null)
+    }
+  }
 
   const handleDelete = async (obj: BucketObject) => {
     if (!await confirm({
@@ -65,7 +85,7 @@ export function BucketBrowserSection({
     setDeletingKey(obj.key)
     setBusyDelete(true)
     try {
-      await deleteObject(obj.key, bucket)
+      await deleteObject(obj.key, bucketId)
       toast.success("已删除", { description: obj.key })
       fetchPage(page)
     } catch (e) {
@@ -82,7 +102,7 @@ export function BucketBrowserSection({
       const useQ = opts?.q ?? query
       setLoading(true)
       try {
-        const data = await getObjects(usePrefix, bucket, p, PAGE_SIZE, useQ || undefined)
+        const data = await getObjects(usePrefix, bucketId, p, PAGE_SIZE, useQ || undefined)
         setObjects(data.objects)
         setSearchedPrefix(data.prefix)
         setPage(data.page)
@@ -93,7 +113,7 @@ export function BucketBrowserSection({
         setLoading(false)
       }
     },
-    [prefix, bucket, query],
+    [prefix, bucketId, query],
   )
 
   const search = () => fetchPage(1)
@@ -152,7 +172,7 @@ export function BucketBrowserSection({
               <TableHead>对象 Key</TableHead>
               <TableHead className="text-right">大小</TableHead>
               <TableHead className="text-right whitespace-nowrap">修改时间</TableHead>
-              <TableHead className="text-right">操作</TableHead>
+              <TableHead className="w-12 text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -192,30 +212,46 @@ export function BucketBrowserSection({
                     {formatTime(obj.last_modified)}
                   </TableCell>
                   <TableCell>
-                    <div className="flex items-center justify-end gap-1">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        title="重命名"
-                        onClick={() => setRenaming(obj)}
-                      >
-                        <Pencil className="size-3.5" /> 重命名
-                      </Button>
-                      <Button asChild variant="ghost" size="sm" title="下载">
-                        <a href={downloadUrl(obj.key, bucket)}>
-                          <Download className="size-3.5" /> 下载
-                        </a>
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        title="删除"
-                        onClick={() => handleDelete(obj)}
-                        disabled={busyDelete && deletingKey === obj.key}
-                        className="text-destructive hover:text-destructive"
-                      >
-                        <Trash2 className="size-3.5" /> 删除
-                      </Button>
+                    <div className="flex justify-end">
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            title="更多操作"
+                            className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                          >
+                            <MoreVertical className="size-3.5" />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onClick={() => setRenaming(obj)}>
+                            <Pencil className="size-3.5" /> 重命名
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => handleServerDownload(obj)}
+                            disabled={downloadingKey !== null}
+                          >
+                            {downloadingKey === obj.key ? (
+                              <Loader2 className="size-3.5 animate-spin" />
+                            ) : (
+                              <Download className="size-3.5" />
+                            )}
+                            下载到服务器
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            variant="destructive"
+                            onClick={() => handleDelete(obj)}
+                            disabled={busyDelete && deletingKey === obj.key}
+                          >
+                            {busyDelete && deletingKey === obj.key ? (
+                              <Loader2 className="size-3.5 animate-spin" />
+                            ) : (
+                              <Trash2 className="size-3.5" />
+                            )}
+                            删除
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </div>
                   </TableCell>
                 </TableRow>
@@ -256,7 +292,7 @@ export function BucketBrowserSection({
       {renaming && (
         <RenameDialog
           obj={renaming}
-          bucket={bucket}
+          bucketId={bucketId}
           onClose={() => setRenaming(null)}
           onDone={() => {
             setRenaming(null)
@@ -268,7 +304,7 @@ export function BucketBrowserSection({
       {/* 上传到桶 Dialog */}
       {uploadOpen && (
         <BucketUploadDialog
-          bucket={bucket}
+          bucketId={bucketId}
           bucketLabel={title}
           defaultPrefix={prefix}
           onClose={() => setUploadOpen(false)}
@@ -287,12 +323,12 @@ export function BucketBrowserSection({
 /** 重命名 Dialog：可修改完整 key（含前缀）。 */
 function RenameDialog({
   obj,
-  bucket,
+  bucketId,
   onClose,
   onDone,
 }: {
   obj: BucketObject
-  bucket: "self" | "beijing" | "bucket2"
+  bucketId: number
   onClose: () => void
   onDone: () => void
 }) {
@@ -312,7 +348,7 @@ function RenameDialog({
     }
     setBusy(true)
     try {
-      await renameObject(obj.key, trimmed, bucket)
+      await renameObject(obj.key, trimmed, bucketId)
       toast.success("已重命名", { description: `${obj.key} → ${trimmed}` })
       onDone()
     } catch (e) {
@@ -370,13 +406,13 @@ function validateKey(value: string): string | null {
 
 /** 上传到桶 Dialog：选择本地文件 + 输入桶内目标路径（可快捷填入 prefix）。 */
 function BucketUploadDialog({
-  bucket,
+  bucketId,
   bucketLabel,
   defaultPrefix,
   onClose,
   onDone,
 }: {
-  bucket: "self" | "beijing" | "bucket2"
+  bucketId: number
   bucketLabel: string
   defaultPrefix: string
   onClose: () => void
@@ -403,7 +439,7 @@ function BucketUploadDialog({
     const key = targetPath.trim().replace(/^\/+/, "")
     setBusy(true)
     try {
-      const r = await uploadFile(file, { key, bucket })
+      const r = await uploadFile(file, { key, bucket: bucketId })
       toast.success(r.message)
       onDone()
     } catch (e) {

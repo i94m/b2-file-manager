@@ -65,11 +65,20 @@ app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 
-_CLIENT = None
-_BEIJING_CLIENT = None
-_BUCKET2_CLIENT = None
 BUCKET_PRIVATE: bool | None = None
 BUCKET_PRIVATE_NOTE = ""
+
+# 桶客户端注册表：bucket_id → {"client": boto3 client, "name": 显示名, "bucket_name": S3 桶名}
+# 由 get_bucket_entry() 惰性构建；凭证/endpoint 变更时 invalidate_bucket_client() 失效。
+_BUCKET_REGISTRY: dict[int, dict] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+# 旧标识符 → files 表旧 flag 列（仅带 legacy_key 的行镜像写入用，勿在业务代码直接 UPDATE）
+LEGACY_FLAG_COLUMNS = {
+    "self": "uploaded",
+    "beijing": "uploaded_beijing",
+    "bucket2": "uploaded_bucket2",
+}
 
 
 def format_bytes(value: float) -> str:
@@ -90,35 +99,25 @@ def format_time(epoch: float) -> str:
 # --------------------------------------------------------------------------
 
 def validate_config() -> str | None:
-    required = ("B2_1_APPLICATION_KEY_ID", "B2_1_APPLICATION_KEY", "B2_1_BUCKET", "APP_API_KEY")
-    missing = [name for name in required if not os.environ.get(name)]
-    if missing:
-        return (
-            "缺少配置项: " + ", ".join(missing)
-            + "（请复制 .env.example 为 .env 并填写）"
-        )
-    if not os.environ.get("B2_1_ENDPOINT") and not os.environ.get("B2_1_REGION"):
-        return "Endpoint/Region 配置无效: B2_1_ENDPOINT 与 B2_1_REGION 至少配置一个"
+    """桶凭证存于 buckets 表（通过 /api/buckets 维护），这里只校验必填的基础项。
+
+    注意：validate_config 在 init_db 之前运行，不能查表。
+    """
+    if not os.environ.get("APP_API_KEY"):
+        return "缺少配置项: APP_API_KEY（请复制 .env.example 为 .env 并填写）"
     required_db = ("DB_HOST", "DB_USERNAME", "DB_DATABASE")
     missing_db = [name for name in required_db if not os.environ.get(name)]
     if missing_db:
         return "缺少数据库配置: " + ", ".join(missing_db)
-    try:
-        resolve_endpoint()
-    except ValueError as exc:
-        return f"Endpoint/Region 配置无效: {exc}"
     return None
 
 
-def resolve_endpoint() -> tuple[str, str]:
-    """解析 B2_1_ENDPOINT / B2_1_REGION。
+def _resolve_bucket_endpoint(endpoint: str | None, region: str | None) -> tuple[str, str]:
+    """归一化 endpoint / region（逻辑同旧 resolve_endpoint，来源改为 buckets 行）。
 
-    与现有脚本一致：优先使用 B2_1_ENDPOINT，能推断 region 就用推断值；
-    自定义 endpoint 无法推断 region 时不再报错，回退到 DEFAULT_REGION，
-    也可用 B2_1_REGION 显式指定。
+    优先使用 endpoint，能推断 region 就用推断值；自定义 endpoint 无法推断时
+    回退 DEFAULT_REGION，也可用 region 显式指定。
     """
-    endpoint = os.environ.get("B2_1_ENDPOINT")
-    region = os.environ.get("B2_1_REGION")
     try:
         return normalize_endpoint(endpoint, region)
     except ValueError:
@@ -130,117 +129,129 @@ def resolve_endpoint() -> tuple[str, str]:
         return endpoint.rstrip("/"), region or DEFAULT_REGION
 
 
-def get_client():
-    global _CLIENT
-    if _CLIENT is None:
-        endpoint, region = resolve_endpoint()
-        _CLIENT = boto3.client(
-            "s3",
-            endpoint_url=endpoint,
-            region_name=region,
-            aws_access_key_id=os.environ["B2_1_APPLICATION_KEY_ID"],
-            aws_secret_access_key=os.environ["B2_1_APPLICATION_KEY"],
-            config=Config(signature_version="s3v4", retries={"max_attempts": 8, "mode": "standard"}),
-        )
-    return _CLIENT
+def _build_client(row: dict):
+    """按 buckets 表行构建一个 S3 客户端（不缓存，test 端点也用它）。"""
+    endpoint, region = _resolve_bucket_endpoint(row.get("endpoint"), row.get("region"))
+    addressing = (row.get("addressing_style") or "auto").strip()
+    config_kwargs: dict = {
+        "signature_version": "s3v4",
+        "retries": {"max_attempts": 8, "mode": "standard"},
+    }
+    if addressing in ("virtual", "path"):
+        config_kwargs["s3"] = {"addressing_style": addressing}
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name=region,
+        aws_access_key_id=row["application_key_id"],
+        aws_secret_access_key=row["application_key"],
+        config=Config(**config_kwargs),
+    )
+
+
+def get_bucket_entry(row: dict) -> dict:
+    """惰性构建并缓存桶客户端；row 为 buckets 表行（dict）。"""
+    bucket_id = int(row["id"])
+    with _REGISTRY_LOCK:
+        entry = _BUCKET_REGISTRY.get(bucket_id)
+        if entry is None:
+            entry = {
+                "client": _build_client(row),
+                "name": row["name"],
+                "bucket_name": row["bucket_name"],
+            }
+            _BUCKET_REGISTRY[bucket_id] = entry
+    return entry
+
+
+def invalidate_bucket_client(bucket_id: int) -> None:
+    with _REGISTRY_LOCK:
+        _BUCKET_REGISTRY.pop(bucket_id, None)
+
+
+def get_buckets(enabled_only: bool = True) -> list[dict]:
+    """桶列表（默认桶优先，其次 sort_order、id）。"""
+    where = "WHERE enabled=1" if enabled_only else ""
+    with get_db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM buckets {where} ORDER BY is_default DESC, sort_order, id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def default_bucket() -> dict | None:
+    buckets = get_buckets(enabled_only=True)
+    return buckets[0] if buckets else None
+
+
+def _default_bucket_name() -> str:
+    b = default_bucket()
+    return b["bucket_name"] if b else ""
+
+
+def resolve_bucket_ref(param) -> dict:
+    """把桶引用解析为 buckets 表行。
+
+    ''/None/'self'/'cloud' → 默认桶；'12' → 桶 id；
+    'bucket2'/'beijing' 等 → legacy_key 别名（机器人兼容）。
+    找不到时 raise ValueError。
+    """
+    raw = (str(param) if param is not None else "").strip()
+    if raw in ("", "self", "cloud"):
+        b = default_bucket()
+        if b is None:
+            raise ValueError("未配置任何桶，请先在「桶管理」中添加")
+        return b
+    if raw.isdigit():
+        with get_db() as conn:
+            row = conn.execute("SELECT * FROM buckets WHERE id=?", (int(raw),)).fetchone()
+        if row is None:
+            raise ValueError(f"桶 {raw} 不存在")
+        return dict(row)
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM buckets WHERE legacy_key=?", (raw,)).fetchone()
+        if row is not None:
+            return dict(row)
+    raise ValueError(f"无效的桶标识: {raw}")
+
+
+def resolve_bucket(target=None) -> tuple:
+    """统一获取 (client, bucket_name)（保持旧签名，内部走 resolve_bucket_ref）。"""
+    row = resolve_bucket_ref(target)
+    entry = get_bucket_entry(row)
+    return entry["client"], entry["bucket_name"]
 
 
 def beijing_enabled() -> bool:
-    """北京桶是否启用：3 个必填项都设置才算启用。"""
-    return all(
-        os.environ.get(name)
-        for name in ("BEIJING_APPLICATION_KEY_ID", "BEIJING_APPLICATION_KEY", "BEIJING_BUCKET")
-    )
+    """兼容 shim：legacy_key='beijing' 的桶存在且启用。"""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM buckets WHERE legacy_key='beijing' AND enabled=1"
+        ).fetchone()
+    return row is not None
 
 
-def resolve_beijing_endpoint() -> tuple[str, str]:
-    """解析 BEIJING_ENDPOINT / BEIJING_REGION（逻辑同 resolve_endpoint，读 BEIJING_* 变量）。"""
-    endpoint = os.environ.get("BEIJING_ENDPOINT")
-    region = os.environ.get("BEIJING_REGION")
-    try:
-        return normalize_endpoint(endpoint, region)
-    except ValueError:
-        if not endpoint:
-            raise
-        endpoint = endpoint.strip()
-        if not endpoint.startswith(("https://", "http://")):
-            endpoint = "https://" + endpoint
-        return endpoint.rstrip("/"), region or DEFAULT_REGION
+def apply_upload_flag(conn, file_id: int, bucket_row: dict, value: bool) -> None:
+    """统一维护 file_uploads 关联 + 旧 flag 列镜像（须在 conn 事务内调用）。
 
-
-def get_beijing_client():
-    """懒加载北京桶 S3 客户端（仅在 beijing_enabled() 时调用）。"""
-    global _BEIJING_CLIENT
-    if _BEIJING_CLIENT is None:
-        endpoint, region = resolve_beijing_endpoint()
-        _BEIJING_CLIENT = boto3.client(
-            "s3",
-            endpoint_url=endpoint,
-            region_name=region,
-            aws_access_key_id=os.environ["BEIJING_APPLICATION_KEY_ID"],
-            aws_secret_access_key=os.environ["BEIJING_APPLICATION_KEY"],
-            config=Config(
-                signature_version="s3v4",
-                s3={"addressing_style": "virtual"},
-                retries={"max_attempts": 8, "mode": "standard"},
-            ),
-        )
-    return _BEIJING_CLIENT
-
-
-def bucket2_enabled() -> bool:
-    """自己桶2是否启用：3 个必填项都设置才算启用。"""
-    return all(
-        os.environ.get(name)
-        for name in ("B2_2_APPLICATION_KEY_ID", "B2_2_APPLICATION_KEY", "B2_2_BUCKET")
-    )
-
-
-def resolve_bucket2_endpoint() -> tuple[str, str]:
-    """解析 B2_2_ENDPOINT / B2_2_REGION（逻辑同 resolve_endpoint，读 B2_2_* 变量）。"""
-    endpoint = os.environ.get("B2_2_ENDPOINT")
-    region = os.environ.get("B2_2_REGION")
-    try:
-        return normalize_endpoint(endpoint, region)
-    except ValueError:
-        if not endpoint:
-            raise
-        endpoint = endpoint.strip()
-        if not endpoint.startswith(("https://", "http://")):
-            endpoint = "https://" + endpoint
-        return endpoint.rstrip("/"), region or DEFAULT_REGION
-
-
-def get_bucket2_client():
-    """懒加载自己桶2 S3 客户端（仅在 bucket2_enabled() 时调用）。"""
-    global _BUCKET2_CLIENT
-    if _BUCKET2_CLIENT is None:
-        endpoint, region = resolve_bucket2_endpoint()
-        _BUCKET2_CLIENT = boto3.client(
-            "s3",
-            endpoint_url=endpoint,
-            region_name=region,
-            aws_access_key_id=os.environ["B2_2_APPLICATION_KEY_ID"],
-            aws_secret_access_key=os.environ["B2_2_APPLICATION_KEY"],
-            config=Config(signature_version="s3v4", retries={"max_attempts": 8, "mode": "standard"}),
-        )
-    return _BUCKET2_CLIENT
-
-
-def resolve_bucket(target: str = "self") -> tuple:
-    """统一获取 (client, bucket_name)。
-
-    target="self" 用自己桶1，"bucket2" 用自己桶2，"beijing" 用北京桶。
+    所有「某文件已上传到某桶」的状态变更都走这里，勿散落直接 UPDATE。
     """
-    if target == "bucket2":
-        if not bucket2_enabled():
-            raise ValueError("自己桶2未启用")
-        return get_bucket2_client(), os.environ["B2_2_BUCKET"]
-    if target == "beijing":
-        if not beijing_enabled():
-            raise ValueError("北京桶未启用")
-        return get_beijing_client(), os.environ["BEIJING_BUCKET"]
-    return get_client(), os.environ["B2_1_BUCKET"]
+    if value:
+        conn.execute(
+            "INSERT IGNORE INTO file_uploads (file_id, bucket_id, uploaded_at) VALUES (?, ?, ?)",
+            (file_id, bucket_row["id"], time.time()),
+        )
+    else:
+        conn.execute(
+            "DELETE FROM file_uploads WHERE file_id=? AND bucket_id=?",
+            (file_id, bucket_row["id"]),
+        )
+    legacy_key = bucket_row.get("legacy_key")
+    if legacy_key and legacy_key in LEGACY_FLAG_COLUMNS:
+        conn.execute(
+            f"UPDATE files SET {LEGACY_FLAG_COLUMNS[legacy_key]}=? WHERE id=?",
+            (1 if value else 0, file_id),
+        )
 
 
 def server_root() -> Path | None:
@@ -332,6 +343,16 @@ def _create_unique_index_if_not_exists(conn, index_name, table_name, columns):
         conn.execute(f"CREATE UNIQUE INDEX {index_name} ON {table_name} ({columns})")
 
 
+def _create_index_if_not_exists(conn, index_name, table_name, columns):
+    exists = conn.execute(
+        "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+        (table_name, index_name),
+    ).fetchone()
+    if not exists:
+        conn.execute(f"CREATE INDEX {index_name} ON {table_name} ({columns})")
+
+
 def init_db() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with get_db() as conn:
@@ -366,6 +387,7 @@ def init_db() -> None:
             ("note", "TEXT"),
             ("cancelled", "TINYINT NOT NULL DEFAULT 0"),
             ("paused", "TINYINT NOT NULL DEFAULT 0"),
+            ("bucket_id", "INT"),
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
@@ -384,6 +406,39 @@ def init_db() -> None:
             )
             """
         )
+        # 桶配置表：桶从此变成数据，加桶只需插入一行（通过 /api/buckets 或页面「桶管理」维护）
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS buckets (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                name VARCHAR(64) NOT NULL,
+                bucket_name VARCHAR(255) NOT NULL,
+                application_key_id VARCHAR(255) NOT NULL,
+                application_key VARCHAR(255) NOT NULL,
+                endpoint VARCHAR(512),
+                region VARCHAR(64),
+                addressing_style VARCHAR(20) NOT NULL DEFAULT 'auto',
+                legacy_key VARCHAR(20) NULL UNIQUE,
+                is_default TINYINT NOT NULL DEFAULT 0,
+                enabled TINYINT NOT NULL DEFAULT 1,
+                sort_order INT NOT NULL DEFAULT 0,
+                created_at DOUBLE NOT NULL,
+                updated_at DOUBLE NOT NULL
+            )
+            """
+        )
+        # 文件 ↔ 桶 上传关联表（替代 files.uploaded / uploaded_beijing / uploaded_bucket2）
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_uploads (
+                file_id INT NOT NULL,
+                bucket_id INT NOT NULL,
+                uploaded_at DOUBLE NOT NULL,
+                PRIMARY KEY (file_id, bucket_id)
+            )
+            """
+        )
+        _create_index_if_not_exists(conn, "idx_file_uploads_bucket", "file_uploads", "bucket_id")
         # 旧库迁移：把旧 scripts 表的数据搬到 datasources（command → script_path）
         has_old_scripts = conn.execute(
             "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
@@ -477,11 +532,55 @@ def init_db() -> None:
                 conn.execute("UPDATE files SET datasource_id = script_id WHERE script_id IS NOT NULL")
         _create_unique_index_if_not_exists(conn, "idx_files_md5", "files", "md5")
         _create_unique_index_if_not_exists(conn, "idx_files_job", "files", "job_id")
+
+        # ── 桶配置完全来自数据库（buckets 表），通过 /api/buckets 或页面「桶管理」维护 ──
+
+        # 确保恰好有一个默认桶（无默认桶时把排序最前的桶提为默认）
+        has_default = conn.execute(
+            "SELECT id FROM buckets WHERE is_default=1 LIMIT 1"
+        ).fetchone()
+        if has_default is None:
+            first = conn.execute(
+                "SELECT id FROM buckets ORDER BY sort_order, id LIMIT 1"
+            ).fetchone()
+            if first is not None:
+                conn.execute("UPDATE buckets SET is_default=1 WHERE id=?", (first["id"],))
+
+        # ── 一次性迁移①：files 旧 flag 列 → file_uploads（guard：关联表为空） ──
+        uploads_count = conn.execute("SELECT COUNT(*) AS c FROM file_uploads").fetchone()["c"]
+        if uploads_count == 0:
+            for legacy_key, column in LEGACY_FLAG_COLUMNS.items():
+                conn.execute(
+                    f"INSERT IGNORE INTO file_uploads (file_id, bucket_id, uploaded_at) "
+                    f"SELECT f.id, b.id, COALESCE(f.synced_at, f.updated_at, f.created_at) "
+                    f"FROM files f JOIN buckets b ON b.legacy_key=? WHERE f.{column}=1",
+                    (legacy_key,),
+                )
+
+        # ── 一次性迁移②：jobs 旧 kind（upload_beijing 等 6 组）→ kind + bucket_id ──
+        for old_kind, new_kind, legacy_key in (
+            ("upload_beijing", "upload", "beijing"),
+            ("upload_bucket2", "upload", "bucket2"),
+            ("download_beijing", "download", "beijing"),
+            ("download_bucket2", "download", "bucket2"),
+        ):
+            conn.execute(
+                "UPDATE jobs j JOIN buckets b ON b.legacy_key=? "
+                "SET j.kind=?, j.bucket_id=b.id "
+                "WHERE j.kind=? AND j.bucket_id IS NULL",
+                (legacy_key, new_kind, old_kind),
+            )
+
+        # 旧库回填：uploaded 的记录补 bucket 名（改为默认桶行的桶名）
+        default_row = conn.execute(
+            "SELECT bucket_name FROM buckets WHERE is_default=1 LIMIT 1"
+        ).fetchone()
+        default_bucket_name = default_row["bucket_name"] if default_row else ""
         conn.execute(
             "UPDATE files SET uploaded=1, status='synced', "
             "updated_at=COALESCE(updated_at, created_at), "
             "bucket=COALESCE(NULLIF(bucket, ''), ?) WHERE uploaded=1 OR status='synced'",
-            (os.environ.get("B2_1_BUCKET", ""),),
+            (default_bucket_name,),
         )
 
 
@@ -501,12 +600,13 @@ def insert_job(
     size: int,
     source: str | None = None,
     destination: str | None = None,
+    bucket_id: int | None = None,
 ) -> int:
     with get_db() as conn:
         cursor = conn.execute(
-            "INSERT INTO jobs (kind, filename, object_key, source, destination, size, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
-            (kind, filename, object_key, source, destination, size, time.time()),
+            "INSERT INTO jobs (kind, filename, object_key, source, destination, size, bucket_id, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+            (kind, filename, object_key, source, destination, size, bucket_id, time.time()),
         )
         return cursor.lastrowid
 
@@ -550,6 +650,19 @@ def object_exists(client, bucket_name: str, object_key: str) -> bool:
         raise
 
 
+def _bucket_display_name(bucket_id) -> str | None:
+    """桶显示名：优先注册表缓存，DB 兜底（给 job_payload 用）。"""
+    if bucket_id is None:
+        return None
+    with _REGISTRY_LOCK:
+        entry = _BUCKET_REGISTRY.get(int(bucket_id))
+        if entry is not None:
+            return entry["name"]
+    with get_db() as conn:
+        row = conn.execute("SELECT name FROM buckets WHERE id=?", (int(bucket_id),)).fetchone()
+    return row["name"] if row else None
+
+
 def job_payload(job: dict) -> dict:
     return {
         "id": job["id"],
@@ -568,6 +681,8 @@ def job_payload(job: dict) -> dict:
         "finished_at": job.get("finished_at"),
         "cancelled": bool(job.get("cancelled", 0)),
         "paused": bool(job.get("paused", 0)),
+        "bucket_id": job.get("bucket_id"),
+        "bucket_name": _bucket_display_name(job.get("bucket_id")),
     }
 
 
@@ -684,12 +799,21 @@ def make_progress(job_id: int, size: int):
     return callback
 
 
+def _default_client_and_name() -> tuple:
+    """默认桶的 (client, bucket_name)；未配置桶时 raise ValueError。"""
+    b = default_bucket()
+    if b is None:
+        raise ValueError("未配置任何桶，请先在「桶管理」中添加")
+    entry = get_bucket_entry(b)
+    return entry["client"], entry["bucket_name"]
+
+
 def upload_to_bucket(source: Path, object_key: str, job_id: int, size: int,
                      client=None, bucket_name: str | None = None) -> None:
-    if client is None:
-        client = get_client()
-    if bucket_name is None:
-        bucket_name = os.environ["B2_1_BUCKET"]
+    if client is None or bucket_name is None:
+        default_client, default_name = _default_client_and_name()
+        client = client or default_client
+        bucket_name = bucket_name or default_name
     client.upload_file(
         str(source),
         bucket_name,
@@ -701,10 +825,10 @@ def upload_to_bucket(source: Path, object_key: str, job_id: int, size: int,
 
 def download_to_path(object_key: str, size: int, destination: Path, job_id: int,
                      client=None, bucket_name: str | None = None) -> None:
-    if client is None:
-        client = get_client()
-    if bucket_name is None:
-        bucket_name = os.environ["B2_1_BUCKET"]
+    if client is None or bucket_name is None:
+        default_client, default_name = _default_client_and_name()
+        client = client or default_client
+        bucket_name = bucket_name or default_name
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.", suffix=".part", dir=str(destination.parent)
@@ -774,18 +898,28 @@ def hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def ensure_unique_md5(md5: str, job_id: int, uploaded_column: str = "uploaded") -> bool:
-    """md5 已存在时跳过上传并给任务加备注，返回是否为新文件。
+def ensure_unique_md5(md5: str, job_id: int, bucket_id: int | None = None) -> bool:
+    """md5 已在该桶存在时跳过上传并给任务加备注，返回是否为新文件。
 
-    只有 uploaded_column=1（实际上传成功）的记录才算数，避免中断/失败的残留记录
-    导致后续相同文件被误判为"已存在"而跳过上传。
+    只有 file_uploads 里已关联该桶（实际上传成功）的记录才算数，避免中断/失败的
+    残留记录导致后续相同文件被误判为"已存在"而跳过上传。
     """
-    # uploaded_column 受控于代码内部调用，非用户输入，可安全拼接
     with get_db() as conn:
-        row = conn.execute(
-            f"SELECT object_key FROM files WHERE md5=? AND job_id <> ? AND {uploaded_column}=1",
-            (md5, job_id),
-        ).fetchone()
+        if bucket_id is not None:
+            row = conn.execute(
+                "SELECT f.object_key FROM files f "
+                "JOIN file_uploads fu ON fu.file_id=f.id AND fu.bucket_id=? "
+                "WHERE f.md5=? AND f.job_id <> ?",
+                (bucket_id, md5, job_id),
+            ).fetchone()
+        else:
+            # 兜底：未指定桶时按任意已上传记录查重（近似旧行为）
+            row = conn.execute(
+                "SELECT f.object_key FROM files f "
+                "JOIN file_uploads fu ON fu.file_id=f.id "
+                "WHERE f.md5=? AND f.job_id <> ?",
+                (md5, job_id),
+            ).fetchone()
     if row is not None:
         with get_db() as conn:
             conn.execute(
@@ -798,10 +932,10 @@ def ensure_unique_md5(md5: str, job_id: int, uploaded_column: str = "uploaded") 
 
 
 def verify_object(object_key: str, size: int, client=None, bucket_name: str | None = None) -> None:
-    if client is None:
-        client = get_client()
-    if bucket_name is None:
-        bucket_name = os.environ["B2_1_BUCKET"]
+    if client is None or bucket_name is None:
+        default_client, default_name = _default_client_and_name()
+        client = client or default_client
+        bucket_name = bucket_name or default_name
     meta = client.head_object(Bucket=bucket_name, Key=object_key)
     actual = int(meta["ContentLength"])
     if actual != size:
@@ -832,7 +966,7 @@ def insert_file_pending(
                 object_key,
                 filename,
                 size,
-                os.environ.get("B2_1_BUCKET", ""),
+                _default_bucket_name(),
                 source_url,
                 datasource_id,
                 now,
@@ -862,13 +996,23 @@ def sync_to_bucket(
     source_url: str | None = None,
     client=None,
     bucket_name: str | None = None,
-    uploaded_column: str = "uploaded",
+    bucket_row: dict | None = None,
 ) -> bool:
     """上传到 bucket 并更新 files 记录；md5 重复时删除 pending 记录并跳过。
 
-    uploaded_column 控制成功后写哪个字段（"uploaded" 或 "uploaded_beijing"）。
+    bucket_row 为 buckets 表行；None 时兜底用默认桶。
+    成功后对每个关联 file 走 apply_upload_flag(True)（含旧列镜像），
+    默认桶额外回填 files.bucket。
     """
-    if not ensure_unique_md5(md5, job_id, uploaded_column):
+    if bucket_row is None:
+        bucket_row = default_bucket()
+        if bucket_row is None:
+            raise ValueError("未配置任何桶，请先在「桶管理」中添加")
+    if client is None or bucket_name is None:
+        entry = get_bucket_entry(bucket_row)
+        client = client or entry["client"]
+        bucket_name = bucket_name or entry["bucket_name"]
+    if not ensure_unique_md5(md5, job_id, bucket_row["id"]):
         with get_db() as conn:
             conn.execute("DELETE FROM files WHERE job_id=?", (job_id,))
         return False
@@ -876,18 +1020,25 @@ def sync_to_bucket(
     upload_to_bucket(source_path, object_key, job_id, size, client=client, bucket_name=bucket_name)
     verify_object(object_key, size, client=client, bucket_name=bucket_name)
     now = time.time()
+    is_default = bool(bucket_row.get("is_default"))
     with get_db() as conn:
         conn.execute(
-            f"UPDATE files SET md5=?, size=?, {uploaded_column}=1, status='synced', synced_at=?, updated_at=? "
-            "WHERE job_id=?",
+            "UPDATE files SET md5=?, size=?, status='synced', synced_at=?, updated_at=? WHERE job_id=?",
             (md5, size, now, now, job_id),
         )
+        for r in conn.execute("SELECT id FROM files WHERE job_id=?", (job_id,)).fetchall():
+            apply_upload_flag(conn, r["id"], bucket_row, True)
+            if is_default:
+                conn.execute(
+                    "UPDATE files SET bucket=? WHERE id=?",
+                    (bucket_row["bucket_name"], r["id"]),
+                )
     return True
 
 
 def cleanup_job_temp(job_id: int, kind: str, destination: str | None = None) -> None:
     """清理任务产生的临时文件（服务器路径上传任务的源文件不属于临时文件）。"""
-    if kind in ("download", "download_beijing", "download_bucket2") and destination:
+    if kind == "download" and destination:
         try:
             dest = Path(destination)
             for leftover in dest.parent.glob(f".{dest.name}.*.part"):
@@ -924,16 +1075,15 @@ def process_job(job_id: int) -> None:
         source = row["source"]
         destination = row["destination"]
         filename = row["filename"]
+        bucket_id = row.get("bucket_id")
     emit_job_update(job_id)
 
     try:
-        if kind in ("download", "download_beijing", "download_bucket2"):
-            target = "beijing" if kind == "download_beijing" else (
-                "bucket2" if kind == "download_bucket2" else "self"
-            )
-            client, bucket = resolve_bucket(target)
+        if kind == "download":
+            bucket_row = resolve_bucket_ref(bucket_id)
+            entry = get_bucket_entry(bucket_row)
             download_to_path(object_key, size, Path(destination), job_id,
-                             client=client, bucket_name=bucket)
+                             client=entry["client"], bucket_name=entry["bucket_name"])
             # 若该 job 关联了 file 记录（从文件列表「下载到服务器」发起），
             # 成功后回写 local_path（相对 SERVER_FILE_ROOT 的路径）作为已下载标识
             with get_db() as conn:
@@ -975,24 +1125,20 @@ def process_job(job_id: int) -> None:
                         rel = dest.name
                     update_file_by_job(job_id, local_path=rel)
                 else:
-                    sync_to_bucket(source_path, object_key, job_id, size, md5, filename, source)
-            elif kind in ("upload", "upload_beijing", "upload_bucket2"):
-                target = "beijing" if kind == "upload_beijing" else (
-                    "bucket2" if kind == "upload_bucket2" else "self"
-                )
-                col = {"upload_beijing": "uploaded_beijing", "upload_bucket2": "uploaded_bucket2"}.get(kind, "uploaded")
-                client, bucket = resolve_bucket(target)
+                    bucket_row = resolve_bucket_ref(bucket_id)  # 无 bucket_id 时取默认桶
+                    sync_to_bucket(source_path, object_key, job_id, size, md5, filename, source,
+                                   bucket_row=bucket_row)
+            elif kind == "upload":
+                bucket_row = resolve_bucket_ref(bucket_id)
+                entry = get_bucket_entry(bucket_row)
                 if source_path is None:
                     source_path = UPLOAD_DIR / f"{job_id}.part"
                 md5 = hash_file(source_path)
                 sync_to_bucket(source_path, object_key, job_id, size, md5, filename,
-                               client=client, bucket_name=bucket, uploaded_column=col)
+                               client=entry["client"], bucket_name=entry["bucket_name"],
+                               bucket_row=bucket_row)
             else:
-                # 兜底：兼容旧版 upload（无 _beijing 后缀）
-                if source_path is None:
-                    source_path = UPLOAD_DIR / f"{job_id}.part"
-                md5 = hash_file(source_path)
-                sync_to_bucket(source_path, object_key, job_id, size, md5, filename)
+                raise ValueError(f"未知任务类型: {kind}")
             final_size = size
         with get_db() as conn:
             conn.execute(
@@ -1058,10 +1204,10 @@ def recover_jobs() -> None:
 
 def cleanup_stale_multipart(max_age_hours: float = 24.0, client=None, bucket_name: str | None = None) -> None:
     """清理 B2 中超过阈值仍未完成的分片上传（进程崩溃时的残留兜底）。"""
-    if client is None:
-        client = get_client()
-    if bucket_name is None:
-        bucket_name = os.environ["B2_1_BUCKET"]
+    if client is None or bucket_name is None:
+        default_client, default_name = _default_client_and_name()
+        client = client or default_client
+        bucket_name = bucket_name or default_name
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
         count = 0
@@ -1100,9 +1246,13 @@ def recent_scripts() -> list[dict]:
 
 
 def check_bucket_private() -> tuple[bool | None, str]:
-    """检测 bucket 是否私有：S3 ACL 中出现 AllUsers 公开读即视为公开。"""
+    """检测默认桶是否私有：S3 ACL 中出现 AllUsers 公开读即视为公开。"""
+    d = default_bucket()
+    if d is None:
+        return None, "未配置默认桶，跳过公开状态检测"
     try:
-        acl = get_client().get_bucket_acl(Bucket=os.environ["B2_1_BUCKET"])
+        entry = get_bucket_entry(d)
+        acl = entry["client"].get_bucket_acl(Bucket=entry["bucket_name"])
         for grant in acl.get("Grants", []):
             grantee = grant.get("Grantee", {})
             uri = grantee.get("URI", "") or ""
@@ -1250,10 +1400,10 @@ def list_objects(prefix: str, limit: int | None = 50, client=None, bucket_name: 
     if prefix:
         prefix += "/"
     objects: list[dict] = []
-    if client is None:
-        client = get_client()
-    if bucket_name is None:
-        bucket_name = os.environ["B2_1_BUCKET"]
+    if client is None or bucket_name is None:
+        default_client, default_name = _default_client_and_name()
+        client = client or default_client
+        bucket_name = bucket_name or default_name
     paginator = client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
         for item in page.get("Contents", []):
@@ -1338,17 +1488,30 @@ def index():
     blocked = require_auth()
     if blocked:
         return blocked
+    buckets = get_buckets()
+    default = next((b for b in buckets if b["is_default"]), None)
     return jsonify({
         "app": "b2-file-manager",
-        "bucket": os.environ["B2_1_BUCKET"],
+        "bucket": default["bucket_name"] if default else "",
         "default_prefix": default_prefix(),
         "bucket_private": BUCKET_PRIVATE,
         "bucket_private_note": BUCKET_PRIVATE_NOTE,
+        "buckets": [
+            {
+                "id": b["id"],
+                "name": b["name"],
+                "bucket_name": b["bucket_name"],
+                "legacy_key": b.get("legacy_key"),
+                "is_default": bool(b["is_default"]),
+            }
+            for b in buckets
+        ],
         "endpoints": [
             "GET /api/files",
             "GET /api/scripts",
             "GET /api/jobs",
             "GET /api/objects",
+            "GET /api/buckets",
             "POST /api/submit",
             "POST /upload",
             "GET /download",
@@ -1361,7 +1524,7 @@ def upload():
     """上传本地文件到 bucket。
 
     表单字段：file（必填）、prefix（可选）、key（可选，自定义完整 object key）、
-    bucket（可选，self|beijing）、datasource_id（可选）。
+    bucket（可选，桶 id 或 legacy 别名 self/bucket2/beijing）、datasource_id（可选）。
     React (Accept: application/json) 调用时返回 JSON，旧表单则 flash + redirect。
     """
     blocked = require_auth()
@@ -1375,19 +1538,12 @@ def upload():
 
     filename = Path(file.filename.replace("\\", "/")).name
 
-    # 目标桶：self（默认）、bucket2 或 beijing
-    bucket = (request.form.get("bucket") or "self").strip()
-    if bucket == "bucket2":
-        if not bucket2_enabled():
-            return respond("error", "自己桶2未启用。", apikey, "error", 400)
-        kind = "upload_bucket2"
-    elif bucket == "beijing":
-        if not beijing_enabled():
-            return respond("error", "北京桶未启用。", apikey, "error", 400)
-        kind = "upload_beijing"
-    else:
-        bucket = "self"
-        kind = "upload"
+    # 目标桶：bucket 字段接受桶 id / legacy 别名（self=默认桶）
+    bucket_ref = (request.form.get("bucket") or request.form.get("bucket_id") or "self").strip()
+    try:
+        bucket_row = resolve_bucket_ref(bucket_ref)
+    except ValueError as exc:
+        return respond("error", str(exc), apikey, "error", 400)
 
     # 自定义完整 key 优先；否则按 prefix 生成 key（保留原始文件名）
     custom_key = (request.form.get("key") or "").strip().lstrip("/")
@@ -1401,8 +1557,8 @@ def upload():
         object_key = build_object_key(prefix, filename)
 
     # 同名拒传：目标 key 已存在则报错，不创建 job、不入队
-    client, bucket_name = resolve_bucket(bucket)
-    if object_exists(client, bucket_name, object_key):
+    entry = get_bucket_entry(bucket_row)
+    if object_exists(entry["client"], entry["bucket_name"], object_key):
         return respond("error", f"同名文件已存在：{object_key}", apikey, "error", 400)
 
     datasource_id = request.form.get("datasource_id", type=int)
@@ -1413,13 +1569,13 @@ def upload():
         size = incoming.stat().st_size
         if size == 0:
             raise ValueError("文件内容为空。")
-        with get_db() as conn:
-            cursor = conn.execute(
-                "INSERT INTO jobs (kind, filename, object_key, size, status, created_at) "
-                "VALUES (?, ?, ?, ?, 'queued', ?)",
-                (kind, filename, object_key, size, time.time()),
-            )
-            job_id = cursor.lastrowid
+        job_id = insert_job(
+            kind="upload",
+            filename=filename,
+            object_key=object_key,
+            size=size,
+            bucket_id=bucket_row["id"],
+        )
         os.replace(incoming, UPLOAD_DIR / f"{job_id}.part")
         insert_file_pending(
             job_id=job_id,
@@ -1460,8 +1616,15 @@ def server_upload():
         return respond("error", f"路径不存在或不是普通文件: {source}", apikey, "error", 400)
 
     object_key = build_object_key(prefix, source.name)
+    # 目标桶：bucket 字段接受桶 id / legacy 别名（self=默认桶）
+    bucket_ref = (request.form.get("bucket") or request.form.get("bucket_id") or "self").strip()
+    try:
+        bucket_row = resolve_bucket_ref(bucket_ref)
+    except ValueError as exc:
+        return respond("error", str(exc), apikey, "error", 400)
+    entry = get_bucket_entry(bucket_row)
     # 同名拒传
-    if object_exists(get_client(), os.environ["B2_1_BUCKET"], object_key):
+    if object_exists(entry["client"], entry["bucket_name"], object_key):
         return respond("error", f"同名文件已存在：{object_key}", apikey, "error", 400)
     size = source.stat().st_size
     datasource_id = request.form.get("datasource_id", type=int)
@@ -1471,6 +1634,7 @@ def server_upload():
         object_key=object_key,
         size=size,
         source=str(source),
+        bucket_id=bucket_row["id"],
     )
     insert_file_pending(
         job_id=job_id,
@@ -1498,15 +1662,32 @@ def server_download():
 
     if not key:
         return respond("error", "请填写要下载的 bucket 对象名（key）。", apikey, "error", 400)
-    try:
-        destination = resolve_server_path(raw_destination)
-    except ValueError as exc:
-        return respond("error", str(exc), apikey, "error", 400)
+    if raw_destination:
+        try:
+            destination = resolve_server_path(raw_destination)
+        except ValueError as exc:
+            return respond("error", str(exc), apikey, "error", 400)
+    else:
+        # 缺省目标路径：SERVER_FILE_ROOT/<对象文件名>（与文件记录下载行为一致）
+        root = server_root()
+        if root is None:
+            return respond(
+                "error", "未配置 SERVER_FILE_ROOT，请填写完整目标路径。", apikey, "error", 400
+            )
+        destination = root / (PurePosixPath(key).name or "download")
     if destination.is_dir():
         return respond("error", "目标路径是已存在的目录，请填写完整的文件路径。", apikey, "error", 400)
 
+    # 目标桶：bucket 字段接受桶 id / legacy 别名（self=默认桶）
+    bucket_ref = (request.form.get("bucket") or request.form.get("bucket_id") or "self").strip()
     try:
-        metadata = get_client().head_object(Bucket=os.environ["B2_1_BUCKET"], Key=key)
+        bucket_row = resolve_bucket_ref(bucket_ref)
+    except ValueError as exc:
+        return respond("error", str(exc), apikey, "error", 400)
+    entry = get_bucket_entry(bucket_row)
+
+    try:
+        metadata = entry["client"].head_object(Bucket=entry["bucket_name"], Key=key)
         size = int(metadata["ContentLength"])
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
@@ -1525,6 +1706,7 @@ def server_download():
         object_key=key,
         size=size,
         destination=str(destination),
+        bucket_id=bucket_row["id"],
     )
     JOB_QUEUE.put(job_id)
     emit_job_update(job_id)
@@ -1602,8 +1784,8 @@ def url_upload():
         return blocked
     apikey = request.args.get("apikey", "")
     url = (request.form.get("url") or "").strip()
-    if not url.startswith(("http://", "https://")):
-        return respond("error", "请填写以 http:// 或 https:// 开头的链接。", apikey, "error", 400)
+    if not url:
+        return respond("error", "请填写链接或文件标识。", apikey, "error", 400)
 
     target = (request.form.get("target") or "bucket").strip()
     destination = None
@@ -1624,8 +1806,12 @@ def url_upload():
             return respond("error", str(exc), apikey, "error", 400)
         filename = PurePosixPath(urlparse(url).path).name or "download"
         object_key = build_object_key(prefix, filename)
-        # 同名拒传：登记阶段就拒掉，避免后续 upload-cloud 冲突
-        if object_exists(get_client(), os.environ["B2_1_BUCKET"], object_key):
+        # 同名拒传：登记阶段就拒掉（默认桶），避免后续上传冲突
+        try:
+            entry = get_bucket_entry(resolve_bucket_ref(None))
+        except ValueError as exc:
+            return respond("error", str(exc), apikey, "error", 400)
+        if object_exists(entry["client"], entry["bucket_name"], object_key):
             return respond("error", f"同名文件已存在：{object_key}", apikey, "error", 400)
 
     filename = PurePosixPath(urlparse(url).path).name or "download"
@@ -1663,24 +1849,33 @@ def url_upload():
     )
 
 
-@app.post("/api/files/<int:file_id>/upload-cloud")
-def api_file_upload_cloud(file_id: int):
-    """把服务器本地文件上传到 bucket。
+def _do_file_upload(file_id: int, bucket_param) -> tuple:
+    """统一实现：把服务器本地文件上传到指定桶（建 kind=upload job 入队）。
 
-    要求 files.local_path 存在（先下载到服务器）且尚未 uploaded=1。
-    建 kind=upload job 入队，worker 从本地路径读取并上传到 bucket。
+    bucket_param 支持桶 id / legacy 别名 / None(默认桶)。
+    要求 files.local_path 存在（先下载到服务器）且尚未上传到该桶。
     """
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
+    try:
+        bucket_row = resolve_bucket_ref(bucket_param)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     with get_db() as conn:
         row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        already = None
+        if row is not None:
+            already = conn.execute(
+                "SELECT 1 FROM file_uploads WHERE file_id=? AND bucket_id=?",
+                (file_id, bucket_row["id"]),
+            ).fetchone()
     if row is None:
         return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
     f = dict(row)
 
-    if f.get("uploaded"):
-        return jsonify({"error": "该文件已上传到云"}), 400
+    if already:
+        return jsonify({"error": f"该文件已上传到{bucket_row['name']}"}), 400
     local_path = f.get("local_path")
     if not local_path:
         return jsonify({"error": "本地文件不存在，请先下载到服务器"}), 400
@@ -1703,6 +1898,7 @@ def api_file_upload_cloud(file_id: int):
         object_key=object_key,
         size=f.get("size") or 0,
         source=str(source),
+        bucket_id=bucket_row["id"],
     )
     with get_db() as conn:
         conn.execute(
@@ -1713,25 +1909,59 @@ def api_file_upload_cloud(file_id: int):
     emit_job_update(job_id)
     return jsonify({
         "status": "ok",
-        "message": f"「{filename}」上传到云的任务已加入队列。",
+        "message": f"「{filename}」上传到{bucket_row['name']}的任务已加入队列。",
         "job_id": job_id,
         "file_id": file_id,
     })
 
 
-@app.post("/api/files/<int:file_id>/download-server")
-def api_file_download_server(file_id: int):
-    """下载文件到服务器 SERVER_FILE_ROOT（保留原始文件名）。
+@app.post("/api/files/<int:file_id>/upload")
+def api_file_upload(file_id: int):
+    """把服务器本地文件上传到指定桶。
 
-    - 已在 bucket（uploaded=1）：从 bucket 下载（kind=download）。
-    - 有 source_url 且未上传：从 URL 抓取到服务器（kind=fetch + destination）。
-    成功后 worker 回写 files.local_path。
+    请求体 JSON：{"bucket_id": <桶 id 或 legacy 别名，可选，默认桶>, "key": "..."}。
+    """
+    body = request.get_json(silent=True) or {}
+    return _do_file_upload(file_id, body.get("bucket_id"))
+
+
+@app.post("/api/files/<int:file_id>/upload-cloud")
+def api_file_upload_cloud(file_id: int):
+    """旧路由包装：上传到默认桶（机器人兼容）。"""
+    return _do_file_upload(file_id, "self")
+
+
+@app.post("/api/files/<int:file_id>/upload-beijing")
+def api_file_upload_beijing(file_id: int):
+    """旧路由包装：上传到北京桶（legacy_key 别名）。"""
+    return _do_file_upload(file_id, "beijing")
+
+
+@app.post("/api/files/<int:file_id>/upload-bucket2")
+def api_file_upload_bucket2(file_id: int):
+    """旧路由包装：上传到自己桶2（legacy_key 别名）。"""
+    return _do_file_upload(file_id, "bucket2")
+
+
+def _do_file_download_server(file_id: int, bucket_param) -> tuple:
+    """统一实现：下载文件到服务器 SERVER_FILE_ROOT（保留原始文件名）。
+
+    - 显式指定桶（bucket_param 为 id/legacy）：必须已上传到该桶 → 从该桶下载。
+    - 缺省（''/None/'self'）：默认桶已上传 → 从默认桶下载；
+      否则回退 source_url 抓取（kind=fetch + destination）。
     """
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
 
     with get_db() as conn:
         row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        uploaded_ids = set()
+        if row is not None:
+            uploaded_ids = {
+                u["bucket_id"] for u in conn.execute(
+                    "SELECT bucket_id FROM file_uploads WHERE file_id=?", (file_id,)
+                ).fetchall()
+            }
     if row is None:
         return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
     f = dict(row)
@@ -1742,21 +1972,38 @@ def api_file_download_server(file_id: int):
     object_key = f["object_key"]
     filename = f["filename"] or "download"
 
+    raw = (str(bucket_param) if bucket_param is not None else "").strip()
+    bucket_row = None
+    if raw and raw not in ("self", "cloud"):
+        try:
+            bucket_row = resolve_bucket_ref(raw)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if bucket_row["id"] not in uploaded_ids:
+            return jsonify({"error": f"该文件未上传到{bucket_row['name']}"}), 400
+    else:
+        d = default_bucket()
+        if d is not None and d["id"] in uploaded_ids:
+            bucket_row = d
+
     root = server_root()
     if root is None:
         return jsonify({"error": "未配置 SERVER_FILE_ROOT"}), 400
     root.mkdir(parents=True, exist_ok=True)
     destination = root / filename
 
-    if f.get("uploaded"):
+    if bucket_row is not None:
+        entry = get_bucket_entry(bucket_row)
         # bucket → server：校验对象存在并取真实大小
         try:
-            metadata = get_client().head_object(Bucket=os.environ["B2_1_BUCKET"], Key=object_key)
+            metadata = entry["client"].head_object(
+                Bucket=entry["bucket_name"], Key=object_key
+            )
             size = int(metadata["ContentLength"])
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code", ""))
             if code in ("404", "NoSuchKey", "NotFound"):
-                return jsonify({"error": f"bucket 中不存在对象: {object_key}"}), 404
+                return jsonify({"error": f"{bucket_row['name']}中不存在对象: {object_key}"}), 404
             return jsonify({"error": str(exc)}), 502
         except (BotoCoreError, OSError) as exc:
             return jsonify({"error": str(exc)}), 502
@@ -1767,6 +2014,7 @@ def api_file_download_server(file_id: int):
             object_key=object_key,
             size=size,
             destination=str(destination),
+            bucket_id=bucket_row["id"],
         )
     elif f.get("source_url"):
         # URL → server
@@ -1779,7 +2027,7 @@ def api_file_download_server(file_id: int):
             destination=str(destination),
         )
     else:
-        return jsonify({"error": "无可下载来源（既不在 bucket 也无来源链接）"}), 400
+        return jsonify({"error": "无可下载来源（既不在桶也无来源链接）"}), 400
 
     with get_db() as conn:
         conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
@@ -1793,244 +2041,27 @@ def api_file_download_server(file_id: int):
     })
 
 
-@app.post("/api/files/<int:file_id>/upload-beijing")
-def api_file_upload_beijing(file_id: int):
-    """把服务器本地文件上传到北京桶（与 upload-cloud 对称）。
+@app.post("/api/files/<int:file_id>/download-server")
+def api_file_download_server(file_id: int):
+    """下载文件到服务器。
 
-    要求 beijing_enabled()、files.local_path 存在且尚未 uploaded_beijing=1。
-    建 kind=upload_beijing job 入队，worker 上传到北京桶并写 uploaded_beijing=1。
+    请求体 JSON：{"bucket_id": <桶 id 或 legacy 别名，可选>}。
+    缺省时默认桶已上传则从默认桶下载，否则回退 source_url。
     """
-    if not apikey_ok():
-        return jsonify({"error": "未授权"}), 401
-    if not beijing_enabled():
-        return jsonify({"error": "北京桶未启用"}), 400
-
-    with get_db() as conn:
-        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-    if row is None:
-        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
-    f = dict(row)
-
-    if f.get("uploaded_beijing"):
-        return jsonify({"error": "该文件已上传到北京桶"}), 400
-    local_path = f.get("local_path")
-    if not local_path:
-        return jsonify({"error": "本地文件不存在，请先下载到服务器"}), 400
-
-    try:
-        source = resolve_local_path(local_path)
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    if not source.exists():
-        return jsonify({"error": f"本地文件不存在: {local_path}"}), 400
-
     body = request.get_json(silent=True) or {}
-    custom_key = (body.get("key") or "").strip().lstrip("/")
-    object_key = custom_key or f["object_key"]
-
-    filename = f["filename"] or "download"
-    job_id = insert_job(
-        kind="upload_beijing",
-        filename=filename,
-        object_key=object_key,
-        size=f.get("size") or 0,
-        source=str(source),
-    )
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE files SET job_id=?, object_key=?, updated_at=? WHERE id=?",
-            (job_id, object_key, time.time(), file_id),
-        )
-    JOB_QUEUE.put(job_id)
-    emit_job_update(job_id)
-    return jsonify({
-        "status": "ok",
-        "message": f"「{filename}」上传到北京桶的任务已加入队列。",
-        "job_id": job_id,
-        "file_id": file_id,
-    })
+    return _do_file_download_server(file_id, body.get("bucket_id"))
 
 
 @app.post("/api/files/<int:file_id>/download-server-beijing")
 def api_file_download_server_beijing(file_id: int):
-    """从北京桶下载文件到服务器（与 download-server 的 bucket→server 分支对称）。
-
-    要求 beijing_enabled()、uploaded_beijing=1、且尚未下载到服务器。
-    """
-    if not apikey_ok():
-        return jsonify({"error": "未授权"}), 401
-    if not beijing_enabled():
-        return jsonify({"error": "北京桶未启用"}), 400
-
-    with get_db() as conn:
-        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-    if row is None:
-        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
-    f = dict(row)
-
-    if f.get("local_path"):
-        return jsonify({"error": "该文件已在服务器上"}), 400
-    if not f.get("uploaded_beijing"):
-        return jsonify({"error": "该文件未上传到北京桶"}), 400
-
-    object_key = f["object_key"]
-    filename = f["filename"] or "download"
-
-    root = server_root()
-    if root is None:
-        return jsonify({"error": "未配置 SERVER_FILE_ROOT"}), 400
-    root.mkdir(parents=True, exist_ok=True)
-    destination = root / filename
-
-    client, bucket = resolve_bucket("beijing")
-    try:
-        metadata = client.head_object(Bucket=bucket, Key=object_key)
-        size = int(metadata["ContentLength"])
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        if code in ("404", "NoSuchKey", "NotFound"):
-            return jsonify({"error": f"北京桶中不存在对象: {object_key}"}), 404
-        return jsonify({"error": str(exc)}), 502
-    except (BotoCoreError, OSError) as exc:
-        return jsonify({"error": str(exc)}), 502
-
-    job_id = insert_job(
-        kind="download_beijing",
-        filename=filename,
-        object_key=object_key,
-        size=size,
-        destination=str(destination),
-    )
-    with get_db() as conn:
-        conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
-    JOB_QUEUE.put(job_id)
-    emit_job_update(job_id)
-    return jsonify({
-        "status": "ok",
-        "message": f"「{filename}」从北京桶下载到服务器 {destination} 的任务已加入队列。",
-        "job_id": job_id,
-        "file_id": file_id,
-    })
-
-
-@app.post("/api/files/<int:file_id>/upload-bucket2")
-def api_file_upload_bucket2(file_id: int):
-    """把服务器本地文件上传到自己桶2（与 upload-cloud 对称）。
-
-    要求 bucket2_enabled()、files.local_path 存在且尚未 uploaded_bucket2=1。
-    建 kind=upload_bucket2 job 入队，worker 上传到自己桶2并写 uploaded_bucket2=1。
-    """
-    if not apikey_ok():
-        return jsonify({"error": "未授权"}), 401
-    if not bucket2_enabled():
-        return jsonify({"error": "自己桶2未启用"}), 400
-
-    with get_db() as conn:
-        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-    if row is None:
-        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
-    f = dict(row)
-
-    if f.get("uploaded_bucket2"):
-        return jsonify({"error": "该文件已上传到自己桶2"}), 400
-    local_path = f.get("local_path")
-    if not local_path:
-        return jsonify({"error": "本地文件不存在，请先下载到服务器"}), 400
-
-    try:
-        source = resolve_local_path(local_path)
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    if not source.exists():
-        return jsonify({"error": f"本地文件不存在: {local_path}"}), 400
-
-    body = request.get_json(silent=True) or {}
-    custom_key = (body.get("key") or "").strip().lstrip("/")
-    object_key = custom_key or f["object_key"]
-
-    filename = f["filename"] or "download"
-    job_id = insert_job(
-        kind="upload_bucket2",
-        filename=filename,
-        object_key=object_key,
-        size=f.get("size") or 0,
-        source=str(source),
-    )
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE files SET job_id=?, object_key=?, updated_at=? WHERE id=?",
-            (job_id, object_key, time.time(), file_id),
-        )
-    JOB_QUEUE.put(job_id)
-    emit_job_update(job_id)
-    return jsonify({
-        "status": "ok",
-        "message": f"「{filename}」上传到自己桶2的任务已加入队列。",
-        "job_id": job_id,
-        "file_id": file_id,
-    })
+    """旧路由包装：从北京桶下载到服务器（legacy_key 别名）。"""
+    return _do_file_download_server(file_id, "beijing")
 
 
 @app.post("/api/files/<int:file_id>/download-server-bucket2")
 def api_file_download_server_bucket2(file_id: int):
-    """从自己桶2下载文件到服务器（与 download-server 的 bucket→server 分支对称）。
-
-    要求 bucket2_enabled()、uploaded_bucket2=1、且尚未下载到服务器。
-    """
-    if not apikey_ok():
-        return jsonify({"error": "未授权"}), 401
-    if not bucket2_enabled():
-        return jsonify({"error": "自己桶2未启用"}), 400
-
-    with get_db() as conn:
-        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-    if row is None:
-        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
-    f = dict(row)
-
-    if f.get("local_path"):
-        return jsonify({"error": "该文件已在服务器上"}), 400
-    if not f.get("uploaded_bucket2"):
-        return jsonify({"error": "该文件未上传到自己桶2"}), 400
-
-    object_key = f["object_key"]
-    filename = f["filename"] or "download"
-
-    root = server_root()
-    if root is None:
-        return jsonify({"error": "未配置 SERVER_FILE_ROOT"}), 400
-    root.mkdir(parents=True, exist_ok=True)
-    destination = root / filename
-
-    client, bucket = resolve_bucket("bucket2")
-    try:
-        metadata = client.head_object(Bucket=bucket, Key=object_key)
-        size = int(metadata["ContentLength"])
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        if code in ("404", "NoSuchKey", "NotFound"):
-            return jsonify({"error": f"自己桶2中不存在对象: {object_key}"}), 404
-        return jsonify({"error": str(exc)}), 502
-    except (BotoCoreError, OSError) as exc:
-        return jsonify({"error": str(exc)}), 502
-
-    job_id = insert_job(
-        kind="download_bucket2",
-        filename=filename,
-        object_key=object_key,
-        size=size,
-        destination=str(destination),
-    )
-    with get_db() as conn:
-        conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
-    JOB_QUEUE.put(job_id)
-    emit_job_update(job_id)
-    return jsonify({
-        "status": "ok",
-        "message": f"「{filename}」从自己桶2下载到服务器 {destination} 的任务已加入队列。",
-        "job_id": job_id,
-        "file_id": file_id,
-    })
+    """旧路由包装：从自己桶2下载到服务器（legacy_key 别名）。"""
+    return _do_file_download_server(file_id, "bucket2")
 
 
 @app.post("/api/files/<int:file_id>/check")
@@ -2038,11 +2069,11 @@ def api_file_check(file_id: int):
     """重新检测文件在指定位置是否存在，按结果更新记录。
 
     请求体 JSON：
-        {"target": "local" | "cloud" | "beijing"}
+        {"target": "local" | 桶 id | "cloud"(=默认桶) | "beijing" | "bucket2"}
 
     始终做真实检测（不因 DB 标记为空就跳过）：
     - local：local_path 为空时回退到 SERVER_FILE_ROOT/filename
-    - cloud/beijing：直接查桶，不因 uploaded=0 就返回 False
+    - 桶：直接查桶，不因已标记未上传就返回 False
 
     返回：
         {"target": "...", "exists": true/false, "file": {更新后的记录}}
@@ -2051,7 +2082,7 @@ def api_file_check(file_id: int):
         return jsonify({"error": "未授权"}), 401
 
     body = request.get_json(silent=True) or {}
-    target = (body.get("target") or "local").strip()
+    target = str(body.get("target") or "local").strip()
 
     with get_db() as conn:
         row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
@@ -2106,10 +2137,24 @@ def api_file_check(file_id: int):
         f = dict(row)
         return jsonify({"target": "local", "exists": exists, "file": f})
 
-    if target == "cloud":
+    # 桶分支统一：target 为桶 id 或 legacy 别名（'cloud'/'self'→默认桶）
+    if target in ("cloud", "self", "beijing", "bucket2") or target.isdigit():
         try:
-            resp = get_client().head_object(
-                Bucket=os.environ["B2_1_BUCKET"], Key=f["object_key"]
+            bucket_row = resolve_bucket_ref(target)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        entry = get_bucket_entry(bucket_row)
+        with get_db() as conn:
+            uploaded_ids = {
+                u["bucket_id"] for u in conn.execute(
+                    "SELECT bucket_id FROM file_uploads WHERE file_id=?", (file_id,)
+                ).fetchall()
+            }
+        was_uploaded = bucket_row["id"] in uploaded_ids
+        is_default = bool(bucket_row.get("is_default"))
+        try:
+            resp = entry["client"].head_object(
+                Bucket=entry["bucket_name"], Key=f["object_key"]
             )
             exists = True
             file_size = resp.get("ContentLength") or 0
@@ -2124,99 +2169,30 @@ def api_file_check(file_id: int):
             return jsonify({"error": str(exc)}), 502
         with get_db() as conn:
             if exists:
+                # 存在 → 补记上传标记 + 更新 size；默认桶新发现时置 synced
                 sets = ["size=?", "updated_at=?"]
                 params = [file_size, now]
-                if not f.get("uploaded"):
-                    sets.extend(["uploaded=1", "status='synced'", "synced_at=?"])
+                if is_default and not was_uploaded:
+                    sets.extend(["status='synced'", "synced_at=?"])
                     params.append(now)
                 params.append(file_id)
                 conn.execute(
                     f"UPDATE files SET {', '.join(sets)} WHERE id=?", params,
                 )
-            elif f.get("uploaded"):
-                conn.execute(
-                    "UPDATE files SET uploaded=0, status='pending', updated_at=? WHERE id=?",
-                    (now, file_id),
-                )
-            row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-        f = dict(row)
-        return jsonify({"target": "cloud", "exists": exists, "file": f})
-
-    if target == "beijing":
-        if not beijing_enabled():
-            return jsonify({"error": "北京桶未启用"}), 400
-        try:
-            resp = get_beijing_client().head_object(
-                Bucket=os.environ["BEIJING_BUCKET"], Key=f["object_key"]
-            )
-            exists = True
-            file_size = resp.get("ContentLength") or 0
-        except ClientError as exc:
-            code = str(exc.response.get("Error", {}).get("Code", ""))
-            if code in ("404", "NoSuchKey", "NotFound"):
-                exists = False
-                file_size = 0
+                apply_upload_flag(conn, file_id, bucket_row, True)
             else:
-                return jsonify({"error": str(exc)}), 502
-        except (BotoCoreError, OSError) as exc:
-            return jsonify({"error": str(exc)}), 502
-        with get_db() as conn:
-            if exists:
-                sets = ["size=?", "updated_at=?"]
-                params = [file_size, now]
-                if not f.get("uploaded_beijing"):
-                    sets.append("uploaded_beijing=1")
-                params.append(file_id)
-                conn.execute(
-                    f"UPDATE files SET {', '.join(sets)} WHERE id=?", params,
-                )
-            elif f.get("uploaded_beijing"):
-                conn.execute(
-                    "UPDATE files SET uploaded_beijing=0, updated_at=? WHERE id=?",
-                    (now, file_id),
-                )
+                # 不存在 → 清除该桶标记；默认桶从 synced 回 pending
+                apply_upload_flag(conn, file_id, bucket_row, False)
+                if is_default and was_uploaded:
+                    conn.execute(
+                        "UPDATE files SET status='pending', updated_at=? WHERE id=?",
+                        (now, file_id),
+                    )
             row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
         f = dict(row)
-        return jsonify({"target": "beijing", "exists": exists, "file": f})
+        return jsonify({"target": target, "exists": exists, "file": f})
 
-    if target == "bucket2":
-        if not bucket2_enabled():
-            return jsonify({"error": "自己桶2未启用"}), 400
-        try:
-            resp = get_bucket2_client().head_object(
-                Bucket=os.environ["B2_2_BUCKET"], Key=f["object_key"]
-            )
-            exists = True
-            file_size = resp.get("ContentLength") or 0
-        except ClientError as exc:
-            code = str(exc.response.get("Error", {}).get("Code", ""))
-            if code in ("404", "NoSuchKey", "NotFound"):
-                exists = False
-                file_size = 0
-            else:
-                return jsonify({"error": str(exc)}), 502
-        except (BotoCoreError, OSError) as exc:
-            return jsonify({"error": str(exc)}), 502
-        with get_db() as conn:
-            if exists:
-                sets = ["size=?", "updated_at=?"]
-                params = [file_size, now]
-                if not f.get("uploaded_bucket2"):
-                    sets.append("uploaded_bucket2=1")
-                params.append(file_id)
-                conn.execute(
-                    f"UPDATE files SET {', '.join(sets)} WHERE id=?", params,
-                )
-            elif f.get("uploaded_bucket2"):
-                conn.execute(
-                    "UPDATE files SET uploaded_bucket2=0, updated_at=? WHERE id=?",
-                    (now, file_id),
-                )
-            row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-        f = dict(row)
-        return jsonify({"target": "bucket2", "exists": exists, "file": f})
-
-    return jsonify({"error": f"无效的 target: {target}（可选 local / cloud / beijing / bucket2）"}), 400
+    return jsonify({"error": f"无效的 target: {target}（可选 local / 桶 id / cloud / beijing / bucket2）"}), 400
 
 
 @app.get("/download")
@@ -2229,16 +2205,10 @@ def download():
         return jsonify({"error": "缺少 key 参数"}), 400
 
     bucket_target = (request.args.get("bucket") or "self").strip()
-    if bucket_target == "bucket2":
-        if not bucket2_enabled():
-            return jsonify({"error": "自己桶2未启用"}), 400
-        client, bucket = resolve_bucket("bucket2")
-    elif bucket_target == "beijing":
-        if not beijing_enabled():
-            return jsonify({"error": "北京桶未启用"}), 400
-        client, bucket = resolve_bucket("beijing")
-    else:
-        client, bucket = resolve_bucket("self")
+    try:
+        client, bucket = resolve_bucket(bucket_target)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     try:
         obj = client.get_object(Bucket=bucket, Key=key)
@@ -2309,7 +2279,8 @@ def api_submit():
     请求体 JSON：
     {
         "urls": ["https://...", "https://..."],   // 必填，1~50 个链接
-        "prefix": "backups/2026"                  // 可选，对象 key 前缀
+        "prefix": "backups/2026",                 // 可选，对象 key 前缀
+        "bucket": <桶 id 或 legacy 别名>           // 可选，目标桶（默认桶）
     }
 
     返回（200 或 400）：
@@ -2350,6 +2321,13 @@ def api_submit():
     except argparse.ArgumentTypeError as exc:
         return jsonify({"error": f"prefix 无效: {exc}"}), 400
 
+    # 目标桶：bucket / bucket_id 字段接受桶 id / legacy 别名（缺省=默认桶）
+    try:
+        bucket_row = resolve_bucket_ref(body.get("bucket") or body.get("bucket_id"))
+        entry = get_bucket_entry(bucket_row)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
     submitted: list[dict] = []
     errors: list[dict] = []
 
@@ -2361,7 +2339,7 @@ def api_submit():
         filename = PurePosixPath(urlparse(url).path).name or "download"
         object_key = build_object_key(prefix, filename)
         # 同名拒传：冲突放进 errors，不中断其它链接
-        if object_exists(get_client(), os.environ["B2_1_BUCKET"], object_key):
+        if object_exists(entry["client"], entry["bucket_name"], object_key):
             errors.append({"url": url, "error": f"同名文件已存在：{object_key}"})
             continue
         job_id = insert_job(
@@ -2370,6 +2348,7 @@ def api_submit():
             object_key=object_key,
             size=0,
             source=url,
+            bucket_id=bucket_row["id"],
         )
         insert_file_pending(
             job_id=job_id,
@@ -2422,6 +2401,22 @@ def api_status(job_id: int):
         if job is None:
             return jsonify({"error": f"任务 {job_id} 不存在"}), 404
         file_row = conn.execute("SELECT * FROM files WHERE job_id=?", (job_id,)).fetchone()
+        uploaded_ids: set[int] = set()
+        if file_row is not None:
+            uploaded_ids = {
+                u["bucket_id"] for u in conn.execute(
+                    "SELECT bucket_id FROM file_uploads WHERE file_id=?", (file_row["id"],)
+                ).fetchall()
+            }
+        legacy_rows = conn.execute(
+            "SELECT id, legacy_key FROM buckets WHERE legacy_key IS NOT NULL"
+        ).fetchall()
+    legacy_map = {r["id"]: r["legacy_key"] for r in legacy_rows}
+    legacy_flags = {key: 0 for key in LEGACY_FLAG_COLUMNS}
+    for bucket_id in uploaded_ids:
+        legacy_key = legacy_map.get(bucket_id)
+        if legacy_key in legacy_flags:
+            legacy_flags[legacy_key] = 1
 
     result = {"job": job_payload(dict(job))}
     if file_row is not None:
@@ -2431,9 +2426,11 @@ def api_status(job_id: int):
             "status": f["status"],
             "md5": f["md5"],
             "size": f["size"],
-            "uploaded": f["uploaded"],
-            "uploaded_beijing": f.get("uploaded_beijing", 0),
-            "uploaded_bucket2": f.get("uploaded_bucket2", 0),
+            # 旧 3 布尔从 file_uploads 派生（机器人兼容）
+            "uploaded": legacy_flags["self"],
+            "uploaded_beijing": legacy_flags["beijing"],
+            "uploaded_bucket2": legacy_flags["bucket2"],
+            "uploaded_bucket_ids": sorted(uploaded_ids),
             "bucket": f["bucket"],
             "object_key": f["object_key"],
             "synced_at": f["synced_at"],
@@ -2554,48 +2551,74 @@ def api_auth():
     """
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
+    buckets = get_buckets()
+    default = next((b for b in buckets if b["is_default"]), None)
+    beijing = next((b for b in buckets if b.get("legacy_key") == "beijing"), None)
+    bucket2 = next((b for b in buckets if b.get("legacy_key") == "bucket2"), None)
     return jsonify({
         "app": "b2-file-manager",
-        "bucket": os.environ["B2_1_BUCKET"],
+        "bucket": default["bucket_name"] if default else "",
         "default_prefix": default_prefix(),
         "bucket_private": BUCKET_PRIVATE,
         "bucket_private_note": BUCKET_PRIVATE_NOTE,
-        "beijing_enabled": beijing_enabled(),
-        "beijing_bucket": os.environ.get("BEIJING_BUCKET", ""),
-        "bucket2_enabled": bucket2_enabled(),
-        "bucket2_bucket": os.environ.get("B2_2_BUCKET", ""),
+        # 旧字段保留（从 buckets 表派生，旧前端/机器人可用）
+        "beijing_enabled": bool(beijing and beijing["enabled"]),
+        "beijing_bucket": beijing["bucket_name"] if beijing else "",
+        "bucket2_enabled": bool(bucket2 and bucket2["enabled"]),
+        "bucket2_bucket": bucket2["bucket_name"] if bucket2 else "",
+        "buckets": [
+            {
+                "id": b["id"],
+                "name": b["name"],
+                "bucket_name": b["bucket_name"],
+                "legacy_key": b.get("legacy_key"),
+                "is_default": bool(b["is_default"]),
+            }
+            for b in buckets
+        ],
     })
+
+
+def _bucket_health_error(exc: Exception) -> dict:
+    return {
+        "ok": False,
+        "error": str(exc),
+        "latency_ms": None,
+        "status_code": None,
+        "endpoint": None,
+        "addressing_style": None,
+        "region": None,
+        "versioning": None,
+        "public": None,
+        "redundancy": None,
+        "storage_class": None,
+    }
 
 
 @app.get("/api/bucket-health")
 def api_bucket_health():
-    """检测自己桶 / 北京桶的连通性 + 元数据（head_bucket 等）。"""
+    """检测所有已启用桶的连通性 + 元数据（head_bucket 等）。"""
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
-    self_endpoint, _ = resolve_endpoint()
-    result = {
-        "self": check_bucket_health(
-            get_client(), os.environ["B2_1_BUCKET"], self_endpoint, "auto"
-        ),
-        "beijing": None,
-        "bucket2": None,
-    }
-    if beijing_enabled():
-        bj_endpoint, _ = resolve_beijing_endpoint()
-        result["beijing"] = check_bucket_health(
-            get_beijing_client(),
-            os.environ["BEIJING_BUCKET"],
-            bj_endpoint,
-            "virtual",
-        )
-    if bucket2_enabled():
-        b2_endpoint, _ = resolve_bucket2_endpoint()
-        result["bucket2"] = check_bucket_health(
-            get_bucket2_client(),
-            os.environ["B2_2_BUCKET"],
-            b2_endpoint,
-            "auto",
-        )
+    result = {"buckets": []}
+    for b in get_buckets():
+        try:
+            entry = get_bucket_entry(b)
+            endpoint_url, _ = _resolve_bucket_endpoint(b.get("endpoint"), b.get("region"))
+            health = check_bucket_health(
+                entry["client"], b["bucket_name"], endpoint_url,
+                b.get("addressing_style") or "auto",
+            )
+        except ValueError as exc:
+            health = _bucket_health_error(exc)
+        result["buckets"].append({
+            "id": b["id"],
+            "name": b["name"],
+            "bucket_name": b["bucket_name"],
+            "legacy_key": b.get("legacy_key"),
+            "is_default": bool(b["is_default"]),
+            "health": health,
+        })
     return jsonify(result)
 
 
@@ -2647,9 +2670,25 @@ def api_files():
             f"SELECT * FROM files {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
             [*params, page_size, offset],
         ).fetchall()
+        # 按页内 file id 批查上传关联 → uploaded_bucket_ids
+        uploads_map: dict[int, list[int]] = {}
+        file_ids = [r["id"] for r in rows]
+        if file_ids:
+            placeholders = ", ".join("?" for _ in file_ids)
+            for u in conn.execute(
+                f"SELECT file_id, bucket_id FROM file_uploads WHERE file_id IN ({placeholders})",
+                file_ids,
+            ).fetchall():
+                uploads_map.setdefault(u["file_id"], []).append(u["bucket_id"])
+
+    items = []
+    for r in rows:
+        d = dict(r)
+        d["uploaded_bucket_ids"] = uploads_map.get(d["id"], [])
+        items.append(d)
 
     return jsonify({
-        "items": [dict(r) for r in rows],
+        "items": items,
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -2664,12 +2703,208 @@ def api_scripts():
     return jsonify(recent_scripts())
 
 
+def _bucket_public_row(b: dict) -> dict:
+    """桶行的对外表示：永不返回 application_key 明文。"""
+    return {
+        "id": b["id"],
+        "name": b["name"],
+        "bucket_name": b["bucket_name"],
+        "application_key_id": b["application_key_id"],
+        "has_application_key": True,
+        "endpoint": b.get("endpoint"),
+        "region": b.get("region"),
+        "addressing_style": b.get("addressing_style") or "auto",
+        "legacy_key": b.get("legacy_key"),
+        "is_default": bool(b["is_default"]),
+        "enabled": bool(b["enabled"]),
+        "sort_order": b["sort_order"],
+        "created_at": b["created_at"],
+        "updated_at": b["updated_at"],
+    }
+
+
+@app.get("/api/buckets")
+def api_buckets():
+    """桶列表（含禁用桶；不返回 application_key）。"""
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    return jsonify([_bucket_public_row(b) for b in get_buckets(enabled_only=False)])
+
+
+@app.post("/api/buckets")
+def api_create_bucket():
+    """新增桶。
+
+    请求体 JSON：name, bucket_name, application_key_id, application_key（必填）；
+    endpoint / region / addressing_style(auto|virtual|path) / sort_order / is_default（可选）。
+    首个桶强制为默认桶；设默认则同事务清掉其它桶的 is_default。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    bucket_name = (body.get("bucket_name") or "").strip()
+    key_id = (body.get("application_key_id") or "").strip()
+    key = (body.get("application_key") or "").strip()
+    if not name:
+        return jsonify({"error": "名称必填"}), 400
+    if not bucket_name:
+        return jsonify({"error": "桶名（bucket_name）必填"}), 400
+    if not key_id or not key:
+        return jsonify({"error": "application_key_id 与 application_key 必填"}), 400
+    addressing = (body.get("addressing_style") or "auto").strip()
+    if addressing not in ("auto", "virtual", "path"):
+        return jsonify({"error": "addressing_style 仅支持 auto/virtual/path"}), 400
+    try:
+        sort_order = int(body.get("sort_order") or 0)
+    except (TypeError, ValueError):
+        sort_order = 0
+
+    now = time.time()
+    with get_db() as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM buckets").fetchone()["c"]
+        is_default = 1 if (count == 0 or body.get("is_default")) else 0
+        if is_default:
+            conn.execute("UPDATE buckets SET is_default=0 WHERE is_default=1")
+        cursor = conn.execute(
+            "INSERT INTO buckets (name, bucket_name, application_key_id, application_key, "
+            "endpoint, region, addressing_style, is_default, enabled, sort_order, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            (
+                name,
+                bucket_name,
+                key_id,
+                key,
+                (body.get("endpoint") or "").strip() or None,
+                (body.get("region") or "").strip() or None,
+                addressing,
+                is_default,
+                sort_order,
+                now,
+                now,
+            ),
+        )
+        bucket_id = cursor.lastrowid
+    return jsonify({
+        "status": "ok",
+        "message": f"桶「{name}」已添加。",
+        "bucket_id": bucket_id,
+    }), 201
+
+
+@app.patch("/api/buckets/<int:bucket_id>")
+def api_update_bucket(bucket_id: int):
+    """编辑桶（子集更新）。application_key 为空/缺省 = 保留旧值。
+
+    凭证 / endpoint / 桶名 / addressing 变更后失效缓存的客户端。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    body = request.get_json(silent=True) or {}
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM buckets WHERE id=?", (bucket_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": f"桶 {bucket_id} 不存在"}), 404
+        current = dict(row)
+
+        sets: list[str] = []
+        values: list = []
+        for field in ("name", "bucket_name", "application_key_id", "application_key"):
+            val = (body.get(field) or "").strip()
+            if val:  # 空 = 保留旧值
+                sets.append(f"{field}=?")
+                values.append(val)
+        for field in ("endpoint", "region"):
+            if field in body:
+                val = (body.get(field) or "").strip()
+                sets.append(f"{field}=?")
+                values.append(val or None)
+        if "addressing_style" in body:
+            addressing = (body.get("addressing_style") or "auto").strip()
+            if addressing not in ("auto", "virtual", "path"):
+                return jsonify({"error": "addressing_style 仅支持 auto/virtual/path"}), 400
+            sets.append("addressing_style=?")
+            values.append(addressing)
+        if "sort_order" in body:
+            try:
+                sets.append("sort_order=?")
+                values.append(int(body.get("sort_order") or 0))
+            except (TypeError, ValueError):
+                return jsonify({"error": "sort_order 必须是整数"}), 400
+        if "enabled" in body:
+            sets.append("enabled=?")
+            values.append(1 if body.get("enabled") else 0)
+        if "is_default" in body:
+            if body.get("is_default"):
+                sets.append("is_default=1")
+                conn.execute("UPDATE buckets SET is_default=0 WHERE is_default=1 AND id<>?", (bucket_id,))
+            elif current["is_default"]:
+                return jsonify({"error": "必须保留一个默认桶"}), 400
+        if not sets:
+            return jsonify({"error": "没有可更新的字段"}), 400
+        sets.append("updated_at=?")
+        values.append(time.time())
+        values.append(bucket_id)
+        conn.execute(f"UPDATE buckets SET {', '.join(sets)} WHERE id=?", values)
+
+    invalidate_bucket_client(bucket_id)
+    return jsonify({"status": "ok", "message": "桶配置已更新。", "bucket_id": bucket_id})
+
+
+@app.delete("/api/buckets/<int:bucket_id>")
+def api_delete_bucket(bucket_id: int):
+    """删除桶（默认桶拒绝删除）。
+
+    先 fail 该桶 queued/uploading 任务（error='桶已删除'），
+    再清 file_uploads 关联、jobs.bucket_id 置空、删行、失效缓存客户端。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM buckets WHERE id=?", (bucket_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": f"桶 {bucket_id} 不存在"}), 404
+        if row["is_default"]:
+            return jsonify({"error": "不能删除默认桶，请先把其它桶设为默认"}), 400
+        now = time.time()
+        conn.execute(
+            "UPDATE jobs SET status='failed', error='桶已删除', finished_at=? "
+            "WHERE bucket_id=? AND status IN ('queued','uploading')",
+            (now, bucket_id),
+        )
+        conn.execute("DELETE FROM file_uploads WHERE bucket_id=?", (bucket_id,))
+        conn.execute("UPDATE jobs SET bucket_id=NULL WHERE bucket_id=?", (bucket_id,))
+        conn.execute("DELETE FROM buckets WHERE id=?", (bucket_id,))
+    invalidate_bucket_client(bucket_id)
+    return jsonify({"status": "ok", "message": f"桶「{row['name']}」已删除。", "bucket_id": bucket_id})
+
+
+@app.post("/api/buckets/<int:bucket_id>/test")
+def api_test_bucket(bucket_id: int):
+    """连通性测试：用临时 client 跑 check_bucket_health（不写入注册表）。"""
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM buckets WHERE id=?", (bucket_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"桶 {bucket_id} 不存在"}), 404
+    b = dict(row)
+    try:
+        client = _build_client(b)
+        endpoint_url, _ = _resolve_bucket_endpoint(b.get("endpoint"), b.get("region"))
+    except ValueError as exc:
+        return jsonify(_bucket_health_error(exc))
+    return jsonify(
+        check_bucket_health(client, b["bucket_name"], endpoint_url, b.get("addressing_style") or "auto")
+    )
+
+
 @app.delete("/api/objects")
 def api_delete_object():
     """删除 bucket 中的一个对象。
 
     请求体 JSON：
-        {"key": "path/to/object.zip", "bucket": "self|bucket2|beijing"}
+        {"key": "path/to/object.zip", "bucket": <桶 id 或 self|bucket2|beijing 别名>}
 
     返回：
         {"deleted": true, "key": "path/to/object.zip"}
@@ -2683,16 +2918,14 @@ def api_delete_object():
         return jsonify({"error": "缺少 key 参数"}), 400
 
     bucket_target = (body.get("bucket") or "self").strip()
-    if bucket_target not in ("self", "bucket2", "beijing"):
-        return jsonify({"error": f"无效的 bucket: {bucket_target}"}), 400
-    if bucket_target == "bucket2" and not bucket2_enabled():
-        return jsonify({"error": "自己桶2未启用"}), 400
-    if bucket_target == "beijing" and not beijing_enabled():
-        return jsonify({"error": "北京桶未启用"}), 400
+    try:
+        bucket_row = resolve_bucket_ref(bucket_target)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     try:
-        client, bucket_name = resolve_bucket(bucket_target)
-        client.delete_object(Bucket=bucket_name, Key=key)
+        entry = get_bucket_entry(bucket_row)
+        entry["client"].delete_object(Bucket=entry["bucket_name"], Key=key)
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code in ("404", "NoSuchKey", "NotFound"):
@@ -2701,17 +2934,15 @@ def api_delete_object():
     except (BotoCoreError, OSError) as exc:
         return jsonify({"error": str(exc)}), 502
 
-    # 同步更新本地 files 表（对应桶的上传标记清零；自己桶1 另标记 status=deleted）
-    col = {"bucket2": "uploaded_bucket2", "beijing": "uploaded_beijing"}.get(bucket_target, "uploaded")
+    # 同步更新本地 files 表：清该桶上传标记；默认桶另标记 status=deleted
+    is_default = bool(bucket_row.get("is_default"))
     with get_db() as conn:
-        if bucket_target == "self":
+        rows = conn.execute("SELECT id FROM files WHERE object_key=?", (key,)).fetchall()
+        for r in rows:
+            apply_upload_flag(conn, r["id"], bucket_row, False)
+        if is_default and rows:
             conn.execute(
-                "UPDATE files SET status='deleted', uploaded=0, updated_at=? WHERE object_key=?",
-                (time.time(), key),
-            )
-        else:
-            conn.execute(
-                f"UPDATE files SET {col}=0, updated_at=? WHERE object_key=?",
+                "UPDATE files SET status='deleted', updated_at=? WHERE object_key=?",
                 (time.time(), key),
             )
 
@@ -2793,7 +3024,8 @@ def api_update_file(file_id: int):
         filename, object_key, bucket   字符串（object_key/bucket 空串也写入）
         md5, source_url, local_path, error  可空字符串（null/空→NULL）
         size                           整数
-        uploaded, uploaded_beijing     true/false → 1/0
+        uploaded_bucket_ids            number[]（替换语义：勾选的桶集合）
+        uploaded, uploaded_beijing, uploaded_bucket2  旧布尔（机器人兼容，映射 file_uploads）
         status                         pending|synced|failed|deleted|cancelled
         datasource_id                  整数或 null
 
@@ -2806,6 +3038,32 @@ def api_update_file(file_id: int):
     body = request.get_json(silent=True) or {}
     fields: list[str] = []
     params: list = []
+
+    # uploaded_bucket_ids: number[]（替换语义，统一走 apply_upload_flag）
+    target_ids: set[int] | None = None
+    if "uploaded_bucket_ids" in body:
+        ids = body.get("uploaded_bucket_ids") or []
+        if not isinstance(ids, list):
+            return jsonify({"error": "uploaded_bucket_ids 必须是数组"}), 400
+        target_ids = set()
+        for bid in ids:
+            try:
+                target_ids.add(resolve_bucket_ref(bid)["id"])
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
+
+    # 旧 3 布尔仍接受（映射到对应桶的 file_uploads）
+    legacy_updates: list[tuple[dict, bool]] = []
+    for key, legacy_key in (
+        ("uploaded", "self"),
+        ("uploaded_beijing", "beijing"),
+        ("uploaded_bucket2", "bucket2"),
+    ):
+        if key in body:
+            try:
+                legacy_updates.append((resolve_bucket_ref(legacy_key), bool(body[key])))
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 400
 
     # 可空字符串字段：null/空字符串 → NULL
     for key in ("filename", "md5", "source_url", "local_path", "error"):
@@ -2828,12 +3086,6 @@ def api_update_file(file_id: int):
         fields.append("size = ?")
         params.append(int(body["size"] or 0))
 
-    # 布尔→0/1 字段
-    for key in ("uploaded", "uploaded_beijing", "uploaded_bucket2"):
-        if key in body:
-            fields.append(f"{key} = ?")
-            params.append(1 if body[key] else 0)
-
     # status 枚举校验
     if "status" in body:
         status_val = str(body["status"])
@@ -2850,7 +3102,7 @@ def api_update_file(file_id: int):
         else:
             fields.append("datasource_id = NULL")
 
-    if not fields:
+    if not fields and target_ids is None and not legacy_updates:
         return jsonify({"error": "没有可更新的字段"}), 400
 
     fields.append("updated_at = ?")
@@ -2864,7 +3116,21 @@ def api_update_file(file_id: int):
         conn.execute(
             f"UPDATE files SET {', '.join(fields)} WHERE id = ?", params
         )
-        conn.commit()
+        if target_ids is not None:
+            bucket_map = {b["id"]: b for b in get_buckets(enabled_only=False)}
+            existing = {
+                u["bucket_id"] for u in conn.execute(
+                    "SELECT bucket_id FROM file_uploads WHERE file_id=?", (file_id,)
+                ).fetchall()
+            }
+            for bid in target_ids:
+                if bid in bucket_map:
+                    apply_upload_flag(conn, file_id, bucket_map[bid], True)
+            for bid in existing - target_ids:
+                if bid in bucket_map:
+                    apply_upload_flag(conn, file_id, bucket_map[bid], False)
+        for bucket_row, value in legacy_updates:
+            apply_upload_flag(conn, file_id, bucket_row, value)
         row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
 
     return jsonify({"status": "ok", "file_id": file_id, "file": dict(row)})
@@ -2975,11 +3241,20 @@ def init_runtime() -> None:
     """
     init_db()
     recover_jobs()
-    cleanup_stale_multipart()
-    if beijing_enabled():
-        cleanup_stale_multipart(client=get_beijing_client(), bucket_name=os.environ["BEIJING_BUCKET"])
-    if bucket2_enabled():
-        cleanup_stale_multipart(client=get_bucket2_client(), bucket_name=os.environ["B2_2_BUCKET"])
+    # 清理每个已启用桶的残留分片（单桶失败可忽略）
+    for row in get_buckets():
+        try:
+            entry = get_bucket_entry(row)
+            cleanup_stale_multipart(
+                client=entry["client"], bucket_name=row["bucket_name"]
+            )
+        except (BotoCoreError, ClientError, ValueError) as exc:
+            print(f"清理桶「{row['name']}」的残留分片失败（可忽略）: {exc}")
+    if default_bucket() is None:
+        print(
+            "⚠️ 未配置任何桶，请通过 POST /api/buckets（或页面「桶管理」）添加",
+            file=sys.stderr,
+        )
     for i in range(max(1, MAX_WORKERS)):
         threading.Thread(target=worker_loop, name=f"worker-{i}", daemon=True).start()
 

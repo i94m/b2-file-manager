@@ -1,5 +1,5 @@
 import * as React from "react"
-import { Download, FileIcon, FolderOpen, RefreshCw, Trash2 } from "lucide-react"
+import { Download, FileIcon, FolderOpen, Loader2, MoreVertical, RefreshCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { type Datasource, type ServerFile } from "@/lib/types"
@@ -8,6 +8,12 @@ import { useConfirm } from "@/lib/use-confirm"
 import { formatBytes } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { UploadDialog, DownloadDialog } from "@/components/action-dialogs"
 import {
   Table,
@@ -112,7 +118,7 @@ export function ServerFilesSection({
             <TableRow>
               <TableHead>文件</TableHead>
               <TableHead className="text-right">大小</TableHead>
-              <TableHead className="text-right">操作</TableHead>
+              <TableHead className="w-12 text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -141,22 +147,37 @@ export function ServerFilesSection({
                     {formatBytes(f.size)}
                   </TableCell>
                   <TableCell>
-                    <div className="flex items-center justify-end gap-1">
-                      <Button asChild variant="ghost" size="sm" title="下载到电脑">
-                        <a href={serverFileDownloadUrl(f.path)}>
-                          <Download className="size-3.5" /> 下载
-                        </a>
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleDelete(f)}
-                        disabled={busyPath === f.path}
-                        className="text-destructive hover:text-destructive"
-                        title="删除"
-                      >
-                        <Trash2 className="size-3.5" /> 删除
-                      </Button>
+                    <div className="flex justify-end">
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            title="更多操作"
+                            className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                          >
+                            <MoreVertical className="size-3.5" />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem asChild>
+                            <a href={serverFileDownloadUrl(f.path)}>
+                              <Download className="size-3.5" /> 下载到电脑
+                            </a>
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            variant="destructive"
+                            onClick={() => handleDelete(f)}
+                            disabled={busyPath === f.path}
+                          >
+                            {busyPath === f.path ? (
+                              <Loader2 className="size-3.5 animate-spin" />
+                            ) : (
+                              <Trash2 className="size-3.5" />
+                            )}
+                            删除
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </div>
                   </TableCell>
                 </TableRow>

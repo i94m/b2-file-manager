@@ -6,23 +6,20 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Loader2, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
+import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Loader2, MoreVertical, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 
-import { type Datasource, type FileItem } from "@/lib/types"
+import { type BucketInfo, type Datasource, type FileItem } from "@/lib/types"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
 import {
   cancelJob,
   checkFileExists,
   deleteFile,
-  downloadServer,
-  downloadUrl,
+  downloadServerFromBucket,
   pauseJob,
   resumeJob,
   updateFile,
-  uploadToBeijing,
-  uploadToBucket2,
-  uploadToCloud,
+  uploadFileToBucket,
 } from "@/lib/api"
 import { useJobs } from "@/lib/use-jobs"
 import { useConfirm } from "@/lib/use-confirm"
@@ -38,8 +35,13 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-  AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Dialog,
   DialogContent,
@@ -68,33 +70,28 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 
 /** 骨架行各列的宽度类（按 columns 顺序对齐，模拟真实数据宽度）。 */
-function skeletonWidths(beijingEnabled: boolean, bucket2Enabled: boolean): string[] {
+function skeletonWidths(bucketCount: number): string[] {
   const widths = [
     "w-4",    // select
     "w-16",   // 数据源
     "w-28",   // 文件名称
     "w-20",   // 大小（居中）
     "w-16",   // 本地
-    "w-16",   // 自己桶1
   ]
-  if (bucket2Enabled) widths.push("w-16") // 自己桶2
-  if (beijingEnabled) widths.push("w-16") // 北京桶
-  widths.push("w-8", "w-24") // 操作、创建时间
+  for (let i = 0; i < bucketCount; i++) widths.push("w-16") // 各桶列
+  widths.push("w-24", "w-8") // 创建时间、操作
   return widths
 }
 
 interface FilesDataTableProps {
   data: FileItem[]
   scripts: Datasource[]
+  /** 全部桶（含禁用；顺序：默认优先 → sort_order → id），列按此动态生成。 */
+  buckets: BucketInfo[]
   total: number
   page: number
   pageSize: number
   loading: boolean
-  beijingEnabled: boolean
-  bucket2Enabled: boolean
-  selfBucketName: string
-  bucket2Name: string
-  beijingBucketName: string
   onPageChange: (page: number) => void
   onDeleted: () => void
   onFileUpdated?: (file: FileItem) => void
@@ -142,33 +139,43 @@ function StatusText({
   return <span className={cn("text-xs font-medium", color)}>{children}</span>
 }
 
-/** 单元格内的小图标按钮（可做 <a> 或 <button>）。 */
-function IconBtn({
-  icon: Icon,
-  title,
-  onClick,
-  busy,
-  href,
+/** 单元格内「更多操作」⋮ 菜单（一格有多个操作时收敛于此）。 */
+function CellMenu({
+  items,
 }: {
-  icon: React.ComponentType<{ className?: string }>
-  title: string
-  onClick?: () => void
-  busy?: boolean
-  href?: string
+  items: Array<{
+    icon: React.ComponentType<{ className?: string }>
+    label: string
+    onClick: () => void
+    busy?: boolean
+    destructive?: boolean
+  }>
 }) {
-  const className =
-    "inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
-  if (href) {
-    return (
-      <a href={href} className={className} title={title}>
-        <Icon className="size-3" />
-      </a>
-    )
-  }
   return (
-    <button type="button" onClick={onClick} disabled={busy} className={className} title={title}>
-      {busy ? <Loader2 className="size-3 animate-spin" /> : <Icon className="size-3" />}
-    </button>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          title="更多操作"
+          className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        >
+          <MoreVertical className="size-3.5" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start">
+        {items.map((it) => (
+          <DropdownMenuItem
+            key={it.label}
+            onClick={it.onClick}
+            disabled={it.busy}
+            variant={it.destructive ? "destructive" : "default"}
+          >
+            {it.busy ? <Loader2 className="size-3.5 animate-spin" /> : <it.icon className="size-3.5" />}
+            {it.label}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
@@ -241,42 +248,42 @@ function CancelJobBtn({ file }: { file: FileItem }) {
 
   return (
     <>
-      <button
-        type="button"
-        onClick={handlePauseResume}
-        disabled={busy}
-        className={btnClass}
-        title={job.paused ? "继续" : "暂停"}
-      >
-        {busy ? <Loader2 className="size-3 animate-spin" /> :
-          job.paused ? <Play className="size-3" /> : <Pause className="size-3" />}
-      </button>
-      <button
-        type="button"
-        onClick={handleCancel}
-        disabled={busy}
-        className={cn(btnClass, "hover:text-destructive")}
-        title="取消任务"
-      >
-        <X className="size-3" />
-      </button>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button type="button" className={btnClass} title="任务操作">
+            <MoreVertical className="size-3.5" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start">
+          <DropdownMenuItem onClick={handlePauseResume} disabled={busy}>
+            {busy ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : job.paused ? (
+              <Play className="size-3.5" />
+            ) : (
+              <Pause className="size-3.5" />
+            )}
+            {job.paused ? "继续" : "暂停"}
+          </DropdownMenuItem>
+          <DropdownMenuItem variant="destructive" onClick={handleCancel} disabled={busy}>
+            <X className="size-3.5" />
+            取消任务
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
       {confirmDialog}
     </>
   )
 }
 
-/** 重新检测文件是否存在的图标按钮（本地 / 自己桶 / 北京桶通用）。 */
-function CheckExistBtn({
-  fileId,
-  target,
-  onFileUpdated,
-}: {
-  fileId: number
-  target: "local" | "cloud" | "beijing" | "bucket2"
-  onFileUpdated?: (file: FileItem) => void
-}) {
+/** 重新检测存在性的逻辑（独立按钮与「更多操作」菜单项共用）。 */
+function useCheckExist(
+  fileId: number,
+  target: "local" | number,
+  onFileUpdated?: (file: FileItem) => void,
+) {
   const [busy, setBusy] = React.useState(false)
-  const handleCheck = async () => {
+  const run = async () => {
     setBusy(true)
     try {
       const r = await checkFileExists(fileId, target)
@@ -294,10 +301,24 @@ function CheckExistBtn({
       setBusy(false)
     }
   }
+  return { busy, run }
+}
+
+/** 重新检测文件是否存在的图标按钮（本地 / 任意桶通用，单按钮场景用）。 */
+function CheckExistBtn({
+  fileId,
+  target,
+  onFileUpdated,
+}: {
+  fileId: number
+  target: "local" | number
+  onFileUpdated?: (file: FileItem) => void
+}) {
+  const { busy, run } = useCheckExist(fileId, target, onFileUpdated)
   return (
     <button
       type="button"
-      onClick={handleCheck}
+      onClick={run}
       disabled={busy}
       className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
       title="重新检测"
@@ -338,13 +359,13 @@ function validateFilename(value: string): string | null {
 /** 上传到桶 Dialog：输入目录 + 文件名，下方有最近目录历史快捷填充。 */
 function UploadKeyDialog({
   file,
-  bucket,
+  bucketId,
   bucketLabel,
   onClose,
   onDone,
 }: {
   file: FileItem
-  bucket: "self" | "beijing" | "bucket2"
+  bucketId: number
   bucketLabel: string
   onClose: () => void
   onDone: () => void
@@ -365,8 +386,7 @@ function UploadKeyDialog({
     const key = cleanDir ? `${cleanDir}/${cleanName}` : cleanName
     setBusy(true)
     try {
-      const fn = bucket === "beijing" ? uploadToBeijing : bucket === "bucket2" ? uploadToBucket2 : uploadToCloud
-      const r = await fn(file.id, key)
+      const r = await uploadFileToBucket(file.id, bucketId, key)
       toast.success(r.message)
       if (cleanDir) pushDirHistory(cleanDir)
       onDone()
@@ -447,43 +467,11 @@ function UploadKeyDialog({
   )
 }
 
-/** 单元格内的紧凑操作按钮（图标+文字），失败时 hover 展示错误。 */
-function CellButton({
-  icon: Icon,
-  label,
-  title,
-  onClick,
-  busy,
-  error,
-}: {
-  icon: React.ComponentType<{ className?: string }>
-  label: string
-  title: string
-  onClick: () => void
-  busy?: boolean
-  error?: string | null
-}) {
-  const btn = (
-    <Button variant="ghost" size="sm" onClick={onClick} disabled={busy} title={title} className="h-6 gap-1 px-1.5 text-xs text-muted-foreground">
-      {busy ? <Loader2 className="size-3 animate-spin" /> : <Icon className="size-3" />}
-      {label}
-    </Button>
-  )
-  if (error) {
-    return (
-      <Tooltip>
-        <TooltipTrigger asChild>{btn}</TooltipTrigger>
-        <TooltipContent className="max-w-xs break-all">{error}</TooltipContent>
-      </Tooltip>
-    )
-  }
-  return btn
-}
-
-/** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿字 / 否则→下载按钮。 */
+/** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿字 / 否则→未下载+菜单。 */
 function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [busy, setBusy] = React.useState(false)
+  const check = useCheckExist(file.id, "local", onFileUpdated)
   const job = file.job_id ? jobs[file.job_id] : undefined
   const isMyJob = job && (job.kind === "fetch" || job.kind === "download")
 
@@ -505,7 +493,7 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
   const handleDownload = async () => {
     setBusy(true)
     try {
-      const r = await downloadServer(file.id)
+      const r = await downloadServerFromBucket(file.id)
       toast.success(r.message)
       onUpdated()
     } catch (e) {
@@ -518,18 +506,26 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
   const failed = file.status === "failed"
   return (
     <div className="flex items-center gap-0.5">
-      <CellButton icon={HardDriveDownload} label="下载" title="下载到服务器" onClick={handleDownload} busy={busy} error={failed ? file.error : undefined} />
-      <CheckExistBtn fileId={file.id} target="local" onFileUpdated={onFileUpdated} />
+      <StatusText error={failed ? file.error : undefined}>未下载</StatusText>
+      <CellMenu
+        items={[
+          { icon: HardDriveDownload, label: "下载到服务器", onClick: handleDownload, busy },
+          { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
+        ]}
+      />
     </div>
   )
 }
 
-/** 自己桶列：排队→黄字 / 上传中→进度 / 已存在→绿字+下载 / 有本地→上传按钮。 */
-function CloudCell({ file, bucketLabel, onUpdated, onFileUpdated }: { file: FileItem; bucketLabel: string; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
+/** 桶列（通用）：排队→黄字 / 上传中→进度 / 已存在→绿字+菜单 / 有本地→未上传+菜单。 */
+function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem; bucket: BucketInfo; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [dialogOpen, setDialogOpen] = React.useState(false)
+  const [downloading, setDownloading] = React.useState(false)
+  const check = useCheckExist(file.id, bucket.id, onFileUpdated)
   const job = file.job_id ? jobs[file.job_id] : undefined
-  const isMyJob = job && job.kind === "upload"
+  const uploaded = file.uploaded_bucket_ids.includes(bucket.id)
+  const isMyJob = job && job.kind === "upload" && job.bucket_id === bucket.id
 
   if (isMyJob && job!.status === "queued") return <QueuedLabel file={file} />
   if (isMyJob && job!.status === "uploading") return (
@@ -539,14 +535,31 @@ function CloudCell({ file, bucketLabel, onUpdated, onFileUpdated }: { file: File
     </div>
   )
 
-  const failed = file.status === "failed" && !!file.local_path && !file.uploaded
+  const failed = file.status === "failed" && !!file.local_path && !uploaded
 
-  if (file.uploaded === 1) {
+  const handleDownload = async () => {
+    setDownloading(true)
+    try {
+      const r = await downloadServerFromBucket(file.id, bucket.id)
+      toast.success(r.message)
+      onUpdated()
+    } catch (e) {
+      toast.error("下载失败", { description: (e as Error).message })
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  if (uploaded) {
     return (
       <div className="flex items-center gap-0.5">
         <StatusText tone="active">已存在</StatusText>
-        <CheckExistBtn fileId={file.id} target="cloud" onFileUpdated={onFileUpdated} />
-        <IconBtn icon={Download} title={`下载(${bucketLabel})`} href={downloadUrl(file.object_key)} />
+        <CellMenu
+          items={[
+            { icon: Download, label: "下载到服务器", onClick: handleDownload, busy: downloading },
+            { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
+          ]}
+        />
       </div>
     )
   }
@@ -555,20 +568,19 @@ function CloudCell({ file, bucketLabel, onUpdated, onFileUpdated }: { file: File
     return (
       <>
         <div className="flex items-center gap-0.5">
-          <CellButton
-            icon={CloudUpload}
-            label="上传"
-            title={`上传到${bucketLabel}`}
-            onClick={() => setDialogOpen(true)}
-            error={failed ? file.error : undefined}
+          <StatusText error={failed ? file.error : undefined}>未上传</StatusText>
+          <CellMenu
+            items={[
+              { icon: CloudUpload, label: "上传", onClick: () => setDialogOpen(true) },
+              { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
+            ]}
           />
-          <CheckExistBtn fileId={file.id} target="cloud" onFileUpdated={onFileUpdated} />
         </div>
         {dialogOpen && (
           <UploadKeyDialog
             file={file}
-            bucket="self"
-            bucketLabel={bucketLabel}
+            bucketId={bucket.id}
+            bucketLabel={bucket.name}
             onClose={() => setDialogOpen(false)}
             onDone={() => {
               setDialogOpen(false)
@@ -583,135 +595,7 @@ function CloudCell({ file, bucketLabel, onUpdated, onFileUpdated }: { file: File
   return (
     <div className="flex items-center gap-0.5">
       <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
-      <CheckExistBtn fileId={file.id} target="cloud" onFileUpdated={onFileUpdated} />
-    </div>
-  )
-}
-
-/** 北京桶列：与 CloudCell 对称，读 uploaded_beijing，检测 upload_beijing 任务。 */
-function BeijingCell({ file, bucketLabel, onUpdated, onFileUpdated }: { file: FileItem; bucketLabel: string; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
-  const { jobs } = useJobs()
-  const [dialogOpen, setDialogOpen] = React.useState(false)
-  const job = file.job_id ? jobs[file.job_id] : undefined
-  const isMyJob = job && job.kind === "upload_beijing"
-
-  if (isMyJob && job!.status === "queued") return <QueuedLabel file={file} />
-  if (isMyJob && job!.status === "uploading") return (
-    <div className="flex items-center gap-0.5">
-      <JobProgressBadge file={file} />
-      <CancelJobBtn file={file} />
-    </div>
-  )
-
-  const failed = file.status === "failed" && !!file.local_path && !file.uploaded_beijing
-
-  if (file.uploaded_beijing === 1) {
-    return (
-      <div className="flex items-center gap-0.5">
-        <StatusText tone="active">已存在</StatusText>
-        <CheckExistBtn fileId={file.id} target="beijing" onFileUpdated={onFileUpdated} />
-        <IconBtn icon={Download} title={`下载(${bucketLabel})`} href={downloadUrl(file.object_key, "beijing")} />
-      </div>
-    )
-  }
-
-  if (file.local_path) {
-    return (
-      <>
-        <div className="flex items-center gap-0.5">
-          <CellButton
-            icon={CloudUpload}
-            label="上传"
-            title={`上传到${bucketLabel}`}
-            onClick={() => setDialogOpen(true)}
-            error={failed ? file.error : undefined}
-          />
-          <CheckExistBtn fileId={file.id} target="beijing" onFileUpdated={onFileUpdated} />
-        </div>
-        {dialogOpen && (
-          <UploadKeyDialog
-            file={file}
-            bucket="beijing"
-            bucketLabel={bucketLabel}
-            onClose={() => setDialogOpen(false)}
-            onDone={() => {
-              setDialogOpen(false)
-              onUpdated()
-            }}
-          />
-        )}
-      </>
-    )
-  }
-
-  return (
-    <div className="flex items-center gap-0.5">
-      <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
-      <CheckExistBtn fileId={file.id} target="beijing" onFileUpdated={onFileUpdated} />
-    </div>
-  )
-}
-
-/** 自己桶2列：与 BeijingCell 对称，读 uploaded_bucket2，检测 upload_bucket2 任务。 */
-function Bucket2Cell({ file, bucketLabel, onUpdated, onFileUpdated }: { file: FileItem; bucketLabel: string; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
-  const { jobs } = useJobs()
-  const [dialogOpen, setDialogOpen] = React.useState(false)
-  const job = file.job_id ? jobs[file.job_id] : undefined
-  const isMyJob = job && job.kind === "upload_bucket2"
-
-  if (isMyJob && job!.status === "queued") return <QueuedLabel file={file} />
-  if (isMyJob && job!.status === "uploading") return (
-    <div className="flex items-center gap-0.5">
-      <JobProgressBadge file={file} />
-      <CancelJobBtn file={file} />
-    </div>
-  )
-
-  const failed = file.status === "failed" && !!file.local_path && !file.uploaded_bucket2
-
-  if (file.uploaded_bucket2 === 1) {
-    return (
-      <div className="flex items-center gap-0.5">
-        <StatusText tone="active">已存在</StatusText>
-        <CheckExistBtn fileId={file.id} target="bucket2" onFileUpdated={onFileUpdated} />
-        <IconBtn icon={Download} title={`下载(${bucketLabel})`} href={downloadUrl(file.object_key, "bucket2")} />
-      </div>
-    )
-  }
-
-  if (file.local_path) {
-    return (
-      <>
-        <div className="flex items-center gap-0.5">
-          <CellButton
-            icon={CloudUpload}
-            label="上传"
-            title={`上传到${bucketLabel}`}
-            onClick={() => setDialogOpen(true)}
-            error={failed ? file.error : undefined}
-          />
-          <CheckExistBtn fileId={file.id} target="bucket2" onFileUpdated={onFileUpdated} />
-        </div>
-        {dialogOpen && (
-          <UploadKeyDialog
-            file={file}
-            bucket="bucket2"
-            bucketLabel={bucketLabel}
-            onClose={() => setDialogOpen(false)}
-            onDone={() => {
-              setDialogOpen(false)
-              onUpdated()
-            }}
-          />
-        )}
-      </>
-    )
-  }
-
-  return (
-    <div className="flex items-center gap-0.5">
-      <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
-      <CheckExistBtn fileId={file.id} target="bucket2" onFileUpdated={onFileUpdated} />
+      <CheckExistBtn fileId={file.id} target={bucket.id} onFileUpdated={onFileUpdated} />
     </div>
   )
 }
@@ -719,15 +603,11 @@ function Bucket2Cell({ file, bucketLabel, onUpdated, onFileUpdated }: { file: Fi
 export function FilesDataTable({
   data,
   scripts,
+  buckets,
   total,
   page,
   pageSize,
   loading,
-  beijingEnabled,
-  bucket2Enabled,
-  selfBucketName,
-  bucket2Name,
-  beijingBucketName,
   onPageChange,
   onDeleted,
   onFileUpdated,
@@ -808,32 +688,15 @@ export function FilesDataTable({
           header: () => <div className="min-w-[4rem] text-center">本地</div>,
           cell: ({ row }) => <div className="flex justify-center"><LocalCell file={row.original} onUpdated={onDeleted} onFileUpdated={onFileUpdated} /></div>,
         },
-        {
-          id: "cloud",
-          header: () => <div className="min-w-[4rem] text-center">{selfBucketName || "自己桶"}</div>,
-          cell: ({ row }) => <div className="flex justify-center"><CloudCell file={row.original} bucketLabel={selfBucketName || "自己桶"} onUpdated={onDeleted} onFileUpdated={onFileUpdated} /></div>,
-        },
       ]
-      if (bucket2Enabled) {
+      buckets.forEach((bucket) => {
         cols.push({
-          id: "bucket2",
-          header: () => <div className="min-w-[4rem] text-center">{bucket2Name || "自己桶2"}</div>,
-          cell: ({ row }) => <div className="flex justify-center"><Bucket2Cell file={row.original} bucketLabel={bucket2Name || "自己桶2"} onUpdated={onDeleted} onFileUpdated={onFileUpdated} /></div>,
+          id: `bucket-${bucket.id}`,
+          header: () => <div className="min-w-[4rem] text-center">{bucket.name}</div>,
+          cell: ({ row }) => <div className="flex justify-center"><BucketCell file={row.original} bucket={bucket} onUpdated={onDeleted} onFileUpdated={onFileUpdated} /></div>,
         })
-      }
-      if (beijingEnabled) {
-        cols.push({
-          id: "beijing",
-          header: () => <div className="min-w-[4rem] text-center">{beijingBucketName || "北京桶"}</div>,
-          cell: ({ row }) => <div className="flex justify-center"><BeijingCell file={row.original} bucketLabel={beijingBucketName || "北京桶"} onUpdated={onDeleted} onFileUpdated={onFileUpdated} /></div>,
-        })
-      }
+      })
       cols.push(
-        {
-          id: "actions",
-          header: () => <div className="text-center">操作</div>,
-          cell: ({ row }) => <RowActions file={row.original} onDeleted={onDeleted} onEdit={() => setEditingFile(row.original)} />,
-        },
         {
           accessorKey: "created_at",
           header: () => <div className="text-left">创建时间</div>,
@@ -843,10 +706,15 @@ export function FilesDataTable({
             </span>
           ),
         },
+        {
+          id: "actions",
+          header: () => <div className="text-center">操作</div>,
+          cell: ({ row }) => <RowActions file={row.original} onDeleted={onDeleted} onEdit={() => setEditingFile(row.original)} />,
+        },
       )
       return cols
     },
-    [datasourceName, onDeleted, onFileUpdated, beijingEnabled, bucket2Enabled, selfBucketName, bucket2Name, beijingBucketName],
+    [datasourceName, onDeleted, onFileUpdated, buckets],
   )
 
   const table = useReactTable({
@@ -866,9 +734,14 @@ export function FilesDataTable({
 
   const selectedFiles = table.getSelectedRowModel().rows.map((r) => r.original)
   const downloadable = selectedFiles.filter((f) => !f.local_path)
-  const uploadable = selectedFiles.filter((f) => f.local_path && f.uploaded === 0)
-  const bucket2Uploadable = selectedFiles.filter((f) => f.local_path && f.uploaded_bucket2 === 0)
-  const beijingUploadable = selectedFiles.filter((f) => f.local_path && f.uploaded_beijing === 0)
+  /** 每个桶可批量上传的文件（有本地副本且尚未上传到该桶）。 */
+  const uploadableByBucket = new Map<number, FileItem[]>()
+  buckets.forEach((b) => {
+    uploadableByBucket.set(
+      b.id,
+      selectedFiles.filter((f) => f.local_path && !f.uploaded_bucket_ids.includes(b.id)),
+    )
+  })
 
   const [batchBusy, setBatchBusy] = React.useState(false)
 
@@ -878,7 +751,7 @@ export function FilesDataTable({
       return
     }
     setBatchBusy(true)
-    const results = await Promise.allSettled(downloadable.map((f) => downloadServer(f.id)))
+    const results = await Promise.allSettled(downloadable.map((f) => downloadServerFromBucket(f.id)))
     const ok = results.filter((r) => r.status === "fulfilled").length
     toast.success(`已入队 ${ok} 个下载任务`)
     setRowSelection({})
@@ -886,13 +759,14 @@ export function FilesDataTable({
     onDeleted()
   }
 
-  const batchUpload = async () => {
+  const batchUploadTo = async (bucket: BucketInfo) => {
+    const uploadable = uploadableByBucket.get(bucket.id) ?? []
     if (!uploadable.length) {
       toast("没有可上传的文件（需先下载到服务器）")
       return
     }
     setBatchBusy(true)
-    const results = await Promise.allSettled(uploadable.map((f) => uploadToCloud(f.id)))
+    const results = await Promise.allSettled(uploadable.map((f) => uploadFileToBucket(f.id, bucket.id)))
     const ok = results.filter((r) => r.status === "fulfilled").length
     toast.success(`已入队 ${ok} 个上传任务`)
     setRowSelection({})
@@ -900,35 +774,7 @@ export function FilesDataTable({
     onDeleted()
   }
 
-  const batchUploadBeijing = async () => {
-    if (!beijingUploadable.length) {
-      toast("没有可上传的文件（需先下载到服务器）")
-      return
-    }
-    setBatchBusy(true)
-    const results = await Promise.allSettled(beijingUploadable.map((f) => uploadToBeijing(f.id)))
-    const ok = results.filter((r) => r.status === "fulfilled").length
-    toast.success(`已入队 ${ok} 个上传任务`)
-    setRowSelection({})
-    setBatchBusy(false)
-    onDeleted()
-  }
-
-  const batchUploadBucket2 = async () => {
-    if (!bucket2Uploadable.length) {
-      toast("没有可上传的文件（需先下载到服务器）")
-      return
-    }
-    setBatchBusy(true)
-    const results = await Promise.allSettled(bucket2Uploadable.map((f) => uploadToBucket2(f.id)))
-    const ok = results.filter((r) => r.status === "fulfilled").length
-    toast.success(`已入队 ${ok} 个上传任务`)
-    setRowSelection({})
-    setBatchBusy(false)
-    onDeleted()
-  }
-
-  const skelWidths = skeletonWidths(beijingEnabled, bucket2Enabled)
+  const skelWidths = skeletonWidths(buckets.length)
 
   return (
     <div className="space-y-3">
@@ -940,40 +786,22 @@ export function FilesDataTable({
             <HardDriveDownload className="size-3.5" />
             批量下载到服务器{downloadable.length > 0 && `（${downloadable.length}）`}
           </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={batchUpload}
-            disabled={batchBusy || uploadable.length === 0}
-            title={uploadable.length === 0 ? "需先下载到服务器" : undefined}
-          >
-            <CloudUpload className="size-3.5" />
-            批量上传到{selfBucketName || "自己桶"}{uploadable.length > 0 && `（${uploadable.length}）`}
-          </Button>
-          {bucket2Enabled && (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={batchUploadBucket2}
-              disabled={batchBusy || bucket2Uploadable.length === 0}
-              title={bucket2Uploadable.length === 0 ? "需先下载到服务器" : undefined}
-            >
-              <CloudUpload className="size-3.5" />
-              批量上传到{bucket2Name || "自己桶2"}{bucket2Uploadable.length > 0 && `（${bucket2Uploadable.length}）`}
-            </Button>
-          )}
-          {beijingEnabled && (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={batchUploadBeijing}
-              disabled={batchBusy || beijingUploadable.length === 0}
-              title={beijingUploadable.length === 0 ? "需先下载到服务器" : undefined}
-            >
-              <CloudUpload className="size-3.5" />
-              批量上传到{beijingBucketName || "北京桶"}{beijingUploadable.length > 0 && `（${beijingUploadable.length}）`}
-            </Button>
-          )}
+          {buckets.map((bucket) => {
+            const uploadable = uploadableByBucket.get(bucket.id) ?? []
+            return (
+              <Button
+                key={bucket.id}
+                size="sm"
+                variant="outline"
+                onClick={() => batchUploadTo(bucket)}
+                disabled={batchBusy || uploadable.length === 0}
+                title={uploadable.length === 0 ? "需先下载到服务器" : undefined}
+              >
+                <CloudUpload className="size-3.5" />
+                批量上传到{bucket.name}{uploadable.length > 0 && `（${uploadable.length}）`}
+              </Button>
+            )
+          })}
           <Button size="sm" variant="ghost" onClick={() => setRowSelection({})} disabled={batchBusy}>
             取消选择
           </Button>
@@ -1024,7 +852,7 @@ export function FilesDataTable({
             ) : (
               <TableRow>
                 <TableCell colSpan={columns.length} className="h-32 text-center text-muted-foreground">
-                  文件库还没有文件，录入链接或上传后自动登记。
+                  文件库还没有文件，录入待处理文件或上传后自动登记。
                 </TableCell>
               </TableRow>
             )}
@@ -1062,9 +890,6 @@ export function FilesDataTable({
         <EditFileDialog
           file={editingFile}
           scripts={scripts}
-          selfBucketLabel={selfBucketName || "自己桶"}
-          bucket2Label={bucket2Name || "自己桶2"}
-          beijingBucketLabel={beijingBucketName || "北京桶"}
           onClose={() => setEditingFile(null)}
           onSaved={() => {
             setEditingFile(null)
@@ -1095,21 +920,27 @@ function RowActions({ file, onDeleted, onEdit }: { file: FileItem; onDeleted: ()
   }
 
   return (
-    <div className="flex items-center justify-center gap-1">
-      <Button variant="ghost" size="sm" onClick={onEdit} title="编辑">
-        <Pencil className="size-3.5" /> 编辑
-      </Button>
-      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-        <AlertDialogTrigger asChild>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="text-destructive hover:text-destructive"
-            title="删除"
+    <div className="flex items-center justify-center">
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            title="更多操作"
+            className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
+            <MoreVertical className="size-3.5" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          <DropdownMenuItem onClick={onEdit}>
+            <Pencil className="size-3.5" /> 编辑
+          </DropdownMenuItem>
+          <DropdownMenuItem variant="destructive" onClick={() => setDeleteOpen(true)}>
             <Trash2 className="size-3.5" /> 删除
-          </Button>
-        </AlertDialogTrigger>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>确认删除？</AlertDialogTitle>
@@ -1133,42 +964,27 @@ function RowActions({ file, onDeleted, onEdit }: { file: FileItem; onDeleted: ()
   )
 }
 
-/** 编辑文件记录 Modal。 */
+/** 编辑文件记录 Modal（仅基础信息；其余字段由列表内操作维护）。 */
 function EditFileDialog({
   file,
   scripts,
-  selfBucketLabel,
-  bucket2Label,
-  beijingBucketLabel,
   onClose,
   onSaved,
 }: {
   file: FileItem
   scripts: Datasource[]
-  selfBucketLabel: string
-  bucket2Label: string
-  beijingBucketLabel: string
   onClose: () => void
   onSaved: () => void
 }) {
   const [form, setForm] = React.useState({
     filename: file.filename ?? "",
-    object_key: file.object_key,
-    md5: file.md5 ?? "",
     size: String(file.size),
-    bucket: file.bucket ?? "",
-    source_url: file.source_url ?? "",
-    local_path: file.local_path ?? "",
-    uploaded: file.uploaded === 1,
-    uploaded_beijing: file.uploaded_beijing === 1,
-    uploaded_bucket2: file.uploaded_bucket2 === 1,
     status: file.status,
     datasource_id: file.datasource_id ? String(file.datasource_id) : "",
-    error: file.error ?? "",
   })
   const [busy, setBusy] = React.useState(false)
 
-  const set = (key: keyof typeof form, value: string | boolean) =>
+  const set = (key: keyof typeof form, value: string) =>
     setForm((f) => ({ ...f, [key]: value }))
 
   const submit = async () => {
@@ -1176,18 +992,9 @@ function EditFileDialog({
     try {
       await updateFile(file.id, {
         filename: form.filename || null,
-        object_key: form.object_key,
-        md5: form.md5 || null,
         size: Number(form.size) || 0,
-        bucket: form.bucket,
-        source_url: form.source_url || null,
-        local_path: form.local_path || null,
-        uploaded: form.uploaded,
-        uploaded_beijing: form.uploaded_beijing,
-        uploaded_bucket2: form.uploaded_bucket2,
         status: form.status,
         datasource_id: form.datasource_id ? Number(form.datasource_id) : null,
-        error: form.error || null,
       })
       toast.success("已保存")
       onSaved()
@@ -1200,11 +1007,11 @@ function EditFileDialog({
 
   return (
     <Dialog open onOpenChange={(v) => { if (!v && !busy) onClose() }}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>编辑文件记录</DialogTitle>
         </DialogHeader>
-        <div className="max-h-[60vh] space-y-4 overflow-y-auto py-2">
+        <div className="space-y-4 py-2">
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
               <Label htmlFor="edit-filename">文件名</Label>
@@ -1215,68 +1022,12 @@ function EditFileDialog({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="edit-object-key">Object Key</Label>
-              <Input
-                id="edit-object-key"
-                value={form.object_key}
-                onChange={(e) => set("object_key", e.target.value)}
-              />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="edit-md5">MD5</Label>
-              <Input
-                id="edit-md5"
-                value={form.md5}
-                onChange={(e) => set("md5", e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
               <Label htmlFor="edit-size">大小（字节）</Label>
               <Input
                 id="edit-size"
                 type="number"
                 value={form.size}
                 onChange={(e) => set("size", e.target.value)}
-              />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="edit-bucket">Bucket</Label>
-              <Input
-                id="edit-bucket"
-                value={form.bucket}
-                onChange={(e) => set("bucket", e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="edit-source-url">来源链接</Label>
-              <Input
-                id="edit-source-url"
-                value={form.source_url}
-                onChange={(e) => set("source_url", e.target.value)}
-              />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="edit-local-path">本地路径</Label>
-              <Input
-                id="edit-local-path"
-                value={form.local_path}
-                onChange={(e) => set("local_path", e.target.value)}
-                placeholder="（空 = 不存在）"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="edit-error">错误信息</Label>
-              <Input
-                id="edit-error"
-                value={form.error}
-                onChange={(e) => set("error", e.target.value)}
-                placeholder="（空 = 无）"
               />
             </div>
           </div>
@@ -1311,29 +1062,6 @@ function EditFileDialog({
                 </SelectContent>
               </Select>
             </div>
-          </div>
-          <div className="flex items-center gap-6">
-            <label className="flex items-center gap-2 text-sm font-medium">
-              <Checkbox
-                checked={form.uploaded}
-                onCheckedChange={(v) => set("uploaded", v === true)}
-              />
-              {selfBucketLabel}已上传
-            </label>
-            <label className="flex items-center gap-2 text-sm font-medium">
-              <Checkbox
-                checked={form.uploaded_bucket2}
-                onCheckedChange={(v) => set("uploaded_bucket2", v === true)}
-              />
-              {bucket2Label}已上传
-            </label>
-            <label className="flex items-center gap-2 text-sm font-medium">
-              <Checkbox
-                checked={form.uploaded_beijing}
-                onCheckedChange={(v) => set("uploaded_beijing", v === true)}
-              />
-              {beijingBucketLabel}已上传
-            </label>
           </div>
         </div>
         <DialogFooter>

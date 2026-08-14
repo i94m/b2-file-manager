@@ -4,6 +4,7 @@ import { toast } from "sonner"
 
 import { type Datasource } from "@/lib/types"
 import { uploadFile, urlUpload, serverDownload } from "@/lib/api"
+import { useBuckets } from "@/lib/use-buckets"
 import { addPrefix, getLastPrefix, validatePrefix } from "@/lib/prefix"
 import { Button } from "@/components/ui/button"
 import {
@@ -51,7 +52,7 @@ function usePrefix(defaultPrefix: string) {
   return { prefix, setPrefix: onChange } as const
 }
 
-/** 录入链接 Dialog。 */
+/** 录入待处理文件 Dialog（链接或任意标识，登记到文件库）。 */
 export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
   const [open, setOpen] = React.useState(false)
   const [url, setUrl] = React.useState("")
@@ -61,13 +62,9 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
 
   const prefixValid = validatePrefix(prefix).valid
   const urlFilename = React.useMemo(() => {
-    try {
-      const u = new URL(url.trim())
-      const name = u.pathname.split("/").filter(Boolean).pop() ?? ""
-      return name || undefined
-    } catch {
-      return undefined
-    }
+    const t = url.trim()
+    if (!t) return undefined
+    return t.split(/[\\/]/).filter(Boolean).pop() ?? t
   }, [url])
 
   const submit = async () => {
@@ -95,23 +92,22 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
         <Button variant="default">
-          <Link2 className="size-4" /> 录入链接
+          <Link2 className="size-4" /> 录入待处理文件
         </Button>
       </DialogTrigger>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>录入下载链接</DialogTitle>
+          <DialogTitle>录入待处理文件</DialogTitle>
           <DialogDescription>
-            粘贴客户下载链接登记到文件库，稍后在列表手动触发上传。
+            登记下载链接或任意文件标识到文件库，稍后在列表手动触发上传。
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
           <div className="space-y-2">
-            <Label htmlFor="fetch-url">链接</Label>
+            <Label htmlFor="fetch-url">链接 / 标识</Label>
             <Input
               id="fetch-url"
-              type="url"
-              placeholder="https://download.example.com/file.zip"
+              placeholder="下载链接、文件名或任意标识"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit()}
@@ -158,6 +154,14 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
 
 /** 上传文件 Dialog。 */
 export function UploadDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
+  const { buckets } = useBuckets()
+  const enabledBuckets = buckets.filter((b) => b.enabled)
+  const defaultBucket = enabledBuckets.find((b) => b.is_default) ?? enabledBuckets[0]
+  const [bucketId, setBucketId] = React.useState("")
+  React.useEffect(() => {
+    if (!bucketId && defaultBucket) setBucketId(String(defaultBucket.id))
+  }, [bucketId, defaultBucket])
+
   const [open, setOpen] = React.useState(false)
   const [file, setFile] = React.useState<File | null>(null)
   const { prefix, setPrefix } = usePrefix(defaultPrefix)
@@ -173,6 +177,7 @@ export function UploadDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
     try {
       const r = await uploadFile(file, {
         prefix: normalized || undefined,
+        bucket: bucketId ? Number(bucketId) : undefined,
         datasourceId: datasourceId ? Number(datasourceId) : undefined,
       })
       toast.success(r.message)
@@ -218,20 +223,35 @@ export function UploadDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
               />
             </div>
             <div className="space-y-2">
-              <Label>数据源（可选）</Label>
-              <Select value={datasourceId} onValueChange={setDatasourceId}>
+              <Label>上传到桶</Label>
+              <Select value={bucketId} onValueChange={setBucketId}>
                 <SelectTrigger>
-                  <SelectValue placeholder="不关联" />
+                  <SelectValue placeholder={enabledBuckets.length ? "默认桶" : "暂无可用桶"} />
                 </SelectTrigger>
                 <SelectContent>
-                  {scripts.map((s) => (
-                    <SelectItem key={s.id} value={String(s.id)}>
-                      {s.name}
+                  {enabledBuckets.map((b) => (
+                    <SelectItem key={b.id} value={String(b.id)}>
+                      {b.name}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             </div>
+          </div>
+          <div className="space-y-2">
+            <Label>数据源（可选）</Label>
+            <Select value={datasourceId} onValueChange={setDatasourceId}>
+              <SelectTrigger>
+                <SelectValue placeholder="不关联" />
+              </SelectTrigger>
+              <SelectContent>
+                {scripts.map((s) => (
+                  <SelectItem key={s.id} value={String(s.id)}>
+                    {s.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
         </div>
         <DialogFooter>
@@ -249,16 +269,28 @@ export function UploadDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
 
 /** 下载对象到服务器 Dialog（半成品搬运：从 bucket 拉到 SERVER_FILE_ROOT）。 */
 export function DownloadDialog({ onDone }: { onDone: () => void }) {
+  const { buckets } = useBuckets()
+  const enabledBuckets = buckets.filter((b) => b.enabled)
+  const defaultBucket = enabledBuckets.find((b) => b.is_default) ?? enabledBuckets[0]
+  const [bucketId, setBucketId] = React.useState("")
+  React.useEffect(() => {
+    if (!bucketId && defaultBucket) setBucketId(String(defaultBucket.id))
+  }, [bucketId, defaultBucket])
+
   const [open, setOpen] = React.useState(false)
   const [key, setKey] = React.useState("")
   const [destination, setDestination] = React.useState("")
   const [busy, setBusy] = React.useState(false)
 
   const submit = async () => {
-    if (!key.trim() || !destination.trim()) return
+    if (!key.trim()) return
     setBusy(true)
     try {
-      const r = await serverDownload(key.trim(), destination.trim())
+      const r = await serverDownload(
+        key.trim(),
+        destination.trim() || undefined,
+        bucketId ? Number(bucketId) : "self",
+      )
       toast.success(r.message)
       setKey("")
       setDestination("")
@@ -287,6 +319,21 @@ export function DownloadDialog({ onDone }: { onDone: () => void }) {
         </DialogHeader>
         <div className="space-y-4 py-2">
           <div className="space-y-2">
+            <Label>来源桶</Label>
+            <Select value={bucketId} onValueChange={setBucketId}>
+              <SelectTrigger>
+                <SelectValue placeholder={enabledBuckets.length ? "默认桶" : "暂无可用桶"} />
+              </SelectTrigger>
+              <SelectContent>
+                {enabledBuckets.map((b) => (
+                  <SelectItem key={b.id} value={String(b.id)}>
+                    {b.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
             <Label htmlFor="dl-key">对象名 (key)</Label>
             <Input
               id="dl-key"
@@ -296,10 +343,10 @@ export function DownloadDialog({ onDone }: { onDone: () => void }) {
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="dl-dest">目标路径</Label>
+            <Label htmlFor="dl-dest">目标路径（可选）</Label>
             <Input
               id="dl-dest"
-              placeholder="/server/path/to/file"
+              placeholder="留空 = SERVER_FILE_ROOT/文件名"
               value={destination}
               onChange={(e) => setDestination(e.target.value)}
             />
@@ -309,7 +356,7 @@ export function DownloadDialog({ onDone }: { onDone: () => void }) {
           <Button variant="outline" onClick={() => setOpen(false)} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || !key.trim() || !destination.trim()}>
+          <Button onClick={submit} disabled={busy || !key.trim()}>
             {busy ? "提交中…" : "下载"}
           </Button>
         </DialogFooter>
