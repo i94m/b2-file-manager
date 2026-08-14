@@ -25,7 +25,8 @@ from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 
 BUCKET = os.environ["BEIJING_BUCKET"]
-ENDPOINT = "https://" + os.environ["BEIJING_ENDPOINT"].lstrip("https://").lstrip("http://")
+_ep = os.environ["BEIJING_ENDPOINT"]
+ENDPOINT = _ep if _ep.startswith(("https://", "http://")) else "https://" + _ep
 REGION = os.environ["BEIJING_REGION"]
 KEY_ID = os.environ["BEIJING_APPLICATION_KEY_ID"]
 APP_KEY = os.environ["BEIJING_APPLICATION_KEY"]
