@@ -71,10 +71,20 @@ queued → uploading → done
 | kind | 含义 |
 |------|------|
 | `fetch` | 从 URL 下载 → 上传到 bucket（或下载到服务器） |
-| `upload` | 本地/服务器文件 → 自己桶 |
+| `upload` | 本地/服务器文件 → 自己桶1 |
+| `upload_bucket2` | 本地/服务器文件 → 自己桶2 |
 | `upload_beijing` | 本地/服务器文件 → 北京桶 |
-| `download` | 自己桶 → 服务器路径 |
+| `download` | 自己桶1 → 服务器路径 |
+| `download_bucket2` | 自己桶2 → 服务器路径 |
 | `download_beijing` | 北京桶 → 服务器路径 |
+
+### Bucket（桶标识）
+
+| 标识 | 环境变量前缀 | 说明 |
+|------|-------------|------|
+| `self` | `B2_1_*` | 自己桶1（必配） |
+| `bucket2` | `B2_2_*` | 自己桶2（可选，凭证留空则不启用） |
+| `beijing` | `BEIJING_*` | 北京桶（可选，凭证留空则不启用） |
 
 ---
 
@@ -152,7 +162,7 @@ Content-Type: multipart/form-data
 
 file=<二进制>
 prefix=backups/2026
-bucket=self          # 可选：self | beijing
+bucket=self          # 可选：self | bucket2 | beijing
 key=custom/path.zip  # 可选：自定义完整 object key（覆盖 prefix）
 datasource_id=3      # 可选
 ```
@@ -191,7 +201,7 @@ X-API-Key: YOUR_KEY
   },
   "file": {
     "id": 3, "status": "pending", "md5": "abc123", "size": 10240,
-    "uploaded": 0, "uploaded_beijing": 0,
+    "uploaded": 0, "uploaded_bucket2": 0, "uploaded_beijing": 0,
     "bucket": "mybucket", "object_key": "files/photo.jpg",
     "synced_at": null, "error": null
   }
@@ -311,20 +321,28 @@ Content-Type: application/json
 
 #### POST /api/files/:file_id/upload-cloud
 
-将服务器本地文件上传到自己桶（需先 `download-server`）。
+将服务器本地文件上传到自己桶1（需先 `download-server`）。
 
 ```json
 // 请求体（可选）
 {"key": "custom/object/key"}
 ```
 
+#### POST /api/files/:file_id/upload-bucket2
+
+上传到自己桶2（需 `B2_2_*` 环境变量已配置）。请求体同 `upload-cloud`。
+
 #### POST /api/files/:file_id/upload-beijing
 
-上传到北京桶（需 `BEIJING_*` 环境变量已配置）。
+上传到北京桶（需 `BEIJING_*` 环境变量已配置）。请求体同 `upload-cloud`。
 
 #### POST /api/files/:file_id/download-server
 
-下载到自己桶 / 北京桶 → 服务器 `SERVER_FILE_ROOT`。
+从自己桶1下载到服务器 `SERVER_FILE_ROOT`。
+
+#### POST /api/files/:file_id/download-server-bucket2
+
+从自己桶2下载到服务器。
 
 #### POST /api/files/:file_id/download-server-beijing
 
@@ -345,8 +363,11 @@ Content-Type: application/json
 | target | 检测内容 | 不存在时更新 |
 |--------|----------|-------------|
 | `local` | 服务器本地文件（`SERVER_FILE_ROOT`） | `local_path = NULL` |
-| `cloud` | 自己桶中的对象 | `uploaded = 0, status = 'pending'` |
+| `cloud` | 自己桶1中的对象 | `uploaded = 0, status = 'pending'` |
+| `bucket2` | 自己桶2中的对象 | `uploaded_bucket2 = 0` |
 | `beijing` | 北京桶中的对象 | `uploaded_beijing = 0` |
+
+> 检测存在时会顺带更新 `size`（本地取文件 stat，桶内取对象 ContentLength）。
 
 **响应**：
 
@@ -367,6 +388,8 @@ GET /api/objects?bucket=self&prefix=backups/&q=2026&page=1&page_size=50
 X-API-Key: YOUR_KEY
 ```
 
+> `bucket` 可选 `self`（默认）/ `bucket2` / `beijing`。
+
 **响应**：
 
 ```json
@@ -383,8 +406,10 @@ X-API-Key: YOUR_KEY
 删除桶对象。
 
 ```json
-{"key": "path/to/object.zip"}
+{"key": "path/to/object.zip", "bucket": "self"}
 ```
+
+> `bucket` 可选 `self`（默认）/ `bucket2` / `beijing`。删除成功后本地文件库对应桶的上传标记自动清零（自己桶1 另标记 `status=deleted`）。
 
 #### POST /api/objects/rename
 
@@ -402,7 +427,7 @@ X-API-Key: YOUR_KEY
 GET /download?key=path/to/file.zip&bucket=self&apikey=YOUR_KEY
 ```
 
-> 浏览器直跳用，返回二进制流。`bucket` 可选 `self` / `beijing`。
+> 浏览器直跳用，返回二进制流。`bucket` 可选 `self` / `bucket2` / `beijing`。
 
 ---
 
@@ -445,7 +470,9 @@ GET /download?key=path/to/file.zip&bucket=self&apikey=YOUR_KEY
 ```json
 {
   "app": "b2-file-manager", "bucket": "mybucket",
-  "default_prefix": "", "beijing_enabled": false, "beijing_bucket": "",
+  "default_prefix": "",
+  "bucket2_enabled": false, "bucket2_bucket": "",
+  "beijing_enabled": false, "beijing_bucket": "",
   "bucket_private": true, "bucket_private_note": "..."
 }
 ```
@@ -498,7 +525,7 @@ socket.on("job_update", (job) => {
 ```typescript
 interface JobUpdate {
   id: number
-  kind: string           // fetch | upload | upload_beijing | download | download_beijing
+  kind: string           // fetch | upload | upload_bucket2 | upload_beijing | download | download_bucket2 | download_beijing
   status: string         // queued | uploading | done | failed | cancelled
   filename: string
   object_key: string

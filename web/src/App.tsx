@@ -48,6 +48,8 @@ function AppShell() {
   const bucketPrivate = appInfo?.bucket_private ?? null
   const beijingEnabled = appInfo?.beijing_enabled ?? false
   const beijingBucket = appInfo?.beijing_bucket ?? ""
+  const bucket2Enabled = appInfo?.bucket2_enabled ?? false
+  const bucket2Bucket = appInfo?.bucket2_bucket ?? ""
 
   const [files, setFiles] = React.useState<FileItem[]>([])
 
@@ -168,6 +170,8 @@ function AppShell() {
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
               <BucketStatusBadges
                 selfBucket={bucket}
+                bucket2Enabled={bucket2Enabled}
+                bucket2Bucket={bucket2Bucket}
                 beijingEnabled={beijingEnabled}
                 beijingBucket={beijingBucket}
                 trailing={<ConnectionStatus />}
@@ -230,6 +234,10 @@ function AppShell() {
           pageSize={pageSize}
           loading={loading}
           beijingEnabled={beijingEnabled}
+          bucket2Enabled={bucket2Enabled}
+          selfBucketName={bucket}
+          bucket2Name={bucket2Bucket}
+          beijingBucketName={beijingBucket}
           onPageChange={setPage}
           onDeleted={loadFiles}
           onFileUpdated={patchFile}
@@ -240,13 +248,20 @@ function AppShell() {
           <JobsTable />
         </div>
 
-        {/* 桶对象浏览（自己桶 / 北京桶 并列） */}
+        {/* 桶对象浏览（自己桶 / 自己桶2 / 北京桶 并列） */}
         <div className="mt-6 flex flex-col gap-4 lg:flex-row">
           <BucketBrowserSection
             title={`自己桶 · ${bucket}`}
             bucket="self"
             defaultPrefix={defaultPrefix}
           />
+          {bucket2Enabled && (
+            <BucketBrowserSection
+              title={`自己桶2 · ${bucket2Bucket}`}
+              bucket="bucket2"
+              defaultPrefix={defaultPrefix}
+            />
+          )}
           {beijingEnabled && (
             <BucketBrowserSection
               title={`北京桶 · ${beijingBucket}`}

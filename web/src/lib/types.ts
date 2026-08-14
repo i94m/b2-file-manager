@@ -10,6 +10,7 @@ export interface FileItem {
   source_url: string | null
   uploaded: number // 0/1
   uploaded_beijing: number // 0/1（北京桶，独立于 uploaded）
+  uploaded_bucket2: number // 0/1（自己桶2，独立于 uploaded）
   status: string // pending | synced | failed | deleted
   datasource_id: number | null
   local_path: string | null // 已下载到服务器 SERVER_FILE_ROOT 的相对路径
@@ -77,6 +78,8 @@ export interface AppInfo {
   bucket_private_note: string
   beijing_enabled: boolean
   beijing_bucket: string
+  bucket2_enabled: boolean
+  bucket2_bucket: string
 }
 
 /** GET /api/bucket-health 的单项结果。 */
@@ -107,6 +110,7 @@ export interface BucketHealthEntry {
 export interface BucketHealth {
   self: BucketHealthEntry
   beijing: BucketHealthEntry | null
+  bucket2: BucketHealthEntry | null
 }
 
 /** Socket.IO job_update 事件（与后端 job_payload 对齐）。 */

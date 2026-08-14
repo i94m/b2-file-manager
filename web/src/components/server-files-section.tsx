@@ -1,5 +1,5 @@
 import * as React from "react"
-import { Download, FileIcon, FolderOpen, RefreshCw, Trash2, Upload } from "lucide-react"
+import { Download, FileIcon, FolderOpen, RefreshCw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { type Datasource, type ServerFile } from "@/lib/types"

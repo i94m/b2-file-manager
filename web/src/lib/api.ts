@@ -73,7 +73,7 @@ export interface FormResult {
 /** POST /upload — 本地文件上传到 bucket（FormData）。 */
 export async function uploadFile(
   file: File,
-  opts: { prefix?: string; key?: string; bucket?: "self" | "beijing"; datasourceId?: number } = {},
+  opts: { prefix?: string; key?: string; bucket?: "self" | "beijing" | "bucket2"; datasourceId?: number } = {},
 ): Promise<FormResult> {
   const form = new FormData()
   form.append("file", file)
@@ -111,6 +111,16 @@ export async function uploadToCloud(fileId: number, key?: string): Promise<FormR
 /** POST /api/files/:id/upload-beijing — 上传本地文件到北京桶（可指定自定义 key）。 */
 export async function uploadToBeijing(fileId: number, key?: string): Promise<FormResult> {
   const res = await fetch(`/api/files/${fileId}/upload-beijing`, {
+    method: "POST",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify(key ? { key } : {}),
+  })
+  return handle<FormResult>(res)
+}
+
+/** POST /api/files/:id/upload-bucket2 — 上传本地文件到自己桶2（可指定自定义 key）。 */
+export async function uploadToBucket2(fileId: number, key?: string): Promise<FormResult> {
+  const res = await fetch(`/api/files/${fileId}/upload-bucket2`, {
     method: "POST",
     headers: { ...headers(), "Content-Type": "application/json" },
     body: JSON.stringify(key ? { key } : {}),
@@ -169,10 +179,19 @@ export async function downloadServerBeijing(fileId: number): Promise<FormResult>
   return handle<FormResult>(res)
 }
 
+/** POST /api/files/:id/download-server-bucket2 — 从自己桶2下载对象到服务器。 */
+export async function downloadServerBucket2(fileId: number): Promise<FormResult> {
+  const res = await fetch(`/api/files/${fileId}/download-server-bucket2`, {
+    method: "POST",
+    headers: headers(true),
+  })
+  return handle<FormResult>(res)
+}
+
 /** POST /api/files/:id/check — 重新检测文件在指定位置是否存在。 */
 export async function checkFileExists(
   fileId: number,
-  target: "local" | "cloud" | "beijing",
+  target: "local" | "cloud" | "beijing" | "bucket2",
 ): Promise<{ target: string; exists: boolean; file?: FileItem }> {
   const res = await fetch(`/api/files/${fileId}/check`, {
     method: "POST",
@@ -196,15 +215,16 @@ export async function serverDownload(
 
 /** PATCH /api/files/:id 的请求体（所有字段可选）。 */
 export interface FileUpdateData {
-  filename?: string
+  filename?: string | null
   object_key?: string
-  md5?: string
+  md5?: string | null
   size?: number
   bucket?: string
-  source_url?: string
+  source_url?: string | null
   local_path?: string | null
   uploaded?: boolean
   uploaded_beijing?: boolean
+  uploaded_bucket2?: boolean
   status?: string
   datasource_id?: number | null
   error?: string | null
@@ -232,19 +252,22 @@ export async function deleteFile(fileId: number): Promise<{ deleted: boolean; fi
   return handle(res)
 }
 
-/** DELETE /api/objects — 删除 bucket 对象。 */
-export async function deleteObject(key: string): Promise<{ deleted: boolean; key: string }> {
+/** DELETE /api/objects — 删除 bucket 对象（bucket 默认 self，可选 bucket2 / beijing）。 */
+export async function deleteObject(
+  key: string,
+  bucket: "self" | "beijing" | "bucket2" = "self",
+): Promise<{ deleted: boolean; key: string }> {
   const res = await fetch("/api/objects", {
     method: "DELETE",
     headers: { ...headers(), "Content-Type": "application/json" },
-    body: JSON.stringify({ key }),
+    body: JSON.stringify({ key, bucket }),
   })
   return handle(res)
 }
 
 /** 下载链接（浏览器直跳，后端流式返回，走 query apikey）。 */
-export function downloadUrl(key: string, bucket?: "self" | "beijing"): string {
-  const bucketParam = bucket === "beijing" ? "&bucket=beijing" : ""
+export function downloadUrl(key: string, bucket?: "self" | "beijing" | "bucket2"): string {
+  const bucketParam = bucket === "beijing" || bucket === "bucket2" ? `&bucket=${bucket}` : ""
   return `/download?key=${encodeURIComponent(key)}${bucketParam}&apikey=${encodeURIComponent(getApiKey())}`
 }
 
@@ -252,7 +275,7 @@ export function downloadUrl(key: string, bucket?: "self" | "beijing"): string {
 export async function renameObject(
   fromKey: string,
   toKey: string,
-  bucket: "self" | "beijing" = "self",
+  bucket: "self" | "beijing" | "bucket2" = "self",
 ): Promise<{ ok: boolean; from_key: string; to_key: string }> {
   const res = await fetch("/api/objects/rename", {
     method: "POST",
@@ -265,7 +288,7 @@ export async function renameObject(
 /** GET /api/objects — 列出桶内对象（按前缀 + 文件名筛选）。bucket 默认 self，可选 beijing。 */
 export async function getObjects(
   prefix: string,
-  bucket: "self" | "beijing" = "self",
+  bucket: "self" | "beijing" | "bucket2" = "self",
   page = 1,
   pageSize = 50,
   q?: string,

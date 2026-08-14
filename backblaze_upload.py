@@ -38,23 +38,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--endpoint",
-        default=os.getenv("B2_ENDPOINT"),
-        help="S3 Endpoint；也可使用 B2_ENDPOINT 环境变量",
+        default=os.getenv("B2_1_ENDPOINT"),
+        help="S3 Endpoint；也可使用 B2_1_ENDPOINT 环境变量",
     )
     parser.add_argument(
         "--region",
-        default=os.getenv("B2_REGION"),
+        default=os.getenv("B2_1_REGION"),
         help="区域，如 us-west-004；省略时从 endpoint 自动提取",
     )
     parser.add_argument(
         "--key-id",
-        default=os.getenv("B2_APPLICATION_KEY_ID"),
-        help="Application Key ID；推荐使用 B2_APPLICATION_KEY_ID 环境变量",
+        default=os.getenv("B2_1_APPLICATION_KEY_ID"),
+        help="Application Key ID；推荐使用 B2_1_APPLICATION_KEY_ID 环境变量",
     )
     parser.add_argument(
         "--application-key",
-        default=os.getenv("B2_APPLICATION_KEY"),
-        help="Application Key；推荐使用 B2_APPLICATION_KEY 环境变量",
+        default=os.getenv("B2_1_APPLICATION_KEY"),
+        help="Application Key；推荐使用 B2_1_APPLICATION_KEY 环境变量",
     )
     parser.add_argument(
         "--workers",
@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
 def normalize_endpoint(endpoint: str | None, region: str | None) -> tuple[str, str]:
     if not endpoint:
         if not region:
-            raise ValueError("必须提供 --endpoint（或 B2_ENDPOINT），或者提供 --region")
+            raise ValueError("必须提供 --endpoint（或 B2_1_ENDPOINT），或者提供 --region")
         endpoint = f"https://s3.{region}.backblazeb2.com"
     elif not endpoint.startswith(("https://", "http://")):
         endpoint = "https://" + endpoint
@@ -210,8 +210,8 @@ def main() -> int:
 
     if not args.key_id or not args.application_key:
         print(
-            "错误: 缺少凭证。请设置 B2_APPLICATION_KEY_ID 和 "
-            "B2_APPLICATION_KEY，或传入对应命令行参数。",
+            "错误: 缺少凭证。请设置 B2_1_APPLICATION_KEY_ID 和 "
+            "B2_1_APPLICATION_KEY，或传入对应命令行参数。",
             file=sys.stderr,
         )
         return 2

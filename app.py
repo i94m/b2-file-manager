@@ -67,6 +67,7 @@ socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 
 _CLIENT = None
 _BEIJING_CLIENT = None
+_BUCKET2_CLIENT = None
 BUCKET_PRIVATE: bool | None = None
 BUCKET_PRIVATE_NOTE = ""
 
@@ -89,15 +90,15 @@ def format_time(epoch: float) -> str:
 # --------------------------------------------------------------------------
 
 def validate_config() -> str | None:
-    required = ("B2_APPLICATION_KEY_ID", "B2_APPLICATION_KEY", "B2_BUCKET", "APP_API_KEY")
+    required = ("B2_1_APPLICATION_KEY_ID", "B2_1_APPLICATION_KEY", "B2_1_BUCKET", "APP_API_KEY")
     missing = [name for name in required if not os.environ.get(name)]
     if missing:
         return (
             "缺少配置项: " + ", ".join(missing)
             + "（请复制 .env.example 为 .env 并填写）"
         )
-    if not os.environ.get("B2_ENDPOINT") and not os.environ.get("B2_REGION"):
-        return "Endpoint/Region 配置无效: B2_ENDPOINT 与 B2_REGION 至少配置一个"
+    if not os.environ.get("B2_1_ENDPOINT") and not os.environ.get("B2_1_REGION"):
+        return "Endpoint/Region 配置无效: B2_1_ENDPOINT 与 B2_1_REGION 至少配置一个"
     required_db = ("DB_HOST", "DB_USERNAME", "DB_DATABASE")
     missing_db = [name for name in required_db if not os.environ.get(name)]
     if missing_db:
@@ -110,14 +111,14 @@ def validate_config() -> str | None:
 
 
 def resolve_endpoint() -> tuple[str, str]:
-    """解析 B2_ENDPOINT / B2_REGION。
+    """解析 B2_1_ENDPOINT / B2_1_REGION。
 
-    与现有脚本一致：优先使用 B2_ENDPOINT，能推断 region 就用推断值；
+    与现有脚本一致：优先使用 B2_1_ENDPOINT，能推断 region 就用推断值；
     自定义 endpoint 无法推断 region 时不再报错，回退到 DEFAULT_REGION，
-    也可用 B2_REGION 显式指定。
+    也可用 B2_1_REGION 显式指定。
     """
-    endpoint = os.environ.get("B2_ENDPOINT")
-    region = os.environ.get("B2_REGION")
+    endpoint = os.environ.get("B2_1_ENDPOINT")
+    region = os.environ.get("B2_1_REGION")
     try:
         return normalize_endpoint(endpoint, region)
     except ValueError:
@@ -137,8 +138,8 @@ def get_client():
             "s3",
             endpoint_url=endpoint,
             region_name=region,
-            aws_access_key_id=os.environ["B2_APPLICATION_KEY_ID"],
-            aws_secret_access_key=os.environ["B2_APPLICATION_KEY"],
+            aws_access_key_id=os.environ["B2_1_APPLICATION_KEY_ID"],
+            aws_secret_access_key=os.environ["B2_1_APPLICATION_KEY"],
             config=Config(signature_version="s3v4", retries={"max_attempts": 8, "mode": "standard"}),
         )
     return _CLIENT
@@ -187,13 +188,59 @@ def get_beijing_client():
     return _BEIJING_CLIENT
 
 
+def bucket2_enabled() -> bool:
+    """自己桶2是否启用：3 个必填项都设置才算启用。"""
+    return all(
+        os.environ.get(name)
+        for name in ("B2_2_APPLICATION_KEY_ID", "B2_2_APPLICATION_KEY", "B2_2_BUCKET")
+    )
+
+
+def resolve_bucket2_endpoint() -> tuple[str, str]:
+    """解析 B2_2_ENDPOINT / B2_2_REGION（逻辑同 resolve_endpoint，读 B2_2_* 变量）。"""
+    endpoint = os.environ.get("B2_2_ENDPOINT")
+    region = os.environ.get("B2_2_REGION")
+    try:
+        return normalize_endpoint(endpoint, region)
+    except ValueError:
+        if not endpoint:
+            raise
+        endpoint = endpoint.strip()
+        if not endpoint.startswith(("https://", "http://")):
+            endpoint = "https://" + endpoint
+        return endpoint.rstrip("/"), region or DEFAULT_REGION
+
+
+def get_bucket2_client():
+    """懒加载自己桶2 S3 客户端（仅在 bucket2_enabled() 时调用）。"""
+    global _BUCKET2_CLIENT
+    if _BUCKET2_CLIENT is None:
+        endpoint, region = resolve_bucket2_endpoint()
+        _BUCKET2_CLIENT = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name=region,
+            aws_access_key_id=os.environ["B2_2_APPLICATION_KEY_ID"],
+            aws_secret_access_key=os.environ["B2_2_APPLICATION_KEY"],
+            config=Config(signature_version="s3v4", retries={"max_attempts": 8, "mode": "standard"}),
+        )
+    return _BUCKET2_CLIENT
+
+
 def resolve_bucket(target: str = "self") -> tuple:
-    """统一获取 (client, bucket_name)。target="self" 用自己桶，"beijing" 用北京桶。"""
+    """统一获取 (client, bucket_name)。
+
+    target="self" 用自己桶1，"bucket2" 用自己桶2，"beijing" 用北京桶。
+    """
+    if target == "bucket2":
+        if not bucket2_enabled():
+            raise ValueError("自己桶2未启用")
+        return get_bucket2_client(), os.environ["B2_2_BUCKET"]
     if target == "beijing":
         if not beijing_enabled():
             raise ValueError("北京桶未启用")
         return get_beijing_client(), os.environ["BEIJING_BUCKET"]
-    return get_client(), os.environ["B2_BUCKET"]
+    return get_client(), os.environ["B2_1_BUCKET"]
 
 
 def server_root() -> Path | None:
@@ -375,6 +422,7 @@ def init_db() -> None:
                 source_url VARCHAR(2048),
                 uploaded TINYINT NOT NULL DEFAULT 0,
                 uploaded_beijing TINYINT NOT NULL DEFAULT 0,
+                uploaded_bucket2 TINYINT NOT NULL DEFAULT 0,
                 status VARCHAR(20) NOT NULL DEFAULT 'pending',
                 datasource_id INT,
                 local_path VARCHAR(1024),
@@ -417,6 +465,7 @@ def init_db() -> None:
                 ("bucket", "VARCHAR(255) NOT NULL DEFAULT ''"),
                 ("uploaded", "TINYINT NOT NULL DEFAULT 0"),
                 ("uploaded_beijing", "TINYINT NOT NULL DEFAULT 0"),
+                ("uploaded_bucket2", "TINYINT NOT NULL DEFAULT 0"),
                 ("datasource_id", "INT"),
                 ("local_path", "VARCHAR(1024)"),
                 ("updated_at", "DOUBLE"),
@@ -432,7 +481,7 @@ def init_db() -> None:
             "UPDATE files SET uploaded=1, status='synced', "
             "updated_at=COALESCE(updated_at, created_at), "
             "bucket=COALESCE(NULLIF(bucket, ''), ?) WHERE uploaded=1 OR status='synced'",
-            (os.environ.get("B2_BUCKET", ""),),
+            (os.environ.get("B2_1_BUCKET", ""),),
         )
 
 
@@ -640,7 +689,7 @@ def upload_to_bucket(source: Path, object_key: str, job_id: int, size: int,
     if client is None:
         client = get_client()
     if bucket_name is None:
-        bucket_name = os.environ["B2_BUCKET"]
+        bucket_name = os.environ["B2_1_BUCKET"]
     client.upload_file(
         str(source),
         bucket_name,
@@ -655,7 +704,7 @@ def download_to_path(object_key: str, size: int, destination: Path, job_id: int,
     if client is None:
         client = get_client()
     if bucket_name is None:
-        bucket_name = os.environ["B2_BUCKET"]
+        bucket_name = os.environ["B2_1_BUCKET"]
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.", suffix=".part", dir=str(destination.parent)
@@ -752,7 +801,7 @@ def verify_object(object_key: str, size: int, client=None, bucket_name: str | No
     if client is None:
         client = get_client()
     if bucket_name is None:
-        bucket_name = os.environ["B2_BUCKET"]
+        bucket_name = os.environ["B2_1_BUCKET"]
     meta = client.head_object(Bucket=bucket_name, Key=object_key)
     actual = int(meta["ContentLength"])
     if actual != size:
@@ -783,7 +832,7 @@ def insert_file_pending(
                 object_key,
                 filename,
                 size,
-                os.environ.get("B2_BUCKET", ""),
+                os.environ.get("B2_1_BUCKET", ""),
                 source_url,
                 datasource_id,
                 now,
@@ -838,7 +887,7 @@ def sync_to_bucket(
 
 def cleanup_job_temp(job_id: int, kind: str, destination: str | None = None) -> None:
     """清理任务产生的临时文件（服务器路径上传任务的源文件不属于临时文件）。"""
-    if kind in ("download", "download_beijing") and destination:
+    if kind in ("download", "download_beijing", "download_bucket2") and destination:
         try:
             dest = Path(destination)
             for leftover in dest.parent.glob(f".{dest.name}.*.part"):
@@ -878,8 +927,11 @@ def process_job(job_id: int) -> None:
     emit_job_update(job_id)
 
     try:
-        if kind in ("download", "download_beijing"):
-            client, bucket = resolve_bucket("beijing" if kind == "download_beijing" else "self")
+        if kind in ("download", "download_beijing", "download_bucket2"):
+            target = "beijing" if kind == "download_beijing" else (
+                "bucket2" if kind == "download_bucket2" else "self"
+            )
+            client, bucket = resolve_bucket(target)
             download_to_path(object_key, size, Path(destination), job_id,
                              client=client, bucket_name=bucket)
             # 若该 job 关联了 file 记录（从文件列表「下载到服务器」发起），
@@ -924,9 +976,12 @@ def process_job(job_id: int) -> None:
                     update_file_by_job(job_id, local_path=rel)
                 else:
                     sync_to_bucket(source_path, object_key, job_id, size, md5, filename, source)
-            elif kind in ("upload", "upload_beijing"):
-                client, bucket = resolve_bucket("beijing" if kind == "upload_beijing" else "self")
-                col = "uploaded_beijing" if kind == "upload_beijing" else "uploaded"
+            elif kind in ("upload", "upload_beijing", "upload_bucket2"):
+                target = "beijing" if kind == "upload_beijing" else (
+                    "bucket2" if kind == "upload_bucket2" else "self"
+                )
+                col = {"upload_beijing": "uploaded_beijing", "upload_bucket2": "uploaded_bucket2"}.get(kind, "uploaded")
+                client, bucket = resolve_bucket(target)
                 if source_path is None:
                     source_path = UPLOAD_DIR / f"{job_id}.part"
                 md5 = hash_file(source_path)
@@ -1006,7 +1061,7 @@ def cleanup_stale_multipart(max_age_hours: float = 24.0, client=None, bucket_nam
     if client is None:
         client = get_client()
     if bucket_name is None:
-        bucket_name = os.environ["B2_BUCKET"]
+        bucket_name = os.environ["B2_1_BUCKET"]
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
         count = 0
@@ -1047,7 +1102,7 @@ def recent_scripts() -> list[dict]:
 def check_bucket_private() -> tuple[bool | None, str]:
     """检测 bucket 是否私有：S3 ACL 中出现 AllUsers 公开读即视为公开。"""
     try:
-        acl = get_client().get_bucket_acl(Bucket=os.environ["B2_BUCKET"])
+        acl = get_client().get_bucket_acl(Bucket=os.environ["B2_1_BUCKET"])
         for grant in acl.get("Grants", []):
             grantee = grant.get("Grantee", {})
             uri = grantee.get("URI", "") or ""
@@ -1198,7 +1253,7 @@ def list_objects(prefix: str, limit: int | None = 50, client=None, bucket_name: 
     if client is None:
         client = get_client()
     if bucket_name is None:
-        bucket_name = os.environ["B2_BUCKET"]
+        bucket_name = os.environ["B2_1_BUCKET"]
     paginator = client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
         for item in page.get("Contents", []):
@@ -1285,7 +1340,7 @@ def index():
         return blocked
     return jsonify({
         "app": "b2-file-manager",
-        "bucket": os.environ["B2_BUCKET"],
+        "bucket": os.environ["B2_1_BUCKET"],
         "default_prefix": default_prefix(),
         "bucket_private": BUCKET_PRIVATE,
         "bucket_private_note": BUCKET_PRIVATE_NOTE,
@@ -1320,9 +1375,13 @@ def upload():
 
     filename = Path(file.filename.replace("\\", "/")).name
 
-    # 目标桶：self（默认）或 beijing
+    # 目标桶：self（默认）、bucket2 或 beijing
     bucket = (request.form.get("bucket") or "self").strip()
-    if bucket == "beijing":
+    if bucket == "bucket2":
+        if not bucket2_enabled():
+            return respond("error", "自己桶2未启用。", apikey, "error", 400)
+        kind = "upload_bucket2"
+    elif bucket == "beijing":
         if not beijing_enabled():
             return respond("error", "北京桶未启用。", apikey, "error", 400)
         kind = "upload_beijing"
@@ -1402,7 +1461,7 @@ def server_upload():
 
     object_key = build_object_key(prefix, source.name)
     # 同名拒传
-    if object_exists(get_client(), os.environ["B2_BUCKET"], object_key):
+    if object_exists(get_client(), os.environ["B2_1_BUCKET"], object_key):
         return respond("error", f"同名文件已存在：{object_key}", apikey, "error", 400)
     size = source.stat().st_size
     datasource_id = request.form.get("datasource_id", type=int)
@@ -1447,7 +1506,7 @@ def server_download():
         return respond("error", "目标路径是已存在的目录，请填写完整的文件路径。", apikey, "error", 400)
 
     try:
-        metadata = get_client().head_object(Bucket=os.environ["B2_BUCKET"], Key=key)
+        metadata = get_client().head_object(Bucket=os.environ["B2_1_BUCKET"], Key=key)
         size = int(metadata["ContentLength"])
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
@@ -1566,7 +1625,7 @@ def url_upload():
         filename = PurePosixPath(urlparse(url).path).name or "download"
         object_key = build_object_key(prefix, filename)
         # 同名拒传：登记阶段就拒掉，避免后续 upload-cloud 冲突
-        if object_exists(get_client(), os.environ["B2_BUCKET"], object_key):
+        if object_exists(get_client(), os.environ["B2_1_BUCKET"], object_key):
             return respond("error", f"同名文件已存在：{object_key}", apikey, "error", 400)
 
     filename = PurePosixPath(urlparse(url).path).name or "download"
@@ -1692,7 +1751,7 @@ def api_file_download_server(file_id: int):
     if f.get("uploaded"):
         # bucket → server：校验对象存在并取真实大小
         try:
-            metadata = get_client().head_object(Bucket=os.environ["B2_BUCKET"], Key=object_key)
+            metadata = get_client().head_object(Bucket=os.environ["B2_1_BUCKET"], Key=object_key)
             size = int(metadata["ContentLength"])
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code", ""))
@@ -1854,6 +1913,126 @@ def api_file_download_server_beijing(file_id: int):
     })
 
 
+@app.post("/api/files/<int:file_id>/upload-bucket2")
+def api_file_upload_bucket2(file_id: int):
+    """把服务器本地文件上传到自己桶2（与 upload-cloud 对称）。
+
+    要求 bucket2_enabled()、files.local_path 存在且尚未 uploaded_bucket2=1。
+    建 kind=upload_bucket2 job 入队，worker 上传到自己桶2并写 uploaded_bucket2=1。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    if not bucket2_enabled():
+        return jsonify({"error": "自己桶2未启用"}), 400
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
+    f = dict(row)
+
+    if f.get("uploaded_bucket2"):
+        return jsonify({"error": "该文件已上传到自己桶2"}), 400
+    local_path = f.get("local_path")
+    if not local_path:
+        return jsonify({"error": "本地文件不存在，请先下载到服务器"}), 400
+
+    try:
+        source = resolve_local_path(local_path)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if not source.exists():
+        return jsonify({"error": f"本地文件不存在: {local_path}"}), 400
+
+    body = request.get_json(silent=True) or {}
+    custom_key = (body.get("key") or "").strip().lstrip("/")
+    object_key = custom_key or f["object_key"]
+
+    filename = f["filename"] or "download"
+    job_id = insert_job(
+        kind="upload_bucket2",
+        filename=filename,
+        object_key=object_key,
+        size=f.get("size") or 0,
+        source=str(source),
+    )
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE files SET job_id=?, object_key=?, updated_at=? WHERE id=?",
+            (job_id, object_key, time.time(), file_id),
+        )
+    JOB_QUEUE.put(job_id)
+    emit_job_update(job_id)
+    return jsonify({
+        "status": "ok",
+        "message": f"「{filename}」上传到自己桶2的任务已加入队列。",
+        "job_id": job_id,
+        "file_id": file_id,
+    })
+
+
+@app.post("/api/files/<int:file_id>/download-server-bucket2")
+def api_file_download_server_bucket2(file_id: int):
+    """从自己桶2下载文件到服务器（与 download-server 的 bucket→server 分支对称）。
+
+    要求 bucket2_enabled()、uploaded_bucket2=1、且尚未下载到服务器。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    if not bucket2_enabled():
+        return jsonify({"error": "自己桶2未启用"}), 400
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
+    f = dict(row)
+
+    if f.get("local_path"):
+        return jsonify({"error": "该文件已在服务器上"}), 400
+    if not f.get("uploaded_bucket2"):
+        return jsonify({"error": "该文件未上传到自己桶2"}), 400
+
+    object_key = f["object_key"]
+    filename = f["filename"] or "download"
+
+    root = server_root()
+    if root is None:
+        return jsonify({"error": "未配置 SERVER_FILE_ROOT"}), 400
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / filename
+
+    client, bucket = resolve_bucket("bucket2")
+    try:
+        metadata = client.head_object(Bucket=bucket, Key=object_key)
+        size = int(metadata["ContentLength"])
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return jsonify({"error": f"自己桶2中不存在对象: {object_key}"}), 404
+        return jsonify({"error": str(exc)}), 502
+    except (BotoCoreError, OSError) as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    job_id = insert_job(
+        kind="download_bucket2",
+        filename=filename,
+        object_key=object_key,
+        size=size,
+        destination=str(destination),
+    )
+    with get_db() as conn:
+        conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
+    JOB_QUEUE.put(job_id)
+    emit_job_update(job_id)
+    return jsonify({
+        "status": "ok",
+        "message": f"「{filename}」从自己桶2下载到服务器 {destination} 的任务已加入队列。",
+        "job_id": job_id,
+        "file_id": file_id,
+    })
+
+
 @app.post("/api/files/<int:file_id>/check")
 def api_file_check(file_id: int):
     """重新检测文件在指定位置是否存在，按结果更新记录。
@@ -1930,7 +2109,7 @@ def api_file_check(file_id: int):
     if target == "cloud":
         try:
             resp = get_client().head_object(
-                Bucket=os.environ["B2_BUCKET"], Key=f["object_key"]
+                Bucket=os.environ["B2_1_BUCKET"], Key=f["object_key"]
             )
             exists = True
             file_size = resp.get("ContentLength") or 0
@@ -2000,7 +2179,44 @@ def api_file_check(file_id: int):
         f = dict(row)
         return jsonify({"target": "beijing", "exists": exists, "file": f})
 
-    return jsonify({"error": f"无效的 target: {target}（可选 local / cloud / beijing）"}), 400
+    if target == "bucket2":
+        if not bucket2_enabled():
+            return jsonify({"error": "自己桶2未启用"}), 400
+        try:
+            resp = get_bucket2_client().head_object(
+                Bucket=os.environ["B2_2_BUCKET"], Key=f["object_key"]
+            )
+            exists = True
+            file_size = resp.get("ContentLength") or 0
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in ("404", "NoSuchKey", "NotFound"):
+                exists = False
+                file_size = 0
+            else:
+                return jsonify({"error": str(exc)}), 502
+        except (BotoCoreError, OSError) as exc:
+            return jsonify({"error": str(exc)}), 502
+        with get_db() as conn:
+            if exists:
+                sets = ["size=?", "updated_at=?"]
+                params = [file_size, now]
+                if not f.get("uploaded_bucket2"):
+                    sets.append("uploaded_bucket2=1")
+                params.append(file_id)
+                conn.execute(
+                    f"UPDATE files SET {', '.join(sets)} WHERE id=?", params,
+                )
+            elif f.get("uploaded_bucket2"):
+                conn.execute(
+                    "UPDATE files SET uploaded_bucket2=0, updated_at=? WHERE id=?",
+                    (now, file_id),
+                )
+            row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        f = dict(row)
+        return jsonify({"target": "bucket2", "exists": exists, "file": f})
+
+    return jsonify({"error": f"无效的 target: {target}（可选 local / cloud / beijing / bucket2）"}), 400
 
 
 @app.get("/download")
@@ -2013,7 +2229,11 @@ def download():
         return jsonify({"error": "缺少 key 参数"}), 400
 
     bucket_target = (request.args.get("bucket") or "self").strip()
-    if bucket_target == "beijing":
+    if bucket_target == "bucket2":
+        if not bucket2_enabled():
+            return jsonify({"error": "自己桶2未启用"}), 400
+        client, bucket = resolve_bucket("bucket2")
+    elif bucket_target == "beijing":
         if not beijing_enabled():
             return jsonify({"error": "北京桶未启用"}), 400
         client, bucket = resolve_bucket("beijing")
@@ -2141,7 +2361,7 @@ def api_submit():
         filename = PurePosixPath(urlparse(url).path).name or "download"
         object_key = build_object_key(prefix, filename)
         # 同名拒传：冲突放进 errors，不中断其它链接
-        if object_exists(get_client(), os.environ["B2_BUCKET"], object_key):
+        if object_exists(get_client(), os.environ["B2_1_BUCKET"], object_key):
             errors.append({"url": url, "error": f"同名文件已存在：{object_key}"})
             continue
         job_id = insert_job(
@@ -2213,6 +2433,7 @@ def api_status(job_id: int):
             "size": f["size"],
             "uploaded": f["uploaded"],
             "uploaded_beijing": f.get("uploaded_beijing", 0),
+            "uploaded_bucket2": f.get("uploaded_bucket2", 0),
             "bucket": f["bucket"],
             "object_key": f["object_key"],
             "synced_at": f["synced_at"],
@@ -2335,12 +2556,14 @@ def api_auth():
         return jsonify({"error": "未授权"}), 401
     return jsonify({
         "app": "b2-file-manager",
-        "bucket": os.environ["B2_BUCKET"],
+        "bucket": os.environ["B2_1_BUCKET"],
         "default_prefix": default_prefix(),
         "bucket_private": BUCKET_PRIVATE,
         "bucket_private_note": BUCKET_PRIVATE_NOTE,
         "beijing_enabled": beijing_enabled(),
         "beijing_bucket": os.environ.get("BEIJING_BUCKET", ""),
+        "bucket2_enabled": bucket2_enabled(),
+        "bucket2_bucket": os.environ.get("B2_2_BUCKET", ""),
     })
 
 
@@ -2352,9 +2575,10 @@ def api_bucket_health():
     self_endpoint, _ = resolve_endpoint()
     result = {
         "self": check_bucket_health(
-            get_client(), os.environ["B2_BUCKET"], self_endpoint, "auto"
+            get_client(), os.environ["B2_1_BUCKET"], self_endpoint, "auto"
         ),
         "beijing": None,
+        "bucket2": None,
     }
     if beijing_enabled():
         bj_endpoint, _ = resolve_beijing_endpoint()
@@ -2363,6 +2587,14 @@ def api_bucket_health():
             os.environ["BEIJING_BUCKET"],
             bj_endpoint,
             "virtual",
+        )
+    if bucket2_enabled():
+        b2_endpoint, _ = resolve_bucket2_endpoint()
+        result["bucket2"] = check_bucket_health(
+            get_bucket2_client(),
+            os.environ["B2_2_BUCKET"],
+            b2_endpoint,
+            "auto",
         )
     return jsonify(result)
 
@@ -2437,7 +2669,7 @@ def api_delete_object():
     """删除 bucket 中的一个对象。
 
     请求体 JSON：
-        {"key": "path/to/object.zip"}
+        {"key": "path/to/object.zip", "bucket": "self|bucket2|beijing"}
 
     返回：
         {"deleted": true, "key": "path/to/object.zip"}
@@ -2450,8 +2682,17 @@ def api_delete_object():
     if not key:
         return jsonify({"error": "缺少 key 参数"}), 400
 
+    bucket_target = (body.get("bucket") or "self").strip()
+    if bucket_target not in ("self", "bucket2", "beijing"):
+        return jsonify({"error": f"无效的 bucket: {bucket_target}"}), 400
+    if bucket_target == "bucket2" and not bucket2_enabled():
+        return jsonify({"error": "自己桶2未启用"}), 400
+    if bucket_target == "beijing" and not beijing_enabled():
+        return jsonify({"error": "北京桶未启用"}), 400
+
     try:
-        get_client().delete_object(Bucket=os.environ["B2_BUCKET"], Key=key)
+        client, bucket_name = resolve_bucket(bucket_target)
+        client.delete_object(Bucket=bucket_name, Key=key)
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code in ("404", "NoSuchKey", "NotFound"):
@@ -2460,12 +2701,19 @@ def api_delete_object():
     except (BotoCoreError, OSError) as exc:
         return jsonify({"error": str(exc)}), 502
 
-    # 同步更新本地 files 表
+    # 同步更新本地 files 表（对应桶的上传标记清零；自己桶1 另标记 status=deleted）
+    col = {"bucket2": "uploaded_bucket2", "beijing": "uploaded_beijing"}.get(bucket_target, "uploaded")
     with get_db() as conn:
-        conn.execute(
-            "UPDATE files SET status='deleted', uploaded=0, updated_at=? WHERE object_key=?",
-            (time.time(), key),
-        )
+        if bucket_target == "self":
+            conn.execute(
+                "UPDATE files SET status='deleted', uploaded=0, updated_at=? WHERE object_key=?",
+                (time.time(), key),
+            )
+        else:
+            conn.execute(
+                f"UPDATE files SET {col}=0, updated_at=? WHERE object_key=?",
+                (time.time(), key),
+            )
 
     return jsonify({"deleted": True, "key": key})
 
@@ -2581,7 +2829,7 @@ def api_update_file(file_id: int):
         params.append(int(body["size"] or 0))
 
     # 布尔→0/1 字段
-    for key in ("uploaded", "uploaded_beijing"):
+    for key in ("uploaded", "uploaded_beijing", "uploaded_bucket2"):
         if key in body:
             fields.append(f"{key} = ?")
             params.append(1 if body[key] else 0)
@@ -2730,6 +2978,8 @@ def init_runtime() -> None:
     cleanup_stale_multipart()
     if beijing_enabled():
         cleanup_stale_multipart(client=get_beijing_client(), bucket_name=os.environ["BEIJING_BUCKET"])
+    if bucket2_enabled():
+        cleanup_stale_multipart(client=get_bucket2_client(), bucket_name=os.environ["B2_2_BUCKET"])
     for i in range(max(1, MAX_WORKERS)):
         threading.Thread(target=worker_loop, name=f"worker-{i}", daemon=True).start()
 

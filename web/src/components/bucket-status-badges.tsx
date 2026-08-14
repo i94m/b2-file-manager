@@ -120,11 +120,15 @@ function BucketBadge({
 
 export function BucketStatusBadges({
   selfBucket,
+  bucket2Enabled,
+  bucket2Bucket,
   beijingEnabled,
   beijingBucket,
   trailing,
 }: {
   selfBucket: string
+  bucket2Enabled: boolean
+  bucket2Bucket: string
   beijingEnabled: boolean
   beijingBucket: string
   /** 渲染在桶徽章之后、刷新按钮之前的额外元素（如连接状态）。 */
@@ -151,11 +155,19 @@ export function BucketStatusBadges({
   return (
     <>
       <BucketBadge
-        label="Bucket"
+        label="Bucket1"
         bucket={selfBucket}
         entry={health?.self ?? null}
         loading={loading}
       />
+      {bucket2Enabled && (
+        <BucketBadge
+          label="Bucket2"
+          bucket={bucket2Bucket}
+          entry={health?.bucket2 ?? null}
+          loading={loading}
+        />
+      )}
       {beijingEnabled && (
         <BucketBadge
           label="北京桶"

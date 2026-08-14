@@ -1,4 +1,3 @@
-import * as React from "react"
 import { Pause } from "lucide-react"
 
 import { type FileItem } from "@/lib/types"

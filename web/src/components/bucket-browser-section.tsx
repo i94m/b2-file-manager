@@ -1,9 +1,10 @@
 import * as React from "react"
-import { ChevronLeft, ChevronRight, Cloud, Download, Pencil, Search, Upload } from "lucide-react"
+import { ChevronLeft, ChevronRight, Cloud, Download, Pencil, Search, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { type BucketObject } from "@/lib/types"
-import { downloadUrl, getObjects, renameObject, uploadFile } from "@/lib/api"
+import { deleteObject, downloadUrl, getObjects, renameObject, uploadFile } from "@/lib/api"
+import { useConfirm } from "@/lib/use-confirm"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -37,7 +38,7 @@ export function BucketBrowserSection({
   defaultPrefix,
 }: {
   title: string
-  bucket: "self" | "beijing"
+  bucket: "self" | "beijing" | "bucket2"
   defaultPrefix: string
 }) {
   const [prefix, setPrefix] = React.useState(defaultPrefix)
@@ -50,6 +51,30 @@ export function BucketBrowserSection({
 
   const [renaming, setRenaming] = React.useState<BucketObject | null>(null)
   const [uploadOpen, setUploadOpen] = React.useState(false)
+  const [deletingKey, setDeletingKey] = React.useState<string | null>(null)
+  const [busyDelete, setBusyDelete] = React.useState(false)
+  const [confirm, confirmDialog] = useConfirm()
+
+  const handleDelete = async (obj: BucketObject) => {
+    if (!await confirm({
+      title: "删除桶对象",
+      description: `确认删除 ${obj.key}？此操作不可撤销。`,
+      confirmText: "删除",
+      destructive: true,
+    })) return
+    setDeletingKey(obj.key)
+    setBusyDelete(true)
+    try {
+      await deleteObject(obj.key, bucket)
+      toast.success("已删除", { description: obj.key })
+      fetchPage(page)
+    } catch (e) {
+      toast.error("删除失败", { description: (e as Error).message })
+    } finally {
+      setDeletingKey(null)
+      setBusyDelete(false)
+    }
+  }
 
   const fetchPage = React.useCallback(
     async (p: number, opts?: { prefix?: string; q?: string }) => {
@@ -181,6 +206,16 @@ export function BucketBrowserSection({
                           <Download className="size-3.5" /> 下载
                         </a>
                       </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title="删除"
+                        onClick={() => handleDelete(obj)}
+                        disabled={busyDelete && deletingKey === obj.key}
+                        className="text-destructive hover:text-destructive"
+                      >
+                        <Trash2 className="size-3.5" /> 删除
+                      </Button>
                     </div>
                   </TableCell>
                 </TableRow>
@@ -234,6 +269,7 @@ export function BucketBrowserSection({
       {uploadOpen && (
         <BucketUploadDialog
           bucket={bucket}
+          bucketLabel={title}
           defaultPrefix={prefix}
           onClose={() => setUploadOpen(false)}
           onDone={() => {
@@ -242,6 +278,8 @@ export function BucketBrowserSection({
           }}
         />
       )}
+
+      {confirmDialog}
     </section>
   )
 }
@@ -254,7 +292,7 @@ function RenameDialog({
   onDone,
 }: {
   obj: BucketObject
-  bucket: "self" | "beijing"
+  bucket: "self" | "beijing" | "bucket2"
   onClose: () => void
   onDone: () => void
 }) {
@@ -333,11 +371,13 @@ function validateKey(value: string): string | null {
 /** 上传到桶 Dialog：选择本地文件 + 输入桶内目标路径（可快捷填入 prefix）。 */
 function BucketUploadDialog({
   bucket,
+  bucketLabel,
   defaultPrefix,
   onClose,
   onDone,
 }: {
-  bucket: "self" | "beijing"
+  bucket: "self" | "beijing" | "bucket2"
+  bucketLabel: string
   defaultPrefix: string
   onClose: () => void
   onDone: () => void
@@ -377,7 +417,7 @@ function BucketUploadDialog({
     <Dialog open onOpenChange={(v) => { if (!v && !busy) onClose() }}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>上传文件到{bucket === "beijing" ? "北京桶" : "自己桶"}</DialogTitle>
+          <DialogTitle>上传文件到{bucketLabel}</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 py-2">
           <div className="space-y-2">
