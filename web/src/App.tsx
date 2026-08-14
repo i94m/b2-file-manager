@@ -6,7 +6,7 @@ import { AuthGuard } from "@/components/auth-guard"
 import { RefreshCw, Search, Moon, Sun } from "lucide-react"
 
 import { type Datasource, type FileItem } from "@/lib/types"
-import { getFiles, getScripts } from "@/lib/api"
+import { getFile, getFiles, getScripts } from "@/lib/api"
 import { useAppInfo } from "@/components/auth-guard"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -27,6 +27,7 @@ import { BucketStatusBadges } from "@/components/bucket-status-badges"
 import { ServerFilesSection } from "@/components/server-files-section"
 import { BucketBrowserSection } from "@/components/bucket-browser-section"
 import { BucketManager } from "@/components/bucket-manager"
+import { DatasourceManager } from "@/components/datasource-manager"
 
 function ThemeToggle() {
   const { resolvedTheme, setTheme } = useTheme()
@@ -73,12 +74,15 @@ function AppShell() {
     return () => clearTimeout(t)
   }, [q])
 
-  // 脚本列表只加载一次
-  React.useEffect(() => {
+  // 数据源列表：初始加载 + 数据源管理变更后刷新
+  const loadScripts = React.useCallback(() => {
     getScripts()
       .then(setScripts)
       .catch((e) => console.error(e))
   }, [])
+  React.useEffect(() => {
+    loadScripts()
+  }, [loadScripts])
 
   // 文件列表：分页 / 状态 / 防抖后的搜索词 变化时加载
   React.useEffect(() => {
@@ -129,35 +133,33 @@ function AppShell() {
     setRefreshing(false)
   }
 
-  // 任务完成时自动静默刷新文件列表（不闪骨架屏）
+  // 任务结束时只更新受影响的行（按 job_id 匹配当前页），不整表刷新
   const { jobs } = useJobs()
   const terminalRef = React.useRef<Set<number>>(new Set())
+  const filesRef = React.useRef(files)
+  filesRef.current = files
   React.useEffect(() => {
-    let hasNew = false
+    const finishedIds = new Set<number>()
     for (const job of Object.values(jobs)) {
       if (["done", "failed", "cancelled", "error"].includes(job.status)) {
         if (!terminalRef.current.has(job.id)) {
           terminalRef.current.add(job.id)
-          hasNew = true
+          finishedIds.add(job.id)
         }
       }
     }
-    if (!hasNew) return
+    if (finishedIds.size === 0) return
+    const affected = filesRef.current.filter(
+      (f) => f.job_id !== null && finishedIds.has(f.job_id),
+    )
+    if (affected.length === 0) return
     const t = setTimeout(() => {
-      getFiles({
-        page,
-        page_size: pageSize,
-        q: debouncedQ || undefined,
-        status: status === "all" ? undefined : status,
+      affected.forEach((f) => {
+        getFile(f.id).then(patchFile).catch((e) => console.error(e))
       })
-        .then((data) => {
-          setFiles(data.items)
-          setTotal(data.total)
-        })
-        .catch((e) => console.error(e))
     }, 500)
     return () => clearTimeout(t)
-  }, [jobs, page, pageSize, debouncedQ, status])
+  }, [jobs, patchFile])
 
   return (
     <div className="min-h-screen bg-background">
@@ -172,6 +174,7 @@ function AppShell() {
           </div>
           <div className="flex items-center gap-2">
             <BucketManager />
+            <DatasourceManager scripts={scripts} onChanged={loadScripts} />
             <ThemeToggle />
           </div>
         </header>
@@ -234,9 +237,14 @@ function AppShell() {
           onFileUpdated={patchFile}
         />
 
-        {/* 文件库 tabs（本地文件 + 各桶）与 任务记录 并列 */}
-        <div className="mt-6 flex flex-col gap-4 xl:flex-row xl:items-start">
-          <Tabs defaultValue="local" className="min-w-0 flex-1">
+        {/* 传输列表（左）与 桶文件管理（右）同行并列，宽度 6:4 */}
+        <div className="mt-6 flex flex-col gap-4 md:flex-row md:items-start">
+          {Object.keys(jobs).length > 0 && (
+            <div className="min-w-0 flex-[6]">
+              <JobsTable />
+            </div>
+          )}
+          <Tabs defaultValue="local" className="min-w-0 flex-[4]">
             <TabsList>
               <TabsTrigger value="local">本地文件</TabsTrigger>
               {buckets.map((b) => (
@@ -262,11 +270,6 @@ function AppShell() {
               </TabsContent>
             ))}
           </Tabs>
-          {Object.keys(jobs).length > 0 && (
-            <div className="min-w-0 flex-1">
-              <JobsTable />
-            </div>
-          )}
         </div>
       </main>
     </div>
@@ -281,7 +284,7 @@ export default function App() {
           <JobsProvider>
             <TooltipProvider>
               <AppShell />
-              <Toaster richColors position="top-right" />
+              <Toaster />
             </TooltipProvider>
           </JobsProvider>
         </BucketsProvider>

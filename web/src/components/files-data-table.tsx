@@ -6,7 +6,7 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Loader2, MoreVertical, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
+import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, ListOrdered, Loader2, MoreVertical, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { type BucketInfo, type Datasource, type FileItem } from "@/lib/types"
@@ -16,6 +16,7 @@ import {
   checkFileExists,
   deleteFile,
   downloadServerFromBucket,
+  getFile,
   pauseJob,
   resumeJob,
   updateFile,
@@ -68,6 +69,7 @@ import {
 } from "@/components/ui/table"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { CopyButton } from "@/components/ui/copy-button"
 
 /** 骨架行各列的宽度类（按 columns 顺序对齐，模拟真实数据宽度）。 */
 function skeletonWidths(bucketCount: number): string[] {
@@ -137,6 +139,16 @@ function StatusText({
     )
   }
   return <span className={cn("text-xs font-medium", color)}>{children}</span>
+}
+
+/** 检测中状态：重新检测在 ⋮ 菜单里触发，菜单随即关闭，需在单元格内展示 loading。 */
+function CheckingText() {
+  return (
+    <span className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground">
+      <Loader2 className="size-3 animate-spin" />
+      检测中…
+    </span>
+  )
 }
 
 /** 单元格内「更多操作」⋮ 菜单（一格有多个操作时收敛于此）。 */
@@ -304,35 +316,28 @@ function useCheckExist(
   return { busy, run }
 }
 
-/** 重新检测文件是否存在的图标按钮（本地 / 任意桶通用，单按钮场景用）。 */
-function CheckExistBtn({
-  fileId,
-  target,
-  onFileUpdated,
-}: {
-  fileId: number
-  target: "local" | number
-  onFileUpdated?: (file: FileItem) => void
-}) {
-  const { busy, run } = useCheckExist(fileId, target, onFileUpdated)
+/** 重新检测文件是否存在的图标按钮（本地 / 任意桶通用；共用单元格的检测状态，检测中时状态文字同步切换）。 */
+function CheckExistBtn({ check }: { check: ReturnType<typeof useCheckExist> }) {
   return (
     <button
       type="button"
-      onClick={run}
-      disabled={busy}
+      onClick={check.run}
+      disabled={check.busy}
       className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
       title="重新检测"
     >
-      {busy ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
+      {check.busy ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
     </button>
   )
 }
 
-/** 排队中黄字 + 取消按钮。 */
+/** 排队中黄字 + 取消按钮；串行（排队执行）任务显示「排队中（串行）」。 */
 function QueuedLabel({ file }: { file: FileItem }) {
+  const { jobs } = useJobs()
+  const job = file.job_id ? jobs[file.job_id] : undefined
   return (
     <div className="flex items-center gap-0.5">
-      <StatusText tone="queued">排队中</StatusText>
+      <StatusText tone="queued">{job?.serial ? "排队中（串行）" : "排队中"}</StatusText>
       <CancelJobBtn file={file} />
     </div>
   )
@@ -373,6 +378,7 @@ function UploadKeyDialog({
   const [history] = React.useState(() => loadDirHistory())
   const [dir, setDir] = React.useState(history[0] ?? "")
   const [filename, setFilename] = React.useState(file.filename ?? "")
+  const [serial, setSerial] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
 
   const dirError = validateDir(dir)
@@ -386,7 +392,7 @@ function UploadKeyDialog({
     const key = cleanDir ? `${cleanDir}/${cleanName}` : cleanName
     setBusy(true)
     try {
-      const r = await uploadFileToBucket(file.id, bucketId, key)
+      const r = await uploadFileToBucket(file.id, bucketId, key, { serial })
       toast.success(r.message)
       if (cleanDir) pushDirHistory(cleanDir)
       onDone()
@@ -453,6 +459,14 @@ function UploadKeyDialog({
               </div>
             </div>
           )}
+          <label className="flex cursor-pointer items-center gap-2 text-sm">
+            <Checkbox
+              checked={serial}
+              onCheckedChange={(v) => setSerial(v === true)}
+              aria-label="排队执行"
+            />
+            排队执行（与其他排队任务按顺序逐个传输）
+          </label>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>
@@ -465,6 +479,19 @@ function UploadKeyDialog({
       </DialogContent>
     </Dialog>
   )
+}
+
+/** 行级刷新：只拉取本行最新数据并 patch，不刷新整表（无 onFileUpdated 时回退整表刷新）。 */
+function refreshFileRow(
+  fileId: number,
+  onUpdated: () => void,
+  onFileUpdated?: (file: FileItem) => void,
+) {
+  if (onFileUpdated) {
+    getFile(fileId).then(onFileUpdated).catch((e) => console.error(e))
+  } else {
+    onUpdated()
+  }
 }
 
 /** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿字 / 否则→未下载+菜单。 */
@@ -485,17 +512,17 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
 
   if (file.local_path) return (
     <div className="flex items-center gap-0.5">
-      <StatusText tone="active">已存在</StatusText>
-      <CheckExistBtn fileId={file.id} target="local" onFileUpdated={onFileUpdated} />
+      {check.busy ? <CheckingText /> : <StatusText tone="active">已存在</StatusText>}
+      <CheckExistBtn check={check} />
     </div>
   )
 
-  const handleDownload = async () => {
+  const handleDownload = async (serial = false) => {
     setBusy(true)
     try {
-      const r = await downloadServerFromBucket(file.id)
+      const r = await downloadServerFromBucket(file.id, undefined, { serial })
       toast.success(r.message)
-      onUpdated()
+      refreshFileRow(file.id, onUpdated, onFileUpdated)
     } catch (e) {
       toast.error("下载失败", { description: (e as Error).message })
     } finally {
@@ -506,10 +533,15 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
   const failed = file.status === "failed"
   return (
     <div className="flex items-center gap-0.5">
-      <StatusText error={failed ? file.error : undefined}>未下载</StatusText>
+      {check.busy ? (
+        <CheckingText />
+      ) : (
+        <StatusText error={failed ? file.error : undefined}>未下载</StatusText>
+      )}
       <CellMenu
         items={[
-          { icon: HardDriveDownload, label: "下载到服务器", onClick: handleDownload, busy },
+          { icon: HardDriveDownload, label: "立即下载", onClick: () => handleDownload(), busy },
+          { icon: ListOrdered, label: "排队下载", onClick: () => handleDownload(true), busy },
           { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
         ]}
       />
@@ -537,12 +569,12 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
 
   const failed = file.status === "failed" && !!file.local_path && !uploaded
 
-  const handleDownload = async () => {
+  const handleDownload = async (serial = false) => {
     setDownloading(true)
     try {
-      const r = await downloadServerFromBucket(file.id, bucket.id)
+      const r = await downloadServerFromBucket(file.id, bucket.id, { serial })
       toast.success(r.message)
-      onUpdated()
+      refreshFileRow(file.id, onUpdated, onFileUpdated)
     } catch (e) {
       toast.error("下载失败", { description: (e as Error).message })
     } finally {
@@ -553,10 +585,11 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
   if (uploaded) {
     return (
       <div className="flex items-center gap-0.5">
-        <StatusText tone="active">已存在</StatusText>
+        {check.busy ? <CheckingText /> : <StatusText tone="active">已存在</StatusText>}
         <CellMenu
           items={[
-            { icon: Download, label: "下载到服务器", onClick: handleDownload, busy: downloading },
+            { icon: Download, label: "立即下载", onClick: () => handleDownload(), busy: downloading },
+            { icon: ListOrdered, label: "排队下载", onClick: () => handleDownload(true), busy: downloading },
             { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
           ]}
         />
@@ -568,7 +601,11 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
     return (
       <>
         <div className="flex items-center gap-0.5">
-          <StatusText error={failed ? file.error : undefined}>未上传</StatusText>
+          {check.busy ? (
+            <CheckingText />
+          ) : (
+            <StatusText error={failed ? file.error : undefined}>未上传</StatusText>
+          )}
           <CellMenu
             items={[
               { icon: CloudUpload, label: "上传", onClick: () => setDialogOpen(true) },
@@ -584,7 +621,7 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
             onClose={() => setDialogOpen(false)}
             onDone={() => {
               setDialogOpen(false)
-              onUpdated()
+              refreshFileRow(file.id, onUpdated, onFileUpdated)
             }}
           />
         )}
@@ -594,8 +631,12 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
 
   return (
     <div className="flex items-center gap-0.5">
-      <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
-      <CheckExistBtn fileId={file.id} target={bucket.id} onFileUpdated={onFileUpdated} />
+      {check.busy ? (
+        <CheckingText />
+      ) : (
+        <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
+      )}
+      <CheckExistBtn check={check} />
     </div>
   )
 }
@@ -657,20 +698,31 @@ export function FilesDataTable({
           header: "文件名称",
           cell: ({ row }) => {
             const f = row.original
-            if (!f.source_url) {
+            if (!f.filename) {
               return <Truncate value={f.filename} />
             }
             return (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="block max-w-[28rem] truncate cursor-default">
-                    {f.filename}
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent className="max-w-sm break-all font-mono text-xs">
-                  {f.source_url}
-                </TooltipContent>
-              </Tooltip>
+              <div className="flex items-center gap-1">
+                {f.source_url ? (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className="block max-w-[26rem] truncate cursor-default">
+                        {f.filename}
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-sm break-all font-mono text-xs">
+                      {f.source_url}
+                    </TooltipContent>
+                  </Tooltip>
+                ) : (
+                  <Truncate value={f.filename} />
+                )}
+                <CopyButton
+                  value={f.filename}
+                  title="复制文件名"
+                  className="size-5 p-0.5 hover:bg-muted"
+                />
+              </div>
             )
           },
         },
@@ -744,6 +796,7 @@ export function FilesDataTable({
   })
 
   const [batchBusy, setBatchBusy] = React.useState(false)
+  const [batchSerial, setBatchSerial] = React.useState(false)
 
   const batchDownload = async () => {
     if (!downloadable.length) {
@@ -751,12 +804,15 @@ export function FilesDataTable({
       return
     }
     setBatchBusy(true)
-    const results = await Promise.allSettled(downloadable.map((f) => downloadServerFromBucket(f.id)))
+    const results = await Promise.allSettled(
+      downloadable.map((f) => downloadServerFromBucket(f.id, undefined, { serial: batchSerial })),
+    )
     const ok = results.filter((r) => r.status === "fulfilled").length
-    toast.success(`已入队 ${ok} 个下载任务`)
+    toast.success(`已入队 ${ok} 个下载任务${batchSerial ? "（串行执行）" : ""}`)
     setRowSelection({})
     setBatchBusy(false)
-    onDeleted()
+    // 行级更新：只刷新受影响的行
+    downloadable.forEach((f) => refreshFileRow(f.id, onDeleted, onFileUpdated))
   }
 
   const batchUploadTo = async (bucket: BucketInfo) => {
@@ -766,12 +822,15 @@ export function FilesDataTable({
       return
     }
     setBatchBusy(true)
-    const results = await Promise.allSettled(uploadable.map((f) => uploadFileToBucket(f.id, bucket.id)))
+    const results = await Promise.allSettled(
+      uploadable.map((f) => uploadFileToBucket(f.id, bucket.id, undefined, { serial: batchSerial })),
+    )
     const ok = results.filter((r) => r.status === "fulfilled").length
-    toast.success(`已入队 ${ok} 个上传任务`)
+    toast.success(`已入队 ${ok} 个上传任务${batchSerial ? "（串行执行）" : ""}`)
     setRowSelection({})
     setBatchBusy(false)
-    onDeleted()
+    // 行级更新：只刷新受影响的行
+    uploadable.forEach((f) => refreshFileRow(f.id, onDeleted, onFileUpdated))
   }
 
   const skelWidths = skeletonWidths(buckets.length)
@@ -782,9 +841,20 @@ export function FilesDataTable({
       {selectedFiles.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/50 px-4 py-2">
           <span className="text-sm font-medium">已选 {selectedFiles.length} 项</span>
+          <label
+            className="flex cursor-pointer items-center gap-1.5 text-sm text-muted-foreground"
+            title="排队任务之间严格按提交顺序逐个传输，可与正在执行的并行任务同时进行"
+          >
+            <Checkbox
+              checked={batchSerial}
+              onCheckedChange={(v) => setBatchSerial(v === true)}
+              aria-label="排队执行"
+            />
+            排队执行
+          </label>
           <Button size="sm" variant="outline" onClick={batchDownload} disabled={batchBusy}>
             <HardDriveDownload className="size-3.5" />
-            批量下载到服务器{downloadable.length > 0 && `（${downloadable.length}）`}
+            批量下载到服务器{downloadable.length > 0 && `（${downloadable.length}）`}{batchSerial && "（排队）"}
           </Button>
           {buckets.map((bucket) => {
             const uploadable = uploadableByBucket.get(bucket.id) ?? []
@@ -798,7 +868,7 @@ export function FilesDataTable({
                 title={uploadable.length === 0 ? "需先下载到服务器" : undefined}
               >
                 <CloudUpload className="size-3.5" />
-                批量上传到{bucket.name}{uploadable.length > 0 && `（${uploadable.length}）`}
+                批量上传到{bucket.name}{uploadable.length > 0 && `（${uploadable.length}）`}{batchSerial && "（排队）"}
               </Button>
             )
           })}
@@ -813,7 +883,14 @@ export function FilesDataTable({
             {table.getHeaderGroups().map((hg) => (
               <TableRow key={hg.id}>
                 {hg.headers.map((header) => (
-                  <TableHead key={header.id}>
+                  <TableHead
+                    key={header.id}
+                    className={
+                      header.column.id === "actions"
+                        ? "sticky right-0 z-10 bg-background shadow-[-1px_0_0_0_var(--border)]"
+                        : undefined
+                    }
+                  >
                     {header.isPlaceholder
                       ? null
                       : flexRender(header.column.columnDef.header, header.getContext())}
@@ -841,9 +918,16 @@ export function FilesDataTable({
               ))
             ) : table.getRowModel().rows.length ? (
               table.getRowModel().rows.map((row) => (
-                <TableRow key={row.id}>
+                <TableRow key={row.id} className="group">
                   {row.getVisibleCells().map((cell) => (
-                    <TableCell key={cell.id}>
+                    <TableCell
+                      key={cell.id}
+                      className={
+                        cell.column.id === "actions"
+                          ? "sticky right-0 z-10 bg-background group-hover:bg-muted/50 shadow-[-1px_0_0_0_var(--border)]"
+                          : undefined
+                      }
+                    >
                       {flexRender(cell.column.columnDef.cell, cell.getContext())}
                     </TableCell>
                   ))}
@@ -892,8 +976,9 @@ export function FilesDataTable({
           scripts={scripts}
           onClose={() => setEditingFile(null)}
           onSaved={() => {
+            const edited = editingFile
             setEditingFile(null)
-            onDeleted()
+            refreshFileRow(edited.id, onDeleted, onFileUpdated)
           }}
         />
       )}

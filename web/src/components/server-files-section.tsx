@@ -91,9 +91,12 @@ export function ServerFilesSection({
             {files.length} 个 · 共 {formatBytes(totalSize)}
           </Badge>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           {root && (
-            <code className="hidden max-w-[40ch] truncate font-mono text-xs text-muted-foreground sm:inline">
+            <code
+              title={root}
+              className="hidden min-w-0 max-w-[24ch] shrink truncate font-mono text-xs text-muted-foreground sm:inline"
+            >
               {root}
             </code>
           )}

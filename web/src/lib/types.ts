@@ -78,6 +78,14 @@ export interface Datasource {
   updated_at: number
 }
 
+/** 上传/下载两条并行道的并发上限（GET/POST /api/concurrency）。 */
+export interface ConcurrencyInfo {
+  upload: number
+  download: number
+  /** 可调最大值（MAX_CONCURRENCY）。 */
+  max: number
+}
+
 /** GET / 根路由的引导信息。 */
 export interface AppInfo {
   app: string
@@ -85,6 +93,8 @@ export interface AppInfo {
   default_prefix: string
   bucket_private: boolean | null
   bucket_private_note: string
+  /** 并行道并发上限（顶部下拉框数据源）。 */
+  concurrency: ConcurrencyInfo
   /** 旧字段从 buckets 表派生（后端保留，机器人兼容）。 */
   beijing_enabled: boolean
   beijing_bucket: string
@@ -138,6 +148,8 @@ export interface JobUpdate {
   finished_at: number | null
   cancelled: boolean
   paused: boolean
+  /** 串行（排队执行）任务：与其他串行任务按提交顺序逐个传输。 */
+  serial: boolean
   bucket_id: number | null
   bucket_name: string | null
 }

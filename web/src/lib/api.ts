@@ -66,10 +66,56 @@ export async function getFiles(params: {
   return handle<FilesResponse>(res)
 }
 
+/** GET /api/files/:id — 单个文件记录（行级刷新，结构与列表项一致）。 */
+export async function getFile(fileId: number): Promise<FileItem> {
+  const res = await fetch(`/api/files/${fileId}`, { headers: headers() })
+  return handle<FileItem>(res)
+}
+
 /** GET /api/scripts — 数据源列表（id→名称映射）。 */
 export async function getScripts(): Promise<Datasource[]> {
   const res = await fetch("/api/scripts", { headers: headers() })
   return handle<Datasource[]>(res)
+}
+
+/** POST /api/scripts — 新增数据源（name 必填；script_path / description 可选）。 */
+export async function createScript(data: {
+  name: string
+  script_path?: string
+  description?: string
+}): Promise<FormResult & { datasource_id: number }> {
+  const res = await fetch("/api/scripts", {
+    method: "POST",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  })
+  return handle(res)
+}
+
+/** PATCH /api/scripts/:id — 编辑数据源（子集更新；可选字段空串即清空）。 */
+export async function updateScript(
+  datasourceId: number,
+  data: {
+    name?: string
+    script_path?: string
+    description?: string
+  },
+): Promise<FormResult & { datasource_id: number }> {
+  const res = await fetch(`/api/scripts/${datasourceId}`, {
+    method: "PATCH",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  })
+  return handle(res)
+}
+
+/** DELETE /api/scripts/:id — 删除数据源（关联文件的 datasource_id 置空）。 */
+export async function deleteScript(datasourceId: number): Promise<FormResult & { datasource_id: number }> {
+  const res = await fetch(`/api/scripts/${datasourceId}`, {
+    method: "DELETE",
+    headers: headers(true),
+  })
+  return handle(res)
 }
 
 // ---------------------------------------------------------------------------
@@ -195,16 +241,21 @@ export async function urlUpload(
   return handle<FormResult>(res)
 }
 
-/** POST /api/files/:id/upload — 上传服务器本地文件到指定桶（可指定自定义 key）。 */
+/** POST /api/files/:id/upload — 上传服务器本地文件到指定桶（可指定自定义 key / 排队串行执行）。 */
 export async function uploadFileToBucket(
   fileId: number,
   bucket: BucketRef,
   key?: string,
+  opts: { serial?: boolean } = {},
 ): Promise<FormResult> {
   const res = await fetch(`/api/files/${fileId}/upload`, {
     method: "POST",
     headers: { ...headers(), "Content-Type": "application/json" },
-    body: JSON.stringify({ bucket_id: bucket, ...(key ? { key } : {}) }),
+    body: JSON.stringify({
+      bucket_id: bucket,
+      ...(key ? { key } : {}),
+      ...(opts.serial ? { serial: true } : {}),
+    }),
   })
   return handle<FormResult>(res)
 }
@@ -242,15 +293,19 @@ export async function resumeJob(
   return handle(res)
 }
 
-/** POST /api/files/:id/download-server — 下载对象到服务器（指定桶；缺省=默认桶/URL 兜底）。 */
+/** POST /api/files/:id/download-server — 下载对象到服务器（指定桶；缺省=默认桶/URL 兜底；可排队串行执行）。 */
 export async function downloadServerFromBucket(
   fileId: number,
   bucket?: BucketRef,
+  opts: { serial?: boolean } = {},
 ): Promise<FormResult> {
   const res = await fetch(`/api/files/${fileId}/download-server`, {
     method: "POST",
     headers: { ...headers(), "Content-Type": "application/json" },
-    body: JSON.stringify(bucket !== undefined ? { bucket_id: bucket } : {}),
+    body: JSON.stringify({
+      ...(bucket !== undefined ? { bucket_id: bucket } : {}),
+      ...(opts.serial ? { serial: true } : {}),
+    }),
   })
   return handle<FormResult>(res)
 }

@@ -49,8 +49,53 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "tmp_uploads"
 MAX_JOBS_SHOWN = 50
 DEFAULT_REGION = "us-east-1"
-JOB_QUEUE: queue.Queue[int] = queue.Queue()
+# 上传/下载两条并行队列：互不冲突（各自独立 worker 池，互不占用对方名额）
+UPLOAD_QUEUE: queue.Queue[int] = queue.Queue()
+DOWNLOAD_QUEUE: queue.Queue[int] = queue.Queue()
+# 串行队列（「排队执行」）：同一时刻只跑一个、按提交顺序接续，可与并行道同时传输
+SERIAL_QUEUE: queue.Queue[int] = queue.Queue()
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "3"))
+# 并行道并发上限的可调最大值（顶部下拉框范围；每条道固定起这么多个 worker 线程）
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "8"))
+
+
+class DynamicGate:
+    """可动态调整上限的并发闸门：worker 取到任务后先领名额，超过上限则等待。
+
+    调小上限不影响已在传输的任务（新任务等待）；调大后等待中的 worker 立即被唤醒。
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._cond = threading.Condition()
+        self._limit = max(1, int(limit))
+        self._active = 0
+
+    def acquire(self) -> None:
+        with self._cond:
+            while self._active >= self._limit:
+                self._cond.wait()
+            self._active += 1
+
+    def release(self) -> None:
+        with self._cond:
+            self._active -= 1
+            self._cond.notify()
+
+    def set_limit(self, limit: int) -> int:
+        with self._cond:
+            self._limit = max(1, int(limit))
+            self._cond.notify_all()
+            return self._limit
+
+    @property
+    def limit(self) -> int:
+        with self._cond:
+            return self._limit
+
+
+# 两条并行道的并发闸门（上限可在运行时通过 /api/concurrency 调整并持久化）
+UPLOAD_GATE = DynamicGate(MAX_WORKERS)
+DOWNLOAD_GATE = DynamicGate(MAX_WORKERS)
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -374,7 +419,8 @@ def init_db() -> None:
                 finished_at DOUBLE,
                 note TEXT,
                 cancelled TINYINT NOT NULL DEFAULT 0,
-                paused TINYINT NOT NULL DEFAULT 0
+                paused TINYINT NOT NULL DEFAULT 0,
+                serial TINYINT NOT NULL DEFAULT 0
             )
             """
         )
@@ -387,6 +433,7 @@ def init_db() -> None:
             ("note", "TEXT"),
             ("cancelled", "TINYINT NOT NULL DEFAULT 0"),
             ("paused", "TINYINT NOT NULL DEFAULT 0"),
+            ("serial", "TINYINT NOT NULL DEFAULT 0"),
             ("bucket_id", "INT"),
         ):
             if name not in columns:
@@ -403,6 +450,15 @@ def init_db() -> None:
                 description TEXT,
                 created_at DOUBLE NOT NULL,
                 updated_at DOUBLE NOT NULL
+            )
+            """
+        )
+        # 通用 KV 设置表（如并发上限等运行时可调配置）
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                k VARCHAR(64) PRIMARY KEY,
+                v VARCHAR(255) NOT NULL
             )
             """
         )
@@ -584,6 +640,22 @@ def init_db() -> None:
         )
 
 
+def get_setting(key: str, default: str | None = None) -> str | None:
+    """读 KV 设置（settings 表），不存在返回 default。"""
+    with get_db() as conn:
+        row = conn.execute("SELECT v FROM settings WHERE k=?", (key,)).fetchone()
+    return row["v"] if row is not None else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO settings (k, v) VALUES (?, ?) "
+            "ON DUPLICATE KEY UPDATE v=VALUES(v)",
+            (key, value),
+        )
+
+
 def recent_jobs(limit: int = MAX_JOBS_SHOWN) -> list[dict]:
     with get_db() as conn:
         rows = conn.execute(
@@ -601,12 +673,13 @@ def insert_job(
     source: str | None = None,
     destination: str | None = None,
     bucket_id: int | None = None,
+    serial: bool = False,
 ) -> int:
     with get_db() as conn:
         cursor = conn.execute(
-            "INSERT INTO jobs (kind, filename, object_key, source, destination, size, bucket_id, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
-            (kind, filename, object_key, source, destination, size, bucket_id, time.time()),
+            "INSERT INTO jobs (kind, filename, object_key, source, destination, size, bucket_id, serial, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+            (kind, filename, object_key, source, destination, size, bucket_id, int(serial), time.time()),
         )
         return cursor.lastrowid
 
@@ -681,6 +754,7 @@ def job_payload(job: dict) -> dict:
         "finished_at": job.get("finished_at"),
         "cancelled": bool(job.get("cancelled", 0)),
         "paused": bool(job.get("paused", 0)),
+        "serial": bool(job.get("serial", 0)),
         "bucket_id": job.get("bucket_id"),
         "bucket_name": _bucket_display_name(job.get("bucket_id")),
     }
@@ -1169,9 +1243,21 @@ def process_job(job_id: int) -> None:
         clear_pause(job_id)
 
 
-def worker_loop() -> None:
+def enqueue_job(job_id: int, kind: str, serial: bool = False) -> None:
+    """按任务模式分流入队：serial → 串行道；否则 upload → 上传道，download/fetch → 下载道。"""
+    if serial:
+        SERIAL_QUEUE.put(job_id)
+    elif kind == "upload":
+        UPLOAD_QUEUE.put(job_id)
+    else:
+        DOWNLOAD_QUEUE.put(job_id)
+
+
+def worker_loop(q: queue.Queue[int], gate: DynamicGate | None = None) -> None:
     while True:
-        job_id = JOB_QUEUE.get()
+        job_id = q.get()
+        if gate is not None:
+            gate.acquire()
         try:
             process_job(job_id)
         except Exception as exc:  # 兜底：未预期异常也标记失败，避免任务卡死
@@ -1180,6 +1266,9 @@ def worker_loop() -> None:
                     "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
                     (f"内部错误（{exc}），请重试", time.time(), job_id),
                 )
+        finally:
+            if gate is not None:
+                gate.release()
 
 
 def recover_jobs() -> None:
@@ -1197,9 +1286,11 @@ def recover_jobs() -> None:
                 "finished_at=? WHERE id=?",
                 (time.time(), row["id"]),
             )
-        pending = conn.execute("SELECT id FROM jobs WHERE status='queued' ORDER BY id").fetchall()
+        pending = conn.execute(
+            "SELECT id, kind, serial FROM jobs WHERE status='queued' ORDER BY id"
+        ).fetchall()
     for row in pending:
-        JOB_QUEUE.put(row["id"])
+        enqueue_job(row["id"], row["kind"], bool(row["serial"]))
 
 
 def cleanup_stale_multipart(max_age_hours: float = 24.0, client=None, bucket_name: str | None = None) -> None:
@@ -1588,7 +1679,7 @@ def upload():
         incoming.unlink(missing_ok=True)
         return respond("error", f"接收文件失败: {exc}", apikey, "error", 500)
 
-    JOB_QUEUE.put(job_id)
+    enqueue_job(job_id, "upload")
     emit_job_update(job_id)
     return respond(
         "ok", f"「{filename}」已加入上传队列（{format_bytes(size)}）。", apikey,
@@ -1643,7 +1734,7 @@ def server_upload():
         size=size,
         datasource_id=datasource_id,
     )
-    JOB_QUEUE.put(job_id)
+    enqueue_job(job_id, "upload")
     emit_job_update(job_id)
     return respond(
         "ok", f"「{source}」已加入上传队列（{format_bytes(size)}）。", apikey,
@@ -1708,7 +1799,7 @@ def server_download():
         destination=str(destination),
         bucket_id=bucket_row["id"],
     )
-    JOB_QUEUE.put(job_id)
+    enqueue_job(job_id, "download")
     emit_job_update(job_id)
     return respond(
         "ok", f"「{key}」下载到 {destination} 的任务已加入队列。", apikey,
@@ -1826,7 +1917,7 @@ def url_upload():
             source=url,
             destination=str(destination),
         )
-        JOB_QUEUE.put(job_id)
+        enqueue_job(job_id, "fetch")
         emit_job_update(job_id)
         return respond(
             "ok", f"「{url}」下载到 {destination} 的任务已加入队列。", apikey,
@@ -1890,6 +1981,7 @@ def _do_file_upload(file_id: int, bucket_param) -> tuple:
     body = request.get_json(silent=True) or {}
     custom_key = (body.get("key") or "").strip().lstrip("/")
     object_key = custom_key or f["object_key"]
+    serial = bool(body.get("serial"))
 
     filename = f["filename"] or "download"
     job_id = insert_job(
@@ -1899,17 +1991,22 @@ def _do_file_upload(file_id: int, bucket_param) -> tuple:
         size=f.get("size") or 0,
         source=str(source),
         bucket_id=bucket_row["id"],
+        serial=serial,
     )
     with get_db() as conn:
         conn.execute(
             "UPDATE files SET job_id=?, object_key=?, updated_at=? WHERE id=?",
             (job_id, object_key, time.time(), file_id),
         )
-    JOB_QUEUE.put(job_id)
+    enqueue_job(job_id, "upload", serial)
     emit_job_update(job_id)
     return jsonify({
         "status": "ok",
-        "message": f"「{filename}」上传到{bucket_row['name']}的任务已加入队列。",
+        "message": (
+            f"「{filename}」上传到{bucket_row['name']}的任务已加入排队（串行执行）。"
+            if serial
+            else f"「{filename}」上传到{bucket_row['name']}的任务已加入队列。"
+        ),
         "job_id": job_id,
         "file_id": file_id,
     })
@@ -1943,7 +2040,7 @@ def api_file_upload_bucket2(file_id: int):
     return _do_file_upload(file_id, "bucket2")
 
 
-def _do_file_download_server(file_id: int, bucket_param) -> tuple:
+def _do_file_download_server(file_id: int, bucket_param, serial: bool = False) -> tuple:
     """统一实现：下载文件到服务器 SERVER_FILE_ROOT（保留原始文件名）。
 
     - 显式指定桶（bucket_param 为 id/legacy）：必须已上传到该桶 → 从该桶下载。
@@ -2015,6 +2112,7 @@ def _do_file_download_server(file_id: int, bucket_param) -> tuple:
             size=size,
             destination=str(destination),
             bucket_id=bucket_row["id"],
+            serial=serial,
         )
     elif f.get("source_url"):
         # URL → server
@@ -2025,17 +2123,22 @@ def _do_file_download_server(file_id: int, bucket_param) -> tuple:
             size=0,
             source=f["source_url"],
             destination=str(destination),
+            serial=serial,
         )
     else:
         return jsonify({"error": "无可下载来源（既不在桶也无来源链接）"}), 400
 
     with get_db() as conn:
         conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
-    JOB_QUEUE.put(job_id)
+    enqueue_job(job_id, "download" if bucket_row is not None else "fetch", serial)
     emit_job_update(job_id)
     return jsonify({
         "status": "ok",
-        "message": f"「{filename}」下载到服务器 {destination} 的任务已加入队列。",
+        "message": (
+            f"「{filename}」下载到服务器 {destination} 的任务已加入排队（串行执行）。"
+            if serial
+            else f"「{filename}」下载到服务器 {destination} 的任务已加入队列。"
+        ),
         "job_id": job_id,
         "file_id": file_id,
     })
@@ -2045,11 +2148,12 @@ def _do_file_download_server(file_id: int, bucket_param) -> tuple:
 def api_file_download_server(file_id: int):
     """下载文件到服务器。
 
-    请求体 JSON：{"bucket_id": <桶 id 或 legacy 别名，可选>}。
+    请求体 JSON：{"bucket_id": <桶 id 或 legacy 别名，可选>, "serial": <bool，可选>}。
     缺省时默认桶已上传则从默认桶下载，否则回退 source_url。
+    serial=true 时进串行队列（一次只跑一个，按提交顺序接续）。
     """
     body = request.get_json(silent=True) or {}
-    return _do_file_download_server(file_id, body.get("bucket_id"))
+    return _do_file_download_server(file_id, body.get("bucket_id"), bool(body.get("serial")))
 
 
 @app.post("/api/files/<int:file_id>/download-server-beijing")
@@ -2106,7 +2210,8 @@ def api_file_check(file_id: int):
         else:
             filename = f.get("filename") or ""
             if not filename:
-                return jsonify({"target": "local", "exists": False, "file": f})
+                with get_db() as conn:
+                    return jsonify({"target": "local", "exists": False, "file": _file_item(conn, row)})
             path = (root / filename).resolve()
 
         exists = path.is_file()
@@ -2134,7 +2239,7 @@ def api_file_check(file_id: int):
                     (now, file_id),
                 )
             row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-        f = dict(row)
+            f = _file_item(conn, row)
         return jsonify({"target": "local", "exists": exists, "file": f})
 
     # 桶分支统一：target 为桶 id 或 legacy 别名（'cloud'/'self'→默认桶）
@@ -2189,7 +2294,7 @@ def api_file_check(file_id: int):
                         (now, file_id),
                     )
             row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
-        f = dict(row)
+            f = _file_item(conn, row)
         return jsonify({"target": target, "exists": exists, "file": f})
 
     return jsonify({"error": f"无效的 target: {target}（可选 local / 桶 id / cloud / beijing / bucket2）"}), 400
@@ -2270,7 +2375,7 @@ def download():
 
 @app.post("/api/submit")
 def api_submit():
-    """提交 URL 自动下载并上传到 bucket（支持单个/批量）。
+    """登记 URL 文件记录（支持单个/批量），可选是否自动下载到服务器本地。
 
     请求头认证：
         X-API-Key: <key>          或
@@ -2280,14 +2385,21 @@ def api_submit():
     {
         "urls": ["https://...", "https://..."],   // 必填，1~50 个链接
         "prefix": "backups/2026",                 // 可选，对象 key 前缀
-        "bucket": <桶 id 或 legacy 别名>           // 可选，目标桶（默认桶）
+        "bucket": <桶 id 或 legacy 别名>,          // 可选，目标桶（默认桶）
+        "download": "none" | "now" | "serial"     // 可选，登记后的动作（默认 none）
     }
+
+    download 取值：
+        "none"   只登记记录，不触发下载（默认；上传到桶由文件列表页手动触发）
+        "now"    立即下载到服务器本地（进入下载并行道，有空闲额度立刻开始）
+        "serial" 放入排队（串行道，与其他排队任务按提交顺序逐个传输）
 
     返回（200 或 400）：
     {
         "submitted": 2,
         "jobs": [
-            {"url": "https://...", "job_id": 5, "object_key": "abc123.zip", "status": "queued"},
+            {"url": "https://...", "file_id": 3, "job_id": 5, "object_key": "abc123.zip", "status": "queued"},
+            {"url": "https://...", "file_id": 4, "job_id": null, "object_key": "x.zip", "status": "registered"},
             ...
         ],
         "errors": [
@@ -2328,6 +2440,18 @@ def api_submit():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    # 登记后的动作：none=只登记（默认）/ now=立即下载到本地（下载并行道）/ serial=排队串行执行
+    download_mode = str(body.get("download") or "none").strip().lower()
+    if download_mode not in ("none", "now", "serial", "queue"):
+        return jsonify({"error": "download 取值：none（默认，不下载）/ now（立即下载到本地）/ serial（放入排队）"}), 400
+    serial = download_mode in ("serial", "queue")
+    root = None
+    if download_mode != "none":
+        root = server_root()
+        if root is None:
+            return jsonify({"error": "未配置 SERVER_FILE_ROOT，无法下载到服务器本地"}), 400
+        root.mkdir(parents=True, exist_ok=True)
+
     submitted: list[dict] = []
     errors: list[dict] = []
 
@@ -2342,29 +2466,35 @@ def api_submit():
         if object_exists(entry["client"], entry["bucket_name"], object_key):
             errors.append({"url": url, "error": f"同名文件已存在：{object_key}"})
             continue
-        job_id = insert_job(
-            kind="fetch",
-            filename=filename,
-            object_key=object_key,
-            size=0,
-            source=url,
-            bucket_id=bucket_row["id"],
-        )
-        insert_file_pending(
+        job_id = None
+        if root is not None:
+            # URL → 服务器本地（fetch）：now 进下载并行道、serial 进串行道
+            job_id = insert_job(
+                kind="fetch",
+                filename=filename,
+                object_key=object_key,
+                size=0,
+                source=url,
+                destination=str(root / filename),
+                serial=serial,
+            )
+        file_id = insert_file_pending(
             job_id=job_id,
             object_key=object_key,
             filename=filename,
             size=0,
             source_url=url,
         )
-        JOB_QUEUE.put(job_id)
-        emit_job_update(job_id)
+        if job_id is not None:
+            enqueue_job(job_id, "fetch", serial)
+            emit_job_update(job_id)
         submitted.append({
             "url": url,
+            "file_id": file_id,
             "job_id": job_id,
             "object_key": object_key,
             "filename": filename,
-            "status": "queued",
+            "status": "queued" if job_id is not None else "registered",
         })
 
     return jsonify({
@@ -2536,9 +2666,61 @@ def api_job_resume(job_id: int):
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     job = dict(row)
     if job["status"] == "queued":
-        JOB_QUEUE.put(job_id)
+        enqueue_job(job_id, job["kind"], bool(job.get("serial")))
     emit_job_update(job_id)
     return jsonify({"status": "ok", "message": "已恢复", "job": job_payload(job)})
+
+
+def concurrency_payload() -> dict:
+    return {
+        "upload": UPLOAD_GATE.limit,
+        "download": DOWNLOAD_GATE.limit,
+        "max": MAX_CONCURRENCY,
+    }
+
+
+@app.get("/api/concurrency")
+def api_concurrency_get():
+    """查询上传/下载两条并行道的当前并发上限。"""
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    return jsonify(concurrency_payload())
+
+
+@app.post("/api/concurrency")
+def api_concurrency_set():
+    """运行时调整上传/下载并行道的并发上限（立即生效，持久化到 settings 表）。
+
+    请求体 JSON：{"upload": 1~max, "download": 1~max}（至少一个字段）。
+    调小不影响已在传输的任务，只是新任务开始等待；串行道固定单并发，不受此参数控制。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    body = request.get_json(silent=True) or {}
+    updates: dict[str, int] = {}
+    for lane in ("upload", "download"):
+        if body.get(lane) is None:
+            continue
+        try:
+            value = int(body[lane])
+        except (TypeError, ValueError):
+            return jsonify({"error": f"{lane} 必须是整数"}), 400
+        if not 1 <= value <= MAX_CONCURRENCY:
+            return jsonify({"error": f"{lane} 取值范围 1~{MAX_CONCURRENCY}"}), 400
+        updates[lane] = value
+    if not updates:
+        return jsonify({"error": "请提供 upload 或 download 字段"}), 400
+    if "upload" in updates:
+        UPLOAD_GATE.set_limit(updates["upload"])
+        set_setting("upload_workers", str(updates["upload"]))
+    if "download" in updates:
+        DOWNLOAD_GATE.set_limit(updates["download"])
+        set_setting("download_workers", str(updates["download"]))
+    return jsonify({
+        "status": "ok",
+        "message": f"并发已调整：上传 {UPLOAD_GATE.limit} · 下载 {DOWNLOAD_GATE.limit}",
+        **concurrency_payload(),
+    })
 
 
 @app.get("/api/auth")
@@ -2561,6 +2743,7 @@ def api_auth():
         "default_prefix": default_prefix(),
         "bucket_private": BUCKET_PRIVATE,
         "bucket_private_note": BUCKET_PRIVATE_NOTE,
+        "concurrency": concurrency_payload(),
         # 旧字段保留（从 buckets 表派生，旧前端/机器人可用）
         "beijing_enabled": bool(beijing and beijing["enabled"]),
         "beijing_bucket": beijing["bucket_name"] if beijing else "",
@@ -2620,6 +2803,17 @@ def api_bucket_health():
             "health": health,
         })
     return jsonify(result)
+
+
+def _file_item(conn, row) -> dict:
+    """files 行 → 前端 FileItem（补 uploaded_bucket_ids 派生字段，单行端点共用）。"""
+    d = dict(row)
+    d["uploaded_bucket_ids"] = [
+        u["bucket_id"] for u in conn.execute(
+            "SELECT bucket_id FROM file_uploads WHERE file_id=?", (d["id"],)
+        ).fetchall()
+    ]
+    return d
 
 
 @app.get("/api/files")
@@ -2695,12 +2889,98 @@ def api_files():
     })
 
 
+@app.get("/api/files/<int:file_id>")
+def api_file_get(file_id: int):
+    """查询单个文件记录（前端行级刷新用，返回结构与列表项一致）。"""
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
+        item = _file_item(conn, row)
+    return jsonify(item)
+
+
 @app.get("/api/scripts")
 def api_scripts():
     """数据源列表（供文件表格「数据源」列做 id→名称映射）。"""
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
     return jsonify(recent_scripts())
+
+
+@app.post("/api/scripts")
+def api_create_script():
+    """新增数据源（JSON：name 必填；script_path / description 可选）。"""
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "数据源名称必填"}), 400
+    script_path = (body.get("script_path") or "").strip()
+    description = (body.get("description") or "").strip()
+    now = time.time()
+    with get_db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO datasources (name, script_path, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (name, script_path or None, description or None, now, now),
+        )
+        datasource_id = cursor.lastrowid
+    return jsonify({
+        "status": "ok",
+        "message": f"数据源「{name}」已添加。",
+        "datasource_id": datasource_id,
+    }), 201
+
+
+@app.patch("/api/scripts/<int:datasource_id>")
+def api_update_script(datasource_id: int):
+    """编辑数据源（子集更新：name / script_path / description；可选字段空串即清空）。"""
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    body = request.get_json(silent=True) or {}
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM datasources WHERE id=?", (datasource_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": f"数据源 {datasource_id} 不存在"}), 404
+        sets: list[str] = []
+        values: list = []
+        name = (body.get("name") or "").strip()
+        if name:
+            sets.append("name=?")
+            values.append(name)
+        for field in ("script_path", "description"):
+            if field in body:
+                val = (body.get(field) or "").strip()
+                sets.append(f"{field}=?")
+                values.append(val or None)
+        if not sets:
+            return jsonify({"error": "没有可更新的字段"}), 400
+        sets.append("updated_at=?")
+        values.append(time.time())
+        values.append(datasource_id)
+        conn.execute(f"UPDATE datasources SET {', '.join(sets)} WHERE id=?", values)
+    return jsonify({"status": "ok", "message": "数据源已更新。", "datasource_id": datasource_id})
+
+
+@app.delete("/api/scripts/<int:datasource_id>")
+def api_delete_script(datasource_id: int):
+    """删除数据源，同时解除 files 的关联。"""
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM datasources WHERE id=?", (datasource_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": f"数据源 {datasource_id} 不存在"}), 404
+        conn.execute("DELETE FROM datasources WHERE id=?", (datasource_id,))
+        conn.execute("UPDATE files SET datasource_id=NULL WHERE datasource_id=?", (datasource_id,))
+    return jsonify({
+        "status": "ok",
+        "message": f"数据源「{row['name']}」已删除。",
+        "datasource_id": datasource_id,
+    })
 
 
 def _bucket_public_row(b: dict) -> dict:
@@ -3131,9 +3411,9 @@ def api_update_file(file_id: int):
                     apply_upload_flag(conn, file_id, bucket_map[bid], False)
         for bucket_row, value in legacy_updates:
             apply_upload_flag(conn, file_id, bucket_row, value)
-        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        item = _file_item(conn, row)
 
-    return jsonify({"status": "ok", "file_id": file_id, "file": dict(row)})
+    return jsonify({"status": "ok", "file_id": file_id, "file": item})
 
 
 @app.get("/api/objects")
@@ -3255,8 +3535,29 @@ def init_runtime() -> None:
             "⚠️ 未配置任何桶，请通过 POST /api/buckets（或页面「桶管理」）添加",
             file=sys.stderr,
         )
-    for i in range(max(1, MAX_WORKERS)):
-        threading.Thread(target=worker_loop, name=f"worker-{i}", daemon=True).start()
+    # 并发上限：优先读 settings 表（页面下拉框调整后持久化），缺省 MAX_WORKERS
+    def _limit_from_setting(key: str) -> int:
+        raw = get_setting(key)
+        try:
+            return max(1, min(int(raw), MAX_CONCURRENCY)) if raw else MAX_WORKERS
+        except (TypeError, ValueError):
+            return MAX_WORKERS
+
+    UPLOAD_GATE.set_limit(_limit_from_setting("upload_workers"))
+    DOWNLOAD_GATE.set_limit(_limit_from_setting("download_workers"))
+    # 上传/下载两条并行道：各起 MAX_CONCURRENCY 个 worker 线程，
+    # 实际并发由各自的闸门上限控制（运行时可通过 /api/concurrency 调整）
+    for i in range(MAX_CONCURRENCY):
+        threading.Thread(
+            target=worker_loop, args=(UPLOAD_QUEUE, UPLOAD_GATE),
+            name=f"upload-worker-{i}", daemon=True,
+        ).start()
+        threading.Thread(
+            target=worker_loop, args=(DOWNLOAD_QUEUE, DOWNLOAD_GATE),
+            name=f"download-worker-{i}", daemon=True,
+        ).start()
+    # 串行道 worker：单线程逐个处理排队任务（串行道活跃时总并发 = 上传上限 + 下载上限 + 1）
+    threading.Thread(target=worker_loop, args=(SERIAL_QUEUE, None), name="serial-worker", daemon=True).start()
 
     global BUCKET_PRIVATE, BUCKET_PRIVATE_NOTE
     BUCKET_PRIVATE, BUCKET_PRIVATE_NOTE = check_bucket_private()
