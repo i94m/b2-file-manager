@@ -6,7 +6,7 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, ListOrdered, Loader2, MoreVertical, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
+import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Info, ListOrdered, Loader2, MoreVertical, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { type BucketInfo, type Datasource, type FileItem } from "@/lib/types"
@@ -21,8 +21,10 @@ import {
   resumeJob,
   updateFile,
   uploadFileToBucket,
+  type FileUpdateData,
 } from "@/lib/api"
 import { useJobs } from "@/lib/use-jobs"
+import { useBuckets } from "@/lib/use-buckets"
 import { useConfirm } from "@/lib/use-confirm"
 import { JobProgressBadge } from "@/components/progress-cell"
 import { Button } from "@/components/ui/button"
@@ -76,6 +78,8 @@ function skeletonWidths(bucketCount: number): string[] {
   const widths = [
     "w-4",    // select
     "w-16",   // 数据源
+    "w-28",   // 下载源
+    "w-24",   // 目录
     "w-28",   // 文件名称
     "w-20",   // 大小（居中）
     "w-16",   // 本地
@@ -641,6 +645,87 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
   )
 }
 
+/** 下载源列：行内 Select，选中即保存（PATCH /api/files/:id）并刷新本行。 */
+function DownloadSourceCell({
+  file,
+  buckets,
+  onUpdated,
+  onFileUpdated,
+}: {
+  file: FileItem
+  buckets: BucketInfo[]
+  onUpdated: () => void
+  onFileUpdated?: (file: FileItem) => void
+}) {
+  const [busy, setBusy] = React.useState(false)
+  const value =
+    file.download_kind === "bucket" && file.download_bucket_id != null
+      ? `bucket:${file.download_bucket_id}`
+      : (file.download_kind ?? "none")
+  const bucketMissing =
+    file.download_kind === "bucket" &&
+    (file.download_bucket_id == null ||
+      !buckets.some((b) => b.id === file.download_bucket_id))
+
+  const handleChange = async (v: string) => {
+    let data: FileUpdateData
+    if (v.startsWith("bucket:")) {
+      data = {
+        download_kind: "bucket",
+        download_bucket_id: Number(v.slice("bucket:".length)),
+      }
+    } else if (v === "url" || v === "local") {
+      data = { download_kind: v }
+    } else {
+      data = { download_kind: "none" }
+    }
+    setBusy(true)
+    try {
+      await updateFile(file.id, data)
+      toast.success("已保存")
+      refreshFileRow(file.id, onUpdated, onFileUpdated)
+    } catch (e) {
+      toast.error("保存失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const copyValue = file.source_url ?? (file.download_kind === "bucket" ? file.object_key : null)
+
+  return (
+    <div className="flex items-center gap-1">
+      <Select value={value} onValueChange={handleChange} disabled={busy}>
+        <SelectTrigger size="xs" className="w-[6.5rem]" title="下载源（修改后立即保存）">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="none">未配置</SelectItem>
+          <SelectItem value="url">下载链接</SelectItem>
+          <SelectItem value="local">本地</SelectItem>
+          {buckets.map((b) => (
+            <SelectItem key={b.id} value={`bucket:${b.id}`}>
+              {b.name}
+            </SelectItem>
+          ))}
+          {file.download_kind === "bucket" && file.download_bucket_id != null && bucketMissing && (
+            <SelectItem value={`bucket:${file.download_bucket_id}`}>
+              桶 #{file.download_bucket_id}（已删除）
+            </SelectItem>
+          )}
+        </SelectContent>
+      </Select>
+      {copyValue && (
+        <CopyButton
+          value={copyValue}
+          title="复制链接/标识"
+          className="size-5 p-0.5 hover:bg-muted"
+        />
+      )}
+    </div>
+  )
+}
+
 export function FilesDataTable({
   data,
   scripts,
@@ -661,6 +746,7 @@ export function FilesDataTable({
 
   const [rowSelection, setRowSelection] = React.useState<Record<string, boolean>>({})
   const [editingFile, setEditingFile] = React.useState<FileItem | null>(null)
+  const [detailsFile, setDetailsFile] = React.useState<FileItem | null>(null)
 
   const columns = React.useMemo<ColumnDef<FileItem>[]>(
     () => {
@@ -694,29 +780,44 @@ export function FilesDataTable({
           },
         },
         {
+          id: "download_source",
+          header: "下载源",
+          cell: ({ row }) => (
+            <DownloadSourceCell
+              file={row.original}
+              buckets={buckets}
+              onUpdated={onDeleted}
+              onFileUpdated={onFileUpdated}
+            />
+          ),
+        },
+        {
+          id: "key_dir",
+          header: "目录",
+          cell: ({ row }) => {
+            const k = row.original.object_key
+            const i = k.lastIndexOf("/")
+            const dir = i >= 0 ? k.slice(0, i) : ""
+            return dir ? (
+              <span className="block max-w-[10rem] truncate font-mono text-xs text-muted-foreground">
+                {dir}
+              </span>
+            ) : (
+              <span className="text-xs text-muted-foreground">—</span>
+            )
+          },
+        },
+        {
           accessorKey: "filename",
           header: "文件名称",
           cell: ({ row }) => {
             const f = row.original
             if (!f.filename) {
-              return <Truncate value={f.filename} />
+              return <span className="text-muted-foreground">—</span>
             }
             return (
               <div className="flex items-center gap-1">
-                {f.source_url ? (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <span className="block max-w-[26rem] truncate cursor-default">
-                        {f.filename}
-                      </span>
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-sm break-all font-mono text-xs">
-                      {f.source_url}
-                    </TooltipContent>
-                  </Tooltip>
-                ) : (
-                  <Truncate value={f.filename} />
-                )}
+                <span className="block max-w-[26rem] truncate">{f.filename}</span>
                 <CopyButton
                   value={f.filename}
                   title="复制文件名"
@@ -761,7 +862,14 @@ export function FilesDataTable({
         {
           id: "actions",
           header: () => <div className="text-center">操作</div>,
-          cell: ({ row }) => <RowActions file={row.original} onDeleted={onDeleted} onEdit={() => setEditingFile(row.original)} />,
+          cell: ({ row }) => (
+            <RowActions
+              file={row.original}
+              onDeleted={onDeleted}
+              onEdit={() => setEditingFile(row.original)}
+              onDetails={() => setDetailsFile(row.original)}
+            />
+          ),
         },
       )
       return cols
@@ -909,7 +1017,7 @@ export function FilesDataTable({
                         className={cn(
                           "h-4",
                           skelWidths[j] ?? "w-20",
-                          j === 3 && "mx-auto", // 大小列居中
+                          j === 5 && "mx-auto", // 大小列居中
                         )}
                       />
                     </TableCell>
@@ -970,6 +1078,15 @@ export function FilesDataTable({
         </div>
       </div>
 
+      {detailsFile && (
+        <FileDetailsDialog
+          file={detailsFile}
+          scripts={scripts}
+          buckets={buckets}
+          onClose={() => setDetailsFile(null)}
+        />
+      )}
+
       {editingFile && (
         <EditFileDialog
           file={editingFile}
@@ -986,7 +1103,17 @@ export function FilesDataTable({
   )
 }
 
-function RowActions({ file, onDeleted, onEdit }: { file: FileItem; onDeleted: () => void; onEdit: () => void }) {
+function RowActions({
+  file,
+  onDeleted,
+  onEdit,
+  onDetails,
+}: {
+  file: FileItem
+  onDeleted: () => void
+  onEdit: () => void
+  onDetails: () => void
+}) {
   const [busy, setBusy] = React.useState(false)
   const [deleteOpen, setDeleteOpen] = React.useState(false)
 
@@ -1017,6 +1144,9 @@ function RowActions({ file, onDeleted, onEdit }: { file: FileItem; onDeleted: ()
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
+          <DropdownMenuItem onClick={onDetails}>
+            <Info className="size-3.5" /> 详情
+          </DropdownMenuItem>
           <DropdownMenuItem onClick={onEdit}>
             <Pencil className="size-3.5" /> 编辑
           </DropdownMenuItem>
@@ -1049,7 +1179,16 @@ function RowActions({ file, onDeleted, onEdit }: { file: FileItem; onDeleted: ()
   )
 }
 
-/** 编辑文件记录 Modal（仅基础信息；其余字段由列表内操作维护）。 */
+/** 状态枚举 → 中文标签（提交值仍为后端枚举）。 */
+const STATUS_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "pending", label: "待处理" },
+  { value: "synced", label: "已同步" },
+  { value: "failed", label: "失败" },
+  { value: "deleted", label: "已删除" },
+  { value: "cancelled", label: "已取消" },
+]
+
+/** 编辑文件记录 Modal（基础信息 + 文件级下载源；其余字段由列表内操作维护）。 */
 function EditFileDialog({
   file,
   scripts,
@@ -1061,25 +1200,76 @@ function EditFileDialog({
   onClose: () => void
   onSaved: () => void
 }) {
+  const { buckets } = useBuckets()
   const [form, setForm] = React.useState({
     filename: file.filename ?? "",
     size: String(file.size),
     status: file.status,
     datasource_id: file.datasource_id ? String(file.datasource_id) : "",
   })
+  /** 文件级下载源："none" 对应 NULL（未配置）。 */
+  const [downloadKind, setDownloadKind] = React.useState<"none" | "url" | "local" | "bucket">(
+    file.download_kind === "url" || file.download_kind === "local" || file.download_kind === "bucket"
+      ? file.download_kind
+      : "none",
+  )
+  const [downloadBucketId, setDownloadBucketId] = React.useState(
+    file.download_kind === "bucket" && file.download_bucket_id != null
+      ? String(file.download_bucket_id)
+      : "",
+  )
+  const [sourceUrl, setSourceUrl] = React.useState(file.source_url ?? "")
+  /** 存储目录/前缀：取当前对象键最后一个 "/" 之前的部分（无则根目录）。 */
+  const [dir, setDir] = React.useState(() => {
+    const i = file.object_key.lastIndexOf("/")
+    return i >= 0 ? file.object_key.slice(0, i) : ""
+  })
   const [busy, setBusy] = React.useState(false)
+
+  /** 桶选项值为 bucket:<id>；当前指向的桶已删除时追加占位项（保存会报桶不存在）。 */
+  const bucketDeleted =
+    downloadKind === "bucket" &&
+    !!downloadBucketId &&
+    !buckets.some((b) => String(b.id) === downloadBucketId)
+  const downloadValue =
+    downloadKind === "bucket" && downloadBucketId ? `bucket:${downloadBucketId}` : downloadKind
+  const handleDownloadChange = (v: string) => {
+    if (v.startsWith("bucket:")) {
+      setDownloadKind("bucket")
+      setDownloadBucketId(v.slice("bucket:".length))
+    } else {
+      setDownloadKind(v as "none" | "url" | "local")
+      setDownloadBucketId("")
+    }
+  }
+  const bucketMissing = downloadKind === "bucket" && !downloadBucketId
+  const dirError = validateDir(dir)
+  const hasError = bucketMissing || !!dirError
+  /** 对象键 = 目录/文件名（文件名为空时保留原键的 basename）。 */
+  const keyBase = file.object_key.slice(file.object_key.lastIndexOf("/") + 1)
+  const cleanDir = dir.trim().replace(/^\/+|\/+$/g, "")
+  const nextKey = cleanDir
+    ? `${cleanDir}/${form.filename.trim() || keyBase}`
+    : form.filename.trim() || keyBase
 
   const set = (key: keyof typeof form, value: string) =>
     setForm((f) => ({ ...f, [key]: value }))
 
   const submit = async () => {
+    if (hasError) return
     setBusy(true)
     try {
       await updateFile(file.id, {
+        object_key: nextKey,
         filename: form.filename || null,
         size: Number(form.size) || 0,
         status: form.status,
         datasource_id: form.datasource_id ? Number(form.datasource_id) : null,
+        download_kind: downloadKind,
+        ...(downloadKind === "bucket" ? { download_bucket_id: Number(downloadBucketId) } : {}),
+        ...(downloadKind === "url" || downloadKind === "local"
+          ? { source_url: sourceUrl.trim() || null }
+          : {}),
       })
       toast.success("已保存")
       onSaved()
@@ -1116,7 +1306,27 @@ function EditFileDialog({
               />
             </div>
           </div>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label htmlFor="edit-dir">目录（存储前缀）</Label>
+            <Input
+              id="edit-dir"
+              value={dir}
+              onChange={(e) => setDir(e.target.value)}
+              placeholder="如 backups/2026，留空 = 根目录"
+              className={cn(
+                "font-mono text-sm",
+                dirError && "border-destructive focus-visible:ring-destructive",
+              )}
+            />
+            {dirError ? (
+              <p className="text-xs text-destructive">{dirError}</p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                对象键 = 目录/文件名（当前：{nextKey}）；桶中按该键匹配存在性，修改后已上传标记不会自动重算，可对各桶「重新检测」。
+              </p>
+            )}
+          </div>
+          <div className="grid grid-cols-3 gap-4">
             <div className="space-y-2">
               <Label>状态</Label>
               <Select value={form.status} onValueChange={(v) => set("status", v)}>
@@ -1124,11 +1334,11 @@ function EditFileDialog({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="pending">pending</SelectItem>
-                  <SelectItem value="synced">synced</SelectItem>
-                  <SelectItem value="failed">failed</SelectItem>
-                  <SelectItem value="deleted">deleted</SelectItem>
-                  <SelectItem value="cancelled">cancelled</SelectItem>
+                  {STATUS_OPTIONS.map((s) => (
+                    <SelectItem key={s.value} value={s.value}>
+                      {s.label}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
@@ -1147,14 +1357,202 @@ function EditFileDialog({
                 </SelectContent>
               </Select>
             </div>
+            <div className="space-y-2">
+              <Label>下载源</Label>
+              <Select value={downloadValue} onValueChange={handleDownloadChange}>
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="未配置（默认）" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">未配置（默认）</SelectItem>
+                  <SelectItem value="url">下载链接</SelectItem>
+                  <SelectItem value="local">本地（服务器路径）</SelectItem>
+                  {buckets.map((b) => (
+                    <SelectItem key={b.id} value={`bucket:${b.id}`}>
+                      {b.name}
+                      {!b.enabled && "（已禁用）"}
+                    </SelectItem>
+                  ))}
+                  {bucketDeleted && (
+                    <SelectItem value={`bucket:${downloadBucketId}`}>
+                      桶 #{downloadBucketId}（已删除）
+                    </SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
+            </div>
           </div>
+          {(downloadKind === "url" || downloadKind === "local") && (
+            <div className="space-y-2">
+              <Label htmlFor="edit-source">
+                {downloadKind === "url" ? "下载链接" : "服务器文件路径"}
+              </Label>
+              <Input
+                id="edit-source"
+                value={sourceUrl}
+                onChange={(e) => setSourceUrl(e.target.value)}
+                placeholder={
+                  downloadKind === "url"
+                    ? "https://example.com/file.zip"
+                    : "/data/spider/out/file.zip"
+                }
+                className="font-mono text-sm"
+              />
+              <p className="text-xs text-muted-foreground">
+                {downloadKind === "url"
+                  ? "「下载到服务器」时直接抓取该链接。"
+                  : "「下载到服务器」时从该路径复制/硬链接到服务器文件目录。"}
+              </p>
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy}>
+          <Button onClick={submit} disabled={busy || hasError}>
             {busy ? "保存中…" : "保存"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/** 详情行：标签 + 值（可选复制按钮）。 */
+function DetailRow({
+  label,
+  children,
+  copyValue,
+}: {
+  label: string
+  children: React.ReactNode
+  copyValue?: string | null
+}) {
+  return (
+    <div className="grid grid-cols-[7rem_1fr] items-start gap-2 border-b py-1.5 last:border-b-0">
+      <span className="pt-0.5 text-xs text-muted-foreground">{label}</span>
+      <div className="flex min-w-0 items-start gap-1">
+        <div className="min-w-0 flex-1 break-all text-sm">{children}</div>
+        {copyValue && (
+          <CopyButton
+            value={copyValue}
+            title={`复制${label}`}
+            className="size-5 p-0.5 hover:bg-muted"
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** 详情里的空值占位。 */
+function Dash() {
+  return <span className="text-muted-foreground">—</span>
+}
+
+/** 文件详情 Modal：展示该文件记录的全部字段。 */
+function FileDetailsDialog({
+  file,
+  scripts,
+  buckets,
+  onClose,
+}: {
+  file: FileItem
+  scripts: Datasource[]
+  buckets: BucketInfo[]
+  onClose: () => void
+}) {
+  const datasource = file.datasource_id
+    ? scripts.find((s) => s.id === file.datasource_id)
+    : undefined
+  const downloadBucket =
+    file.download_kind === "bucket" && file.download_bucket_id != null
+      ? buckets.find((b) => b.id === file.download_bucket_id)
+      : undefined
+  const uploadedNames = file.uploaded_bucket_ids
+    .map((id) => buckets.find((b) => b.id === id)?.name ?? `#${id}`)
+    .join("、")
+  /** 存储目录/前缀：对象键最后一个 "/" 之前的部分。 */
+  const keyDir = file.object_key.includes("/")
+    ? file.object_key.slice(0, file.object_key.lastIndexOf("/"))
+    : ""
+
+  return (
+    <Dialog open onOpenChange={(v) => { if (!v) onClose() }}>
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>文件详情</DialogTitle>
+        </DialogHeader>
+        <div className="max-h-[65vh] overflow-y-auto py-2">
+          <DetailRow label="ID">{file.id}</DetailRow>
+          <DetailRow label="任务 ID">{file.job_id ?? <Dash />}</DetailRow>
+          <DetailRow label="目录" copyValue={keyDir || null}>
+            {keyDir ? (
+              <span className="font-mono text-xs">{keyDir}</span>
+            ) : (
+              <span className="text-muted-foreground">根目录</span>
+            )}
+          </DetailRow>
+          <DetailRow label="对象键" copyValue={file.object_key}>
+            <span className="font-mono text-xs">{file.object_key}</span>
+          </DetailRow>
+          <DetailRow label="文件名" copyValue={file.filename}>
+            {file.filename ?? <Dash />}
+          </DetailRow>
+          <DetailRow label="MD5" copyValue={file.md5}>
+            <span className="font-mono text-xs">{file.md5 ?? <Dash />}</span>
+          </DetailRow>
+          <DetailRow label="大小">
+            {formatBytes(file.size)}
+            <span className="text-muted-foreground">（{file.size} 字节）</span>
+          </DetailRow>
+          <DetailRow label="数据源">
+            {datasource ? datasource.name : <Dash />}
+          </DetailRow>
+          <DetailRow label="下载源">
+            {file.download_kind === "url" ? (
+              "下载链接"
+            ) : file.download_kind === "local" ? (
+              "本地（服务器路径）"
+            ) : file.download_kind === "bucket" ? (
+              downloadBucket ? (
+                `桶 · ${downloadBucket.name}`
+              ) : (
+                <span className="text-destructive">
+                  桶 #{file.download_bucket_id ?? "?"}（已删除）
+                </span>
+              )
+            ) : (
+              <span className="text-muted-foreground">未配置</span>
+            )}
+          </DetailRow>
+          <DetailRow label="链接/标识" copyValue={file.source_url}>
+            <span className="font-mono text-xs break-all">
+              {file.source_url ?? <Dash />}
+            </span>
+          </DetailRow>
+          <DetailRow label="本地路径" copyValue={file.local_path}>
+            <span className="font-mono text-xs break-all">
+              {file.local_path ?? <Dash />}
+            </span>
+          </DetailRow>
+          <DetailRow label="已上传桶">{uploadedNames || <Dash />}</DetailRow>
+          <DetailRow label="状态">{file.status}</DetailRow>
+          {file.error && (
+            <DetailRow label="错误信息">
+              <span className="text-destructive">{file.error}</span>
+            </DetailRow>
+          )}
+          <DetailRow label="创建时间">{formatTime(file.created_at)}</DetailRow>
+          <DetailRow label="更新时间">{formatTime(file.updated_at)}</DetailRow>
+          <DetailRow label="同步时间">
+            {file.synced_at ? formatTime(file.synced_at) : <Dash />}
+          </DetailRow>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            关闭
           </Button>
         </DialogFooter>
       </DialogContent>

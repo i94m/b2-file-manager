@@ -228,15 +228,22 @@ export async function uploadFile(
   return handle<FormResult>(res)
 }
 
-/** POST /url-upload — 录入链接，只登记不自动上传。 */
+/** POST /url-upload — 录入链接，只登记不自动上传（可带文件级下载源配置）。 */
 export async function urlUpload(
   url: string,
-  opts: { prefix?: string; datasourceId?: number } = {},
+  opts: {
+    prefix?: string
+    datasourceId?: number
+    downloadKind?: "url" | "local" | "bucket"
+    downloadBucketId?: number
+  } = {},
 ): Promise<FormResult> {
   const form = new FormData()
   form.append("url", url)
   if (opts.prefix) form.append("prefix", opts.prefix)
   if (opts.datasourceId) form.append("datasource_id", String(opts.datasourceId))
+  if (opts.downloadKind) form.append("download_kind", opts.downloadKind)
+  if (opts.downloadBucketId) form.append("download_bucket_id", String(opts.downloadBucketId))
   const res = await fetch("/url-upload", { method: "POST", headers: headers(true), body: form })
   return handle<FormResult>(res)
 }
@@ -350,6 +357,9 @@ export interface FileUpdateData {
   uploaded_bucket_ids?: number[]
   status?: string
   datasource_id?: number | null
+  /** 文件级下载源（'none' 表示清除）。 */
+  download_kind?: "none" | "url" | "local" | "bucket"
+  download_bucket_id?: number
   error?: string | null
 }
 

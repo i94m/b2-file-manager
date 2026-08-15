@@ -536,6 +536,8 @@ def init_db() -> None:
                 uploaded_bucket2 TINYINT NOT NULL DEFAULT 0,
                 status VARCHAR(20) NOT NULL DEFAULT 'pending',
                 datasource_id INT,
+                download_kind VARCHAR(20),
+                download_bucket_id INT,
                 local_path VARCHAR(1024),
                 created_at DOUBLE NOT NULL,
                 updated_at DOUBLE NOT NULL,
@@ -578,6 +580,8 @@ def init_db() -> None:
                 ("uploaded_beijing", "TINYINT NOT NULL DEFAULT 0"),
                 ("uploaded_bucket2", "TINYINT NOT NULL DEFAULT 0"),
                 ("datasource_id", "INT"),
+                ("download_kind", "VARCHAR(20)"),
+                ("download_bucket_id", "INT"),
                 ("local_path", "VARCHAR(1024)"),
                 ("updated_at", "DOUBLE"),
             ):
@@ -1024,17 +1028,22 @@ def insert_file_pending(
     size: int,
     source_url: str | None = None,
     datasource_id: int | None = None,
+    download_kind: str | None = None,
+    download_bucket_id: int | None = None,
 ) -> int:
     """登记一条 pending 记录，后续由 worker 逐步更新。
 
     job_id 为空时表示「只登记未上传」（用户稍后手动触发上传），
     返回新插入的 file id。
+    download_kind：文件级下载源 'url'（来源链接）/ 'local'（服务器本地路径）/
+    'bucket'（指定桶，配 download_bucket_id）/ None 未配置。
     """
     now = time.time()
     with get_db() as conn:
         cursor = conn.execute(
-            "INSERT INTO files (job_id, object_key, filename, size, bucket, source_url, datasource_id, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            "INSERT INTO files (job_id, object_key, filename, size, bucket, source_url, datasource_id, "
+            "download_kind, download_bucket_id, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
             (
                 job_id,
                 object_key,
@@ -1043,6 +1052,8 @@ def insert_file_pending(
                 _default_bucket_name(),
                 source_url,
                 datasource_id,
+                download_kind,
+                download_bucket_id,
                 now,
                 now,
             ),
@@ -1110,6 +1121,30 @@ def sync_to_bucket(
     return True
 
 
+def _copy_local_to_dest(src: Path, dest: Path, job_id: int) -> None:
+    """本地来源 → 服务器目录：优先硬链接（同盘零拷贝），跨盘回退流式复制（带进度/取消）。
+
+    复制走隐藏 .part 文件，完成后原子替换，中断不留半截目标文件。
+    """
+    part = dest.with_name(f".{dest.name}.{job_id}.part")
+    try:
+        if part.exists() or part.is_symlink():
+            part.unlink()
+        os.link(src, part)
+    except OSError:
+        callback = make_progress(job_id, src.stat().st_size)
+        with open(src, "rb") as fsrc, open(part, "wb") as fdst:
+            while True:
+                chunk = fsrc.read(1024 * 1024)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                callback(len(chunk))
+    if dest.exists() or dest.is_symlink():
+        dest.unlink()
+    part.replace(dest)
+
+
 def cleanup_job_temp(job_id: int, kind: str, destination: str | None = None) -> None:
     """清理任务产生的临时文件（服务器路径上传任务的源文件不属于临时文件）。"""
     if kind == "download" and destination:
@@ -1120,7 +1155,8 @@ def cleanup_job_temp(job_id: int, kind: str, destination: str | None = None) -> 
         except OSError:
             pass
     else:
-        # 同时清理新路径（/tmp/b2-fetch-*）与旧路径（tmp_uploads/*.part），兼容两种来源
+        # 同时清理新路径（/tmp/b2-fetch-*）与旧路径（tmp_uploads/*.part），兼容两种来源；
+        # 本地来源复制任务的 .part 残留（取消/失败中断）也一并清理
         try:
             (Path(tempfile.gettempdir()) / f"b2-fetch-{job_id}.part").unlink(missing_ok=True)
         except OSError:
@@ -1129,6 +1165,13 @@ def cleanup_job_temp(job_id: int, kind: str, destination: str | None = None) -> 
             (UPLOAD_DIR / f"{job_id}.part").unlink(missing_ok=True)
         except OSError:
             pass
+        if destination:
+            try:
+                dest = Path(destination)
+                for leftover in dest.parent.glob(f".{dest.name}.*.part"):
+                    leftover.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def process_job(job_id: int) -> None:
@@ -1182,12 +1225,26 @@ def process_job(job_id: int) -> None:
                 else None
             )
             if kind == "fetch":
-                source_path, size, md5 = fetch_url_to_temp(source, job_id)
+                # 本地文件来源（source 非 http(s)）：直接取源文件，复制/硬链接不搬移原件
+                local_source = source_path
+                if local_source is not None:
+                    if not local_source.is_file():
+                        raise FileNotFoundError(f"本地文件不存在: {source}")
+                    size = local_source.stat().st_size
+                    md5 = hash_file(local_source)
+                    with get_db() as conn:
+                        conn.execute("UPDATE jobs SET size=? WHERE id=?", (size, job_id))
+                    emit_job_update(job_id)
+                else:
+                    source_path, size, md5 = fetch_url_to_temp(source, job_id)
                 if destination:
                     update_file_by_job(job_id, size=size, md5=md5)
                     dest = Path(destination)
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(source_path), dest)
+                    if local_source is not None:
+                        _copy_local_to_dest(local_source, dest, job_id)
+                    else:
+                        shutil.move(str(source_path), dest)
                     # 回写 local_path（相对 SERVER_FILE_ROOT）作为已下载标识
                     root = server_root()
                     if root is not None:
@@ -1878,6 +1935,35 @@ def url_upload():
     if not url:
         return respond("error", "请填写链接或文件标识。", apikey, "error", 400)
 
+    # 文件级下载源（可选）：url=下载链接 / local=服务器本地路径 / bucket=指定桶
+    download_kind = (request.form.get("download_kind") or "").strip()
+    download_bucket_id = None
+    if download_kind in ("", "none"):
+        download_kind = None
+    elif download_kind in ("url", "local", "bucket"):
+        if download_kind == "bucket":
+            with get_db() as conn:
+                try:
+                    download_bucket_id = _check_download_bucket(
+                        conn, request.form.get("download_bucket_id")
+                    )
+                except ValueError as exc:
+                    return respond("error", str(exc), apikey, "error", 400)
+        elif download_kind == "url" and not url.lower().startswith(("http://", "https://")):
+            return respond(
+                "error", "下载源为「下载链接」时，请填写以 http:// 或 https:// 开头的链接。",
+                apikey, "error", 400,
+            )
+        elif download_kind == "local" and not url.startswith("/"):
+            return respond(
+                "error", "下载源为「本地」时，请填写服务器上的文件绝对路径（以 / 开头）。",
+                apikey, "error", 400,
+            )
+    else:
+        return respond(
+            "error", "download_kind 仅支持 url / local / bucket / none", apikey, "error", 400,
+        )
+
     target = (request.form.get("target") or "bucket").strip()
     destination = None
     object_key = ""
@@ -1933,6 +2019,8 @@ def url_upload():
         size=0,
         source_url=url,
         datasource_id=datasource_id,
+        download_kind=download_kind,
+        download_bucket_id=download_bucket_id,
     )
     return respond(
         "ok", f"「{filename}」已登记。", apikey,
@@ -2044,8 +2132,12 @@ def _do_file_download_server(file_id: int, bucket_param, serial: bool = False) -
     """统一实现：下载文件到服务器 SERVER_FILE_ROOT（保留原始文件名）。
 
     - 显式指定桶（bucket_param 为 id/legacy）：必须已上传到该桶 → 从该桶下载。
-    - 缺省（''/None/'self'）：默认桶已上传 → 从默认桶下载；
-      否则回退 source_url 抓取（kind=fetch + destination）。
+    - 缺省（''/None/'self'）按优先级取下载源：
+      1. 文件级 download_kind：bucket → 直接从该桶下载（不要求上传记录，
+         head_object 校验对象存在）；url → 一律走 source_url 抓取；
+         local → source_url 视为服务器本地路径，fetch 任务复制/链接过来。
+      2. 未配置：默认桶已上传 → 从默认桶下载；否则回退 source_url 抓取
+         （kind=fetch + destination）。
     """
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
@@ -2053,12 +2145,17 @@ def _do_file_download_server(file_id: int, bucket_param, serial: bool = False) -
     with get_db() as conn:
         row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
         uploaded_ids = set()
+        file_bucket = None
         if row is not None:
             uploaded_ids = {
                 u["bucket_id"] for u in conn.execute(
                     "SELECT bucket_id FROM file_uploads WHERE file_id=?", (file_id,)
                 ).fetchall()
             }
+            if row["download_kind"] == "bucket" and row["download_bucket_id"]:
+                file_bucket = conn.execute(
+                    "SELECT * FROM buckets WHERE id=?", (row["download_bucket_id"],)
+                ).fetchone()
     if row is None:
         return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
     f = dict(row)
@@ -2071,6 +2168,11 @@ def _do_file_download_server(file_id: int, bucket_param, serial: bool = False) -
 
     raw = (str(bucket_param) if bucket_param is not None else "").strip()
     bucket_row = None
+    # 下载源指定的桶在 404 消息里的前缀（区分 文件级 / 数据源级 / 显式）
+    bucket_error_prefix = ""
+    force_fetch = False
+    force_local = False
+    fetch_error = ""
     if raw and raw not in ("self", "cloud"):
         try:
             bucket_row = resolve_bucket_ref(raw)
@@ -2079,9 +2181,21 @@ def _do_file_download_server(file_id: int, bucket_param, serial: bool = False) -
         if bucket_row["id"] not in uploaded_ids:
             return jsonify({"error": f"该文件未上传到{bucket_row['name']}"}), 400
     else:
-        d = default_bucket()
-        if d is not None and d["id"] in uploaded_ids:
-            bucket_row = d
+        fk = f.get("download_kind")
+        if fk == "bucket":
+            if file_bucket is None:
+                return jsonify({"error": "该文件下载源指定的桶不存在或已被删除"}), 400
+            bucket_row = file_bucket
+            bucket_error_prefix = "下载源指定的"
+        elif fk == "url":
+            force_fetch = True
+            fetch_error = "该文件下载源为下载链接，但该文件没有来源链接"
+        elif fk == "local":
+            force_local = True
+        else:
+            d = default_bucket()
+            if d is not None and d["id"] in uploaded_ids:
+                bucket_row = d
 
     root = server_root()
     if root is None:
@@ -2100,6 +2214,15 @@ def _do_file_download_server(file_id: int, bucket_param, serial: bool = False) -
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code", ""))
             if code in ("404", "NoSuchKey", "NotFound"):
+                if bucket_error_prefix:
+                    return jsonify(
+                        {
+                            "error": (
+                                f"{bucket_error_prefix}桶"
+                                f"{bucket_row['name']}中不存在对象: {object_key}"
+                            )
+                        }
+                    ), 404
                 return jsonify({"error": f"{bucket_row['name']}中不存在对象: {object_key}"}), 404
             return jsonify({"error": str(exc)}), 502
         except (BotoCoreError, OSError) as exc:
@@ -2114,6 +2237,23 @@ def _do_file_download_server(file_id: int, bucket_param, serial: bool = False) -
             bucket_id=bucket_row["id"],
             serial=serial,
         )
+    elif force_local:
+        # 服务器本地路径 → server（source_url 存路径，fetch 任务复制/硬链接过来）
+        raw_src = (f.get("source_url") or "").strip()
+        if not raw_src:
+            return jsonify({"error": "该文件下载源为本地，但未填写服务器文件路径"}), 400
+        src = Path(raw_src).expanduser()
+        if not src.is_file():
+            return jsonify({"error": f"本地文件不存在: {raw_src}"}), 400
+        job_id = insert_job(
+            kind="fetch",
+            filename=filename,
+            object_key=object_key,
+            size=src.stat().st_size,
+            source=str(src),
+            destination=str(destination),
+            serial=serial,
+        )
     elif f.get("source_url"):
         # URL → server
         job_id = insert_job(
@@ -2125,6 +2265,8 @@ def _do_file_download_server(file_id: int, bucket_param, serial: bool = False) -
             destination=str(destination),
             serial=serial,
         )
+    elif force_fetch:
+        return jsonify({"error": fetch_error}), 400
     else:
         return jsonify({"error": "无可下载来源（既不在桶也无来源链接）"}), 400
 
@@ -2910,6 +3052,17 @@ def api_scripts():
     return jsonify(recent_scripts())
 
 
+def _check_download_bucket(conn, value) -> int:
+    """校验下载桶 id 合法且存在于 buckets 表（只查存在性，不查 enabled），返回 int。"""
+    raw = str(value if value is not None else "").strip()
+    if not raw.isdigit():
+        raise ValueError("配置 B2 桶下载源时必须指定有效的桶")
+    found = conn.execute("SELECT id FROM buckets WHERE id=?", (int(raw),)).fetchone()
+    if found is None:
+        raise ValueError(f"桶 {raw} 不存在")
+    return int(raw)
+
+
 @app.post("/api/scripts")
 def api_create_script():
     """新增数据源（JSON：name 必填；script_path / description 可选）。"""
@@ -3136,7 +3289,8 @@ def api_delete_bucket(bucket_id: int):
     """删除桶（默认桶拒绝删除）。
 
     先 fail 该桶 queued/uploading 任务（error='桶已删除'），
-    再清 file_uploads 关联、jobs.bucket_id 置空、删行、失效缓存客户端。
+    再清 file_uploads 关联、jobs.bucket_id 置空、文件级下载源引用回退未配置、
+    删行、失效缓存客户端。
     """
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
@@ -3154,6 +3308,10 @@ def api_delete_bucket(bucket_id: int):
         )
         conn.execute("DELETE FROM file_uploads WHERE bucket_id=?", (bucket_id,))
         conn.execute("UPDATE jobs SET bucket_id=NULL WHERE bucket_id=?", (bucket_id,))
+        conn.execute(
+            "UPDATE files SET download_kind=NULL, download_bucket_id=NULL WHERE download_bucket_id=?",
+            (bucket_id,),
+        )
         conn.execute("DELETE FROM buckets WHERE id=?", (bucket_id,))
     invalidate_bucket_client(bucket_id)
     return jsonify({"status": "ok", "message": f"桶「{row['name']}」已删除。", "bucket_id": bucket_id})
@@ -3308,6 +3466,9 @@ def api_update_file(file_id: int):
         uploaded, uploaded_beijing, uploaded_bucket2  旧布尔（机器人兼容，映射 file_uploads）
         status                         pending|synced|failed|deleted|cancelled
         datasource_id                  整数或 null
+        download_kind                  文件级下载源 none|url|local|bucket（'none'/空 → 清空）；
+                                       kind=bucket 需带 download_bucket_id（校验桶存在）
+        download_bucket_id             仅当当前 download_kind=bucket 时可单独更新
 
     返回：
         {"status": "ok", "file_id": id, "file": {更新后的行}}
@@ -3381,6 +3542,52 @@ def api_update_file(file_id: int):
             params.append(int(val))
         else:
             fields.append("datasource_id = NULL")
+
+    # 文件级下载源：含 download_kind 时整组更新（none → 两列清空）；
+    # 只发 download_bucket_id 时仅当当前类型为 bucket 才接受
+    download_updates: list[tuple[str, object]] | None = None
+    if "download_kind" in body or "download_bucket_id" in body:
+        with get_db() as conn:
+            if "download_kind" in body:
+                kind_val = (body.get("download_kind") or "").strip()
+                if kind_val in ("", "none"):
+                    download_updates = [("download_kind", None), ("download_bucket_id", None)]
+                elif kind_val in ("url", "local"):
+                    download_updates = [("download_kind", kind_val), ("download_bucket_id", None)]
+                elif kind_val == "bucket":
+                    try:
+                        bucket_id_value = _check_download_bucket(
+                            conn, body.get("download_bucket_id")
+                        )
+                    except ValueError as exc:
+                        return jsonify({"error": str(exc)}), 400
+                    download_updates = [
+                        ("download_kind", "bucket"),
+                        ("download_bucket_id", bucket_id_value),
+                    ]
+                else:
+                    return jsonify({"error": "download_kind 仅支持 url / local / bucket / none"}), 400
+            else:
+                current = conn.execute(
+                    "SELECT download_kind FROM files WHERE id=?", (file_id,)
+                ).fetchone()
+                if current is None:
+                    return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
+                if current["download_kind"] != "bucket":
+                    return jsonify({"error": "仅当下载源类型为 B2 桶时才能单独更新下载桶"}), 400
+                try:
+                    bucket_id_value = _check_download_bucket(
+                        conn, body.get("download_bucket_id")
+                    )
+                except ValueError as exc:
+                    return jsonify({"error": str(exc)}), 400
+                download_updates = [("download_bucket_id", bucket_id_value)]
+        for name, val in download_updates:
+            if val is None:
+                fields.append(f"{name} = NULL")
+            else:
+                fields.append(f"{name} = ?")
+                params.append(val)
 
     if not fields and target_ids is None and not legacy_updates:
         return jsonify({"error": "没有可更新的字段"}), 400

@@ -22,6 +22,10 @@ export interface FileItem {
   uploaded_bucket_ids: number[]
   status: string // pending | synced | failed | deleted
   datasource_id: number | null
+  /** 文件级下载源：url=下载链接 / local=服务器本地路径 / bucket=指定桶 / null=未配置。 */
+  download_kind: "url" | "local" | "bucket" | null
+  /** kind=bucket 时指向的桶 id。 */
+  download_bucket_id: number | null
   local_path: string | null // 已下载到服务器 SERVER_FILE_ROOT 的相对路径
   created_at: number
   updated_at: number
