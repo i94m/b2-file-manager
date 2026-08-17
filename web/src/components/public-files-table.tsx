@@ -70,8 +70,8 @@ function ReadOnlySyncCell({
       error={file.status === "failed" ? file.error : null}
     >
       {synced
-        ? target === "local" ? "已下载" : "已同步"
-        : target === "local" ? "未下载" : "未同步"}
+        ? target === "local" ? "已存在" : "已同步"
+        : target === "local" ? "不存在" : "未同步"}
     </StatusText>
   )
 }

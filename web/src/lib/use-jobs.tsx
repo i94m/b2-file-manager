@@ -127,6 +127,19 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
       setStats({})
     })
     socket.on("job_update", upsert)
+    socket.on("job_removed", (payload: { id: number }) => {
+      delete ref.current[payload.id]
+      setJobs((j) => {
+        const next = { ...j }
+        delete next[payload.id]
+        return next
+      })
+      setStats((s) => {
+        const next = { ...s }
+        delete next[payload.id]
+        return next
+      })
+    })
 
     return () => {
       socket.disconnect()

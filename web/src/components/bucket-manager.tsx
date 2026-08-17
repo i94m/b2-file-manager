@@ -363,22 +363,31 @@ function BucketForm({
     enabled: initial?.enabled ?? true,
   })
   const [busy, setBusy] = React.useState(false)
+  /** 提交后（attempted）才展示校验结果，避免打开弹窗即满屏红色。 */
+  const [attempted, setAttempted] = React.useState(false)
 
   const set = (key: keyof typeof form, value: string | boolean) =>
     setForm((f) => ({ ...f, [key]: value }))
 
-  const nameError = form.name.trim() ? null : "名称必填"
-  const bucketNameError = form.bucket_name.trim() ? null : "桶名必填"
-  const keyIdError = form.application_key_id.trim() ? null : "keyID 必填"
-  const keyError =
+  const nameErrorRaw = form.name.trim() ? null : "名称必填"
+  const bucketNameErrorRaw = form.bucket_name.trim() ? null : "桶名必填"
+  const keyIdErrorRaw = form.application_key_id.trim() ? null : "keyID 必填"
+  const keyErrorRaw =
     !isEdit && !form.application_key.trim() ? "新增桶必须填写 applicationKey" : null
-  const hasError = !!(nameError || bucketNameError || keyIdError || keyError)
+  const hasError = !!(nameErrorRaw || bucketNameErrorRaw || keyIdErrorRaw || keyErrorRaw)
+  const nameError = attempted ? nameErrorRaw : null
+  const bucketNameError = attempted ? bucketNameErrorRaw : null
+  const keyIdError = attempted ? keyIdErrorRaw : null
+  const keyError = attempted ? keyErrorRaw : null
 
   const inputCls = (err: string | null) =>
     cn(err && "border-destructive focus-visible:ring-destructive")
 
   const submit = async () => {
-    if (hasError) return
+    if (hasError) {
+      setAttempted(true)
+      return
+    }
     setBusy(true)
     try {
       if (isEdit) {
@@ -538,7 +547,7 @@ function BucketForm({
         <Button variant="outline" onClick={onClose} disabled={busy}>
           取消
         </Button>
-        <Button onClick={submit} disabled={busy || hasError}>
+        <Button onClick={submit} disabled={busy}>
           {busy ? "保存中…" : "保存"}
         </Button>
       </div>

@@ -3124,6 +3124,35 @@ def api_jobs():
     return jsonify([job_payload(job) for job in recent_jobs()])
 
 
+@app.delete("/api/jobs/<int:job_id>")
+def api_job_delete(job_id: int):
+    """删除一条任务记录（仅限已结束的历史记录；进行中的任务需先取消）。
+
+    删除仅清理任务日志，不影响文件记录与桶内对象；
+    关联文件记录的 job_id 置空，并广播 job_removed 供前端移除该行。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": f"任务 {job_id} 不存在"}), 404
+    job = dict(row)
+    if job["status"] in ("queued", "uploading"):
+        return jsonify({
+            "error": "任务进行中，无法删除记录（请先取消）",
+            "job": job_payload(job),
+        }), 400
+
+    with get_db() as conn:
+        conn.execute("UPDATE files SET job_id=NULL WHERE job_id=?", (job_id,))
+        conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    socketio.emit("job_removed", {"id": job_id})
+    return jsonify({"status": "ok", "message": "任务记录已删除"})
+
+
 @app.post("/api/jobs/<int:job_id>/cancel")
 def api_job_cancel(job_id: int):
     """请求取消一个任务（上传/下载/抓取）。

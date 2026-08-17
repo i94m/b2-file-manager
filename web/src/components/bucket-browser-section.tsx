@@ -274,7 +274,7 @@ export function BucketBrowserSection({
                             ) : (
                               <Download className="size-3.5" />
                             )}
-                            下载到服务器
+                            下载
                           </DropdownMenuItem>
                           <DropdownMenuItem
                             variant="destructive"
@@ -386,12 +386,18 @@ function RenameDialog({
 }) {
   const [newKey, setNewKey] = React.useState(obj.key)
   const [busy, setBusy] = React.useState(false)
+  /** 提交后（attempted）才展示校验结果，避免打开弹窗即满屏红色。 */
+  const [attempted, setAttempted] = React.useState(false)
 
-  const keyError = validateKey(newKey)
-  const hasError = !!keyError
+  const keyErrorRaw = validateKey(newKey)
+  const hasError = !!keyErrorRaw
+  const keyError = attempted ? keyErrorRaw : null
 
   const submit = async () => {
-    if (hasError) return
+    if (hasError) {
+      setAttempted(true)
+      return
+    }
     const trimmed = newKey.trim().replace(/^\/+/, "")
     if (!trimmed) return
     if (trimmed === obj.key) {
@@ -422,7 +428,7 @@ function RenameDialog({
             id="rename-key"
             value={newKey}
             onChange={(e) => setNewKey(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !hasError && submit()}
+            onKeyDown={(e) => e.key === "Enter" && !busy && submit()}
             className={cn("font-mono text-sm", keyError && "border-destructive focus-visible:ring-destructive")}
             autoFocus
           />
@@ -438,7 +444,7 @@ function RenameDialog({
           <Button variant="outline" onClick={onClose} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || hasError}>
+          <Button onClick={submit} disabled={busy}>
             {busy ? "重命名中…" : "确认"}
           </Button>
         </DialogFooter>
@@ -474,17 +480,25 @@ function MoveObjectDialog({
   const [fromKey, setFromKey] = React.useState(cleanPrefix ? `${cleanPrefix}/` : "")
   const [toKey, setToKey] = React.useState("")
   const [busy, setBusy] = React.useState(false)
+  /** 提交后（attempted）才展示校验结果，避免打开弹窗即满屏红色。 */
+  const [attempted, setAttempted] = React.useState(false)
 
-  const fromError = validateKey(fromKey)
-  const toError = validateKey(toKey)
-  const sameError =
+  const fromErrorRaw = validateKey(fromKey)
+  const toErrorRaw = validateKey(toKey)
+  const sameErrorRaw =
     fromKey.trim() && toKey.trim() && fromKey.trim() === toKey.trim()
       ? "新 key 与原始 key 相同"
       : null
-  const hasError = !!fromError || !!toError || !!sameError
+  const hasError = !!fromErrorRaw || !!toErrorRaw || !!sameErrorRaw
+  const fromError = attempted ? fromErrorRaw : null
+  const toError = attempted ? toErrorRaw : null
+  const sameError = attempted ? sameErrorRaw : null
 
   const submit = async () => {
-    if (hasError) return
+    if (hasError) {
+      setAttempted(true)
+      return
+    }
     const from = fromKey.trim().replace(/^\/+/, "")
     const to = toKey.trim().replace(/^\/+/, "")
     setBusy(true)
@@ -525,7 +539,7 @@ function MoveObjectDialog({
               placeholder="如 fable/a.zip"
               value={toKey}
               onChange={(e) => setToKey(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && !hasError && submit()}
+              onKeyDown={(e) => e.key === "Enter" && !busy && submit()}
               className={cn("font-mono text-sm", (toError || sameError) && "border-destructive focus-visible:ring-destructive")}
             />
             {toError || sameError ? (
@@ -541,7 +555,7 @@ function MoveObjectDialog({
           <Button variant="outline" onClick={onClose} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || hasError}>
+          <Button onClick={submit} disabled={busy}>
             {busy ? "移动中…" : "移动"}
           </Button>
         </DialogFooter>
@@ -567,9 +581,12 @@ function BucketUploadDialog({
   const [file, setFile] = React.useState<File | null>(null)
   const [targetPath, setTargetPath] = React.useState("")
   const [busy, setBusy] = React.useState(false)
+  /** 提交后（attempted）才展示校验结果，避免打开弹窗即满屏红色。 */
+  const [attempted, setAttempted] = React.useState(false)
 
-  const pathError = validateKey(targetPath)
-  const hasError = !!pathError
+  const pathErrorRaw = validateKey(targetPath)
+  const hasError = !!pathErrorRaw
+  const pathError = attempted ? pathErrorRaw : null
 
   // 选定文件后，默认填入 prefix/文件名
   const onFileChange = (f: File | null) => {
@@ -581,7 +598,10 @@ function BucketUploadDialog({
   }
 
   const submit = async () => {
-    if (!file || hasError) return
+    if (!file || hasError) {
+      setAttempted(true)
+      return
+    }
     const key = targetPath.trim().replace(/^\/+/, "")
     setBusy(true)
     try {
@@ -609,6 +629,9 @@ function BucketUploadDialog({
               type="file"
               onChange={(e) => onFileChange(e.target.files?.[0] ?? null)}
             />
+            {attempted && !file && (
+              <p className="text-xs text-destructive">请选择要上传的文件</p>
+            )}
           </div>
           <div className="space-y-2">
             <Label htmlFor="bucket-upload-path">桶内目标路径</Label>
@@ -617,7 +640,7 @@ function BucketUploadDialog({
               placeholder="如 files/photo.jpg"
               value={targetPath}
               onChange={(e) => setTargetPath(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && !hasError && submit()}
+              onKeyDown={(e) => e.key === "Enter" && !busy && submit()}
               className={cn("font-mono text-sm", pathError && "border-destructive focus-visible:ring-destructive")}
             />
             {pathError ? (
@@ -633,7 +656,7 @@ function BucketUploadDialog({
           <Button variant="outline" onClick={onClose} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || !file || hasError}>
+          <Button onClick={submit} disabled={busy}>
             {busy ? "提交中…" : "上传"}
           </Button>
         </DialogFooter>

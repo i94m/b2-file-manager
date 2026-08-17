@@ -137,10 +137,10 @@ function ExistsBadge() {
     <Tooltip>
       <TooltipTrigger asChild>
         <span
-          className="flex size-3.5 shrink-0 items-center justify-center rounded-full bg-green-500 text-white"
+          className="flex size-3 shrink-0 items-center justify-center rounded-full bg-green-500 text-white"
           aria-label="已存在"
         >
-          <Check className="size-2.5" strokeWidth={3.5} />
+          <Check className="size-2" strokeWidth={3.5} />
         </span>
       </TooltipTrigger>
       <TooltipContent>已存在</TooltipContent>
@@ -201,33 +201,6 @@ function CellMenu({
       </DropdownMenuContent>
     </DropdownMenu>
   )
-}
-
-/** ── 上传目录历史（localStorage）── */
-const DIR_HISTORY_KEY = "upload-dir-history"
-const MAX_DIR_HISTORY = 8
-
-function loadDirHistory(): string[] {
-  try {
-    const raw = localStorage.getItem(DIR_HISTORY_KEY)
-    if (!raw) return []
-    const arr = JSON.parse(raw)
-    return Array.isArray(arr) ? arr.slice(0, MAX_DIR_HISTORY) : []
-  } catch {
-    return []
-  }
-}
-
-function pushDirHistory(dir: string) {
-  const trimmed = dir.trim().replace(/^\/+|\/+$/g, "")
-  if (!trimmed) return
-  const current = loadDirHistory()
-  const updated = [trimmed, ...current.filter((d) => d !== trimmed)].slice(0, MAX_DIR_HISTORY)
-  try {
-    localStorage.setItem(DIR_HISTORY_KEY, JSON.stringify(updated))
-  } catch {
-    /* ignore */
-  }
 }
 
 /** 小型任务操作按钮组：暂停/恢复 + 取消（排队 / 上传中均可点击）。 */
@@ -365,14 +338,21 @@ function RenameKeyDialog({
 }) {
   const [newKey, setNewKey] = React.useState(file.object_key)
   const [busy, setBusy] = React.useState(false)
+  /** 提交后（attempted）才展示校验结果，避免打开弹窗即满屏红色。 */
+  const [attempted, setAttempted] = React.useState(false)
 
-  const keyError = validateKeyStrict(newKey)
-  const sameError =
+  const keyErrorRaw = validateKeyStrict(newKey)
+  const sameErrorRaw =
     newKey.trim() && newKey.trim() === file.object_key ? "新 ObjectKey 与原始相同" : null
-  const hasError = !!keyError || !!sameError
+  const hasError = !!keyErrorRaw || !!sameErrorRaw
+  const keyError = attempted ? keyErrorRaw : null
+  const sameError = attempted ? sameErrorRaw : null
 
   const submit = async () => {
-    if (hasError) return
+    if (hasError) {
+      setAttempted(true)
+      return
+    }
     const to = newKey.trim().replace(/^\/+|\/+$/g, "")
     setBusy(true)
     try {
@@ -398,15 +378,15 @@ function RenameKeyDialog({
             id="rename-object-key"
             value={newKey}
             onChange={(e) => setNewKey(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !hasError && submit()}
+            onKeyDown={(e) => e.key === "Enter" && !busy && submit()}
             placeholder="如 opus5_delivery_20260812/a.zip"
             className={cn(
               "font-mono text-sm",
-              hasError && "border-destructive focus-visible:ring-destructive",
+              (keyError || sameError) && "border-destructive focus-visible:ring-destructive",
             )}
             autoFocus
           />
-          {hasError ? (
+          {keyError || sameError ? (
             <p className="text-xs text-destructive">{keyError ?? sameError}</p>
           ) : (
             <p className="text-xs text-muted-foreground">
@@ -418,7 +398,7 @@ function RenameKeyDialog({
           <Button variant="outline" onClick={onClose} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || hasError}>
+          <Button onClick={submit} disabled={busy}>
             {busy ? "重命名中…" : "确认"}
           </Button>
         </DialogFooter>
@@ -427,7 +407,7 @@ function RenameKeyDialog({
   )
 }
 
-/** 上传到桶 Dialog：输入完整 ObjectKey（目录/文件名），支持编辑；最近目录快捷填充。 */
+/** 上传到桶 Dialog：输入完整 ObjectKey（目录/文件名），支持编辑。 */
 function UploadKeyDialog({
   file,
   bucketId,
@@ -441,24 +421,26 @@ function UploadKeyDialog({
   onClose: () => void
   onDone: () => void
 }) {
-  const [history] = React.useState(() => loadDirHistory())
   /** 初始 key = 文件记录的 object_key（严格模式，可编辑）。 */
   const [objectKey, setObjectKey] = React.useState(file.object_key)
   const [busy, setBusy] = React.useState(false)
+  /** 提交后（attempted）才展示校验结果，避免打开弹窗即满屏红色。 */
+  const [attempted, setAttempted] = React.useState(false)
 
-  const keyError = validateKeyStrict(objectKey)
-  const hasError = !!keyError
+  const keyErrorRaw = validateKeyStrict(objectKey)
+  const hasError = !!keyErrorRaw
+  const keyError = attempted ? keyErrorRaw : null
 
   const submit = async () => {
-    if (hasError) return
+    if (hasError) {
+      setAttempted(true)
+      return
+    }
     const key = objectKey.trim().replace(/^\/+|\/+$/g, "")
     setBusy(true)
     try {
       const r = await uploadFileToBucket(file.id, bucketId, key)
       toast.success(r.message)
-      // 目录段（key 去掉最后一段）进历史，供下次快捷填充
-      const dir = key.includes("/") ? key.slice(0, key.lastIndexOf("/")) : ""
-      if (dir) pushDirHistory(dir)
       onDone()
     } catch (e) {
       toast.error("上传失败", { description: (e as Error).message })
@@ -468,15 +450,7 @@ function UploadKeyDialog({
   }
 
   const onEnter = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !hasError) submit()
-  }
-
-  /** 点击历史目录芯片：替换 key 的目录段，保留文件名。 */
-  const applyDir = (d: string) => {
-    const name = objectKey.includes("/")
-      ? objectKey.slice(objectKey.lastIndexOf("/") + 1)
-      : objectKey
-    setObjectKey(`${d}/${name}`)
+    if (e.key === "Enter" && !busy) submit()
   }
 
   return (
@@ -497,38 +471,17 @@ function UploadKeyDialog({
               className={cn("font-mono text-sm", keyError && "border-destructive focus-visible:ring-destructive")}
               autoFocus
             />
-            {keyError ? (
+            {keyError && (
               <p className="text-xs text-destructive">{keyError}</p>
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                完整对象键，已预填当前记录的 ObjectKey，可编辑；上传成功后按该 key 存储。
-              </p>
             )}
           </div>
-          {history.length > 0 && (
-            <div className="space-y-1.5">
-              <span className="text-xs text-muted-foreground">最近目录（点击替换目录段）</span>
-              <div className="flex flex-wrap gap-1.5">
-                {history.map((d) => (
-                  <button
-                    key={d}
-                    type="button"
-                    onClick={() => applyDir(d)}
-                    className="rounded bg-muted px-2 py-1 font-mono text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                  >
-                    {d}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
           <p className="text-xs text-muted-foreground">任务进入上传队列，与其它上传任务按顺序逐个执行。</p>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || hasError}>
+          <Button onClick={submit} disabled={busy}>
             {busy ? "提交中…" : "上传"}
           </Button>
         </DialogFooter>
@@ -550,7 +503,7 @@ function refreshFileRow(
   }
 }
 
-/** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿勾+菜单 / 否则→未下载+菜单。 */
+/** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿勾+菜单 / 否则→不存在+菜单。 */
 function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [busy, setBusy] = React.useState(false)
@@ -567,12 +520,12 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
     </div>
   )
 
-  /** 已存在 → 标记为未下载（仅清 local_path 记录，不删服务器文件）。 */
+  /** 已存在 → 标记为不存在（仅清 local_path 记录，不删服务器文件）。 */
   const handleUnmark = async () => {
     setBusy(true)
     try {
       const r = await updateFile(file.id, { local_path: null })
-      toast.success("已标记为未下载")
+      toast.success("已标记为不存在")
       if (r.file && onFileUpdated) onFileUpdated(r.file)
       else onUpdated()
     } catch (e) {
@@ -582,7 +535,7 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
     }
   }
 
-  /** 已存在 → 删除服务器上的本地文件（确认后删除，成功后记录自动回到未下载）。 */
+  /** 已存在 → 删除服务器上的本地文件（确认后删除，成功后记录自动回到不存在）。 */
   const handleDeleteLocal = async () => {
     if (!await confirm({
       title: "删除本地文件",
@@ -612,8 +565,8 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
       <CellMenu
         items={[
           { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
-          { icon: HardDriveDownload, label: "标记为未下载", onClick: handleUnmark, busy },
-          { icon: Trash2, label: "删除本地文件", onClick: handleDeleteLocal, busy, destructive: true },
+          { icon: HardDriveDownload, label: "标记为不存在", onClick: handleUnmark, busy },
+          { icon: Trash2, label: "删除", onClick: handleDeleteLocal, busy, destructive: true },
         ]}
       />
       {confirmDialog}
@@ -639,11 +592,11 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
       {check.busy ? (
         <CheckingText />
       ) : (
-        <EmptyBadge label="未下载" error={failed ? file.error : undefined} />
+        <EmptyBadge label="不存在" error={failed ? file.error : undefined} />
       )}
       <CellMenu
         items={[
-          { icon: HardDriveDownload, label: "下载到服务器", onClick: handleDownload, busy },
+          { icon: HardDriveDownload, label: "下载", onClick: handleDownload, busy },
           { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
         ]}
       />
@@ -736,10 +689,10 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
           {check.busy ? <CheckingText /> : <ExistsBadge />}
           <CellMenu
             items={[
-              { icon: Download, label: "下载到服务器", onClick: handleDownload, busy: downloading },
+              { icon: Download, label: "下载", onClick: handleDownload, busy: downloading },
               { icon: Pencil, label: "重命名", onClick: () => setRenameOpen(true) },
               { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
-              { icon: Trash2, label: "从桶中删除", onClick: handleDeleteObject, busy: deleting, destructive: true },
+              { icon: Trash2, label: "删除", onClick: handleDeleteObject, busy: deleting, destructive: true },
             ]}
           />
         </div>
@@ -1361,14 +1314,20 @@ function EditFileDialog({
     }
   }
   const bucketMissing = downloadKind === "bucket" && !downloadBucketId
-  const keyError = validateKeyStrict(objectKey)
-  const hasError = bucketMissing || !!keyError
+  const keyErrorRaw = validateKeyStrict(objectKey)
+  const hasError = bucketMissing || !!keyErrorRaw
+  /** 提交后（attempted）才展示校验结果，避免打开弹窗即满屏红色。 */
+  const [attempted, setAttempted] = React.useState(false)
+  const keyError = attempted ? keyErrorRaw : null
 
   const set = (key: keyof typeof form, value: string) =>
     setForm((f) => ({ ...f, [key]: value }))
 
   const submit = async () => {
-    if (hasError) return
+    if (hasError) {
+      setAttempted(true)
+      return
+    }
     setBusy(true)
     try {
       await updateFile(file.id, {
@@ -1492,6 +1451,9 @@ function EditFileDialog({
                   )}
                 </SelectContent>
               </Select>
+              {attempted && bucketMissing && (
+                <p className="text-xs text-destructive">请选择来源桶</p>
+              )}
             </div>
           </div>
           {(downloadKind === "url" || downloadKind === "local") && (
@@ -1522,7 +1484,7 @@ function EditFileDialog({
           <Button variant="outline" onClick={onClose} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || hasError}>
+          <Button onClick={submit} disabled={busy}>
             {busy ? "保存中…" : "保存"}
           </Button>
         </DialogFooter>

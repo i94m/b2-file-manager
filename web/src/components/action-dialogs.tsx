@@ -113,7 +113,7 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
   }, [urlFilename])
 
   /** 完整 ObjectKey 校验：非空、无 '..'、无连续 /、不以 / 开头结尾。 */
-  const keyError = (() => {
+  const keyErrorRaw = (() => {
     const t = objectKey.trim()
     if (!t) return "ObjectKey 不能为空"
     if (/^\/|\/$/.test(t)) return "不能以 / 开头或结尾"
@@ -122,7 +122,10 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
     if (parts.some((p) => p === "")) return "路径不能包含连续的 /"
     return null
   })()
-  const keyValid = !keyError
+  /** 提交后（attempted）才展示校验结果，避免打开弹窗即满屏红色。 */
+  const [attempted, setAttempted] = React.useState(false)
+  const keyError = attempted ? keyErrorRaw : null
+  const urlError = attempted && !url.trim() ? "不能为空" : null
 
   const urlPlaceholder =
     downloadKind === "local"
@@ -136,7 +139,10 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
     downloadKind === "local" ? "服务器路径" : downloadKind === "bucket" ? "ObjectKey" : "网络链接（URL）"
 
   const submit = async () => {
-    if (!url.trim() || !objectKey.trim()) return
+    if (!url.trim() || !!keyErrorRaw) {
+      setAttempted(true)
+      return
+    }
     const normalizedKey = objectKey.trim().replace(/^\/+|\/+$/g, "")
     setBusy(true)
     try {
@@ -169,6 +175,7 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
     if (open) {
       keyDirty.current = false
       setObjectKey("")
+      setAttempted(false)
     }
   }, [open])
 
@@ -235,7 +242,9 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit()}
+              className={cn(urlError && "border-destructive focus-visible:ring-destructive")}
             />
+            {urlError && <p className="text-xs text-destructive">{urlError}</p>}
           </div>
           <div className="space-y-2">
             <Label htmlFor="fetch-key">ObjectKey（目录/文件名）</Label>
@@ -245,7 +254,7 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
               value={objectKey}
               onChange={(e) => handleKeyChange(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit()}
-              aria-invalid={!keyValid}
+              aria-invalid={!!keyError}
               className={cn("font-mono text-sm", keyError && "border-destructive focus-visible:ring-destructive")}
             />
             {keyError ? (
@@ -288,7 +297,7 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
           <Button variant="outline" onClick={() => setOpen(false)} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || !url.trim() || !keyValid}>
+          <Button onClick={submit} disabled={busy}>
             {busy ? "提交中…" : "录入"}
           </Button>
         </DialogFooter>

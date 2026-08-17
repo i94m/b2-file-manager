@@ -294,6 +294,24 @@ X-API-Key: YOUR_KEY
 {"status": "ok", "message": "已恢复", "job": {"id": 5, "status": "uploading", "paused": false, ...}}
 ```
 
+#### DELETE /api/jobs/:job_id
+
+删除一条任务记录（仅限已结束的历史记录：`done` / `failed` / `cancelled`）。
+只清理任务日志，不影响文件记录与桶内对象；关联文件记录的 `job_id` 会置空。
+
+```http
+DELETE /api/jobs/5
+X-API-Key: YOUR_KEY
+```
+
+**响应**：
+
+```json
+{"status": "ok", "message": "任务记录已删除"}
+```
+
+> 进行中的任务（`queued` / `uploading`，含已暂停）返回 `400`，需先取消。
+
 #### GET /api/concurrency
 
 查询上传/下载两条队列的当前并发（兼容保留。队列已固定单并发：同一条队列内按提交顺序逐个执行）。
@@ -714,6 +732,9 @@ socket.on("jobs_snapshot", (jobs) => console.log(jobs))
 socket.on("job_update", (job) => {
   console.log(job.id, job.status, job.progress, job.paused)
 })
+
+// 任务记录被删除（DELETE /api/jobs/:id）
+socket.on("job_removed", ({ id }) => console.log("已删除", id))
 ```
 
 **JobUpdate 字段**：

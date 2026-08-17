@@ -337,6 +337,15 @@ export async function resumeJob(
   return handle(res)
 }
 
+/** DELETE /api/jobs/:id — 删除一条任务记录（仅限已结束的历史记录，不影响文件与桶内对象）。 */
+export async function deleteJob(jobId: number): Promise<FormResult> {
+  const res = await fetch(`/api/jobs/${jobId}`, {
+    method: "DELETE",
+    headers: headers(true),
+  })
+  return handle(res)
+}
+
 /** POST /api/files/:id/download-server — 下载对象到服务器（指定桶；缺省=默认桶/URL 兜底；进下载队列逐个执行）。 */
 export async function downloadServerFromBucket(
   fileId: number,

@@ -190,17 +190,23 @@ function DatasourceForm({
     description: initial?.description ?? "",
   })
   const [busy, setBusy] = React.useState(false)
+  /** 提交后（attempted）才展示校验结果，避免打开弹窗即满屏红色。 */
+  const [attempted, setAttempted] = React.useState(false)
 
   const set = (key: keyof typeof form, value: string) =>
     setForm((f) => ({ ...f, [key]: value }))
 
-  const nameError = form.name.trim() ? null : "名称必填"
-  const hasError = !!nameError
+  const nameErrorRaw = form.name.trim() ? null : "名称必填"
+  const hasError = !!nameErrorRaw
+  const nameError = attempted ? nameErrorRaw : null
   const inputCls = (err: string | null) =>
     cn(err && "border-destructive focus-visible:ring-destructive")
 
   const submit = async () => {
-    if (hasError) return
+    if (hasError) {
+      setAttempted(true)
+      return
+    }
     setBusy(true)
     try {
       const data = {
@@ -254,7 +260,7 @@ function DatasourceForm({
         <Button variant="outline" onClick={onClose} disabled={busy}>
           取消
         </Button>
-        <Button onClick={submit} disabled={busy || hasError}>
+        <Button onClick={submit} disabled={busy}>
           {busy ? "保存中…" : "保存"}
         </Button>
       </div>

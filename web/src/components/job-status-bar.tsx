@@ -1,9 +1,9 @@
 import * as React from "react"
-import { Ban, CheckCircle2, CloudDownload, CloudUpload, Loader2, MoreVertical, Pause, Play, X, XCircle } from "lucide-react"
+import { Ban, CheckCircle2, CloudDownload, CloudUpload, Loader2, MoreVertical, Pause, Play, Trash2, X, XCircle } from "lucide-react"
 import { toast } from "sonner"
 
 import { useJobs } from "@/lib/use-jobs"
-import { cancelJob, pauseJob, resumeJob } from "@/lib/api"
+import { cancelJob, deleteJob, pauseJob, resumeJob } from "@/lib/api"
 import type { JobUpdate } from "@/lib/types"
 import { useConfirm } from "@/lib/use-confirm"
 import { cn, formatBytes, formatRate, formatTime } from "@/lib/utils"
@@ -168,7 +168,6 @@ function TransferTable({ direction, jobs }: { direction: keyof typeof DIRECTION_
         {jobs.map((j) => {
           const stat = stats[j.id]
           const pct = j.size > 0 ? Math.min(100, (j.progress / j.size) * 100) : 0
-          const isActive = j.status === "queued" || j.status === "uploading"
           const kindLabel = jobKindLabel(j)
           return (
             <TableRow key={j.id} className={dir.rowClass}>
@@ -229,7 +228,7 @@ function TransferTable({ direction, jobs }: { direction: keyof typeof DIRECTION_
                 {formatTime(j.created_at)}
               </TableCell>
               <TableCell className="text-right">
-                {isActive && <JobActions job={j} />}
+                <JobActions job={j} />
               </TableCell>
             </TableRow>
           )
@@ -240,9 +239,10 @@ function TransferTable({ direction, jobs }: { direction: keyof typeof DIRECTION_
   )
 }
 
-function JobActions({ job }: { job: { id: number; filename: string; paused: boolean } }) {
+function JobActions({ job }: { job: JobUpdate }) {
   const [busy, setBusy] = React.useState(false)
   const [confirm, confirmDialog] = useConfirm()
+  const isActive = isActiveJob(job)
   const handlePauseResume = async () => {
     setBusy(true)
     try {
@@ -271,6 +271,23 @@ function JobActions({ job }: { job: { id: number; filename: string; paused: bool
       setBusy(false)
     }
   }
+  const handleDelete = async () => {
+    if (!await confirm({
+      title: "删除记录",
+      description: `确认删除任务记录「${job.filename}」？仅删除任务记录，不影响文件与桶内对象。`,
+      confirmText: "删除记录",
+      destructive: true,
+    })) return
+    setBusy(true)
+    try {
+      const r = await deleteJob(job.id)
+      toast(r.message)
+    } catch (e) {
+      toast.error("删除失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
   return (
     <div className="inline-flex items-center justify-end">
       <DropdownMenu>
@@ -284,20 +301,29 @@ function JobActions({ job }: { job: { id: number; filename: string; paused: bool
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem onClick={handlePauseResume} disabled={busy}>
-            {busy ? (
-              <Loader2 className="size-3.5 animate-spin" />
-            ) : job.paused ? (
-              <Play className="size-3.5" />
-            ) : (
-              <Pause className="size-3.5" />
-            )}
-            {job.paused ? "继续" : "暂停"}
-          </DropdownMenuItem>
-          <DropdownMenuItem variant="destructive" onClick={handleCancel} disabled={busy}>
-            <X className="size-3.5" />
-            取消任务
-          </DropdownMenuItem>
+          {isActive ? (
+            <>
+              <DropdownMenuItem onClick={handlePauseResume} disabled={busy}>
+                {busy ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : job.paused ? (
+                  <Play className="size-3.5" />
+                ) : (
+                  <Pause className="size-3.5" />
+                )}
+                {job.paused ? "继续" : "暂停"}
+              </DropdownMenuItem>
+              <DropdownMenuItem variant="destructive" onClick={handleCancel} disabled={busy}>
+                <X className="size-3.5" />
+                取消任务
+              </DropdownMenuItem>
+            </>
+          ) : (
+            <DropdownMenuItem variant="destructive" onClick={handleDelete} disabled={busy}>
+              <Trash2 className="size-3.5" />
+              删除记录
+            </DropdownMenuItem>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
       {confirmDialog}
