@@ -3796,7 +3796,7 @@ def api_delete_object():
     if not key:
         return jsonify({"error": "缺少 key 参数"}), 400
 
-    bucket_target = (body.get("bucket") or "self").strip()
+    bucket_target = str(body.get("bucket") or "self").strip()
     try:
         bucket_row = resolve_bucket_ref(bucket_target)
     except ValueError as exc:
@@ -3842,7 +3842,7 @@ def api_rename_object():
         return jsonify({"error": "未授权"}), 401
 
     body = request.get_json(silent=True) or {}
-    target = (body.get("bucket") or "self").strip()
+    target = str(body.get("bucket") or "self").strip()
     from_key = (body.get("from_key") or "").strip().lstrip("/")
     to_key = (body.get("to_key") or "").strip().lstrip("/")
 
