@@ -3426,11 +3426,13 @@ def api_files():
     params: list = []
     conditions: list[str] = []
     if q:
-        like = f"%{q}%"
-        conditions.append(
-            "(filename LIKE ? OR source_url LIKE ? OR object_key LIKE ?)"
-        )
-        params.extend([like, like, like])
+        # 空格分词：每个词都需命中（filename / source_url / object_key 任一列）
+        for tok in q.split():
+            like = f"%{tok}%"
+            conditions.append(
+                "(filename LIKE ? OR source_url LIKE ? OR object_key LIKE ?)"
+            )
+            params.extend([like, like, like])
     if status:
         conditions.append("status = ?")
         params.append(status)
@@ -4110,8 +4112,12 @@ def api_objects():
     except (BotoCoreError, ClientError) as exc:
         return jsonify({"error": str(exc)}), 502
     if q:
-        ql = q.lower()
-        all_objects = [o for o in all_objects if ql in o["key"].lower()]
+        # 空格分词：每个词都需命中完整 key（大小写不敏感）
+        tokens = [t.lower() for t in q.split()]
+        all_objects = [
+            o for o in all_objects
+            if all(t in o["key"].lower() for t in tokens)
+        ]
     total = len(all_objects)
     start = (page - 1) * page_size
     objects = all_objects[start:start + page_size]

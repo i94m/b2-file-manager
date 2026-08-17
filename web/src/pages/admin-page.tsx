@@ -231,7 +231,7 @@ function AdminPage() {
                 <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   className="w-[28rem] pl-8"
-                  placeholder="文件名 / 链接 / 文件Key..."
+                  placeholder="搜索，多关键词空格分隔..."
                   value={q}
                   onChange={(e) => setQ(e.target.value)}
                 />

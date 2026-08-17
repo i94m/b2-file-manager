@@ -194,7 +194,7 @@ export function BucketBrowserSection({
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="文件名筛选"
+          placeholder="文件名筛选，空格分隔多词"
           className="min-w-[14rem] flex-1 text-sm"
         />
         <Button size="sm" onClick={search} disabled={loading}>
