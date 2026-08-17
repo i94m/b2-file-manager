@@ -1,6 +1,6 @@
 import * as React from "react"
 import { Link } from "react-router-dom"
-import { ArrowLeft, ArrowUpDown, FolderOpen, HardDrive, RefreshCw, Search } from "lucide-react"
+import { ArrowLeft, ArrowUpDown, Cloud, FolderOpen, HardDrive, RefreshCw, Search } from "lucide-react"
 
 import { type BucketHealthEntry, type Datasource, type FileItem } from "@/lib/types"
 import { getBucketHealth, getFiles, getScripts } from "@/lib/api"
@@ -18,7 +18,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tabs, TabsContent } from "@/components/ui/tabs"
+import {
+  NavigationMenu,
+  NavigationMenuContent,
+  NavigationMenuItem,
+  NavigationMenuLink,
+  NavigationMenuList,
+  NavigationMenuTrigger,
+  navigationMenuTriggerStyle,
+} from "@/components/ui/navigation-menu"
 import { FilesDataTable } from "@/components/files-data-table"
 import { FetchUrlDialog } from "@/components/action-dialogs"
 import { ConnectionStatus, JobsTable } from "@/components/job-status-bar"
@@ -150,10 +159,12 @@ function AdminPage() {
 
   // 任务结束时只更新受影响的行（按 job_id 匹配当前页），不整表刷新
   const { jobs } = useJobs()
-  /** 进行中的任务数（上传管理 Tab 角标）。 */
+  /** 进行中的任务数（上传管理菜单角标）。 */
   const activeJobs = Object.values(jobs).filter(
     (j) => j.status === "queued" || j.status === "uploading",
   ).length
+  /** 启用中的桶（存储桶下拉菜单项）。 */
+  const enabledBuckets = buckets.filter((b) => b.enabled)
   useTerminalFileRefresh(files, patchFile)
 
   return (
@@ -184,40 +195,79 @@ function AdminPage() {
           </div>
         )}
 
-        {/* 顶层模块切换（Tabs 样式）：源文件管理 / 上传管理 / 本地文件 / 各桶（含连通性状态） */}
+        {/* 顶部模块菜单（NavigationMenu）：源文件管理 / 上传管理 / 本地文件 / 桶（下拉） */}
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-          <Tabs
-            value={section}
-            onValueChange={setSection}
-            className="min-w-0"
-          >
-            <TabsList className="flex-wrap gap-1 sm:gap-0">
-              <TabsTrigger value="files" className="gap-1.5">
-                <FolderOpen className="size-4" /> <span className="sm:inline">源文件</span>
-              </TabsTrigger>
-              <TabsTrigger value="transfers" className="gap-1.5">
-                <ArrowUpDown className="size-4" /> <span className="sm:inline">上传管理</span>
-                {activeJobs > 0 && (
-                  <span className="text-[10px] tabular-nums text-muted-foreground">
-                    {activeJobs}
-                  </span>
-                )}
-              </TabsTrigger>
-              <TabsTrigger value="local" className="gap-1.5">
-                <HardDrive className="size-4" /> <span className="sm:inline">本地</span>
-              </TabsTrigger>
-              {buckets.filter((b) => b.enabled).map((b) => (
-                <TabsTrigger
-                  key={b.id}
-                  value={`bucket:${b.id}`}
-                  className="gap-1.5"
+          <NavigationMenu viewport={false} className="max-w-full justify-start">
+            <NavigationMenuList className="max-w-full flex-wrap justify-start gap-1 sm:flex-nowrap">
+              <NavigationMenuItem>
+                <button
+                  type="button"
+                  className={navigationMenuTriggerStyle({ className: "gap-1.5 px-3" })}
+                  data-active={section === "files"}
+                  onClick={() => setSection("files")}
                 >
-                  <HealthDot entry={healthMap[b.id]} />
-                  {b.name}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
+                  <FolderOpen className="size-4" /> 源文件管理
+                </button>
+              </NavigationMenuItem>
+              <NavigationMenuItem>
+                <button
+                  type="button"
+                  className={navigationMenuTriggerStyle({ className: "gap-1.5 px-3" })}
+                  data-active={section === "transfers"}
+                  onClick={() => setSection("transfers")}
+                >
+                  <ArrowUpDown className="size-4" /> 上传管理
+                  {activeJobs > 0 && (
+                    <span className="text-[10px] tabular-nums text-muted-foreground">
+                      {activeJobs}
+                    </span>
+                  )}
+                </button>
+              </NavigationMenuItem>
+              <NavigationMenuItem>
+                <button
+                  type="button"
+                  className={navigationMenuTriggerStyle({ className: "gap-1.5 px-3" })}
+                  data-active={section === "local"}
+                  onClick={() => setSection("local")}
+                >
+                  <HardDrive className="size-4" /> 本地文件
+                </button>
+              </NavigationMenuItem>
+              <NavigationMenuItem>
+                <NavigationMenuTrigger
+                  className="gap-1.5 px-3"
+                  data-active={section.startsWith("bucket:")}
+                >
+                  <Cloud className="size-4" /> 存储桶
+                </NavigationMenuTrigger>
+                <NavigationMenuContent>
+                  <ul className="grid w-[11rem] gap-1 p-1">
+                    {enabledBuckets.length === 0 && (
+                      <li className="px-2 py-1.5 text-xs text-muted-foreground">
+                        暂无启用的桶
+                      </li>
+                    )}
+                    {enabledBuckets.map((b) => (
+                      <li key={b.id}>
+                        <NavigationMenuLink
+                          asChild
+                          data-active={section === `bucket:${b.id}`}
+                          onClick={() => setSection(`bucket:${b.id}`)}
+                          className="cursor-pointer flex-row items-center gap-2"
+                        >
+                          <button type="button" className="flex flex-1 items-center gap-2 text-left">
+                            <HealthDot entry={healthMap[b.id]} />
+                            <span className="min-w-0 truncate">{b.name}</span>
+                          </button>
+                        </NavigationMenuLink>
+                      </li>
+                    ))}
+                  </ul>
+                </NavigationMenuContent>
+              </NavigationMenuItem>
+            </NavigationMenuList>
+          </NavigationMenu>
 
           {/* 搜索 / 状态筛选只在源文件管理模块显示 */}
           {section === "files" && (
