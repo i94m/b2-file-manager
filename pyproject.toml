@@ -1,7 +1,7 @@
 [project]
-name = "b2-file-manager"
-version = "0.1.0"
-description = "B2 网页版上传/下载小工具"
+name = "buckethub"
+version = "0.2.0"
+description = "BucketHub - 多桶文件传输调度台"
 requires-python = ">=3.10"
 dependencies = [
     "boto3>=1.28.0",

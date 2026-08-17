@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B2 网页版上传/下载小工具。
+"""BucketHub - 多桶文件传输调度台。
 
 - 配置：.env（参考 .env.example），Python 依赖由 uv 管理
 - 鉴权：所有请求需带 ?apikey=<APP_API_KEY>
@@ -939,7 +939,7 @@ def fetch_url_to_temp(url: str, job_id: int) -> tuple[Path, int, str]:
 
     上传到 bucket 后由 cleanup_job_temp 清理该临时文件。
     """
-    request = Request(url, headers={"User-Agent": "b2-file-manager/0.1"})
+    request = Request(url, headers={"User-Agent": "BucketHub/0.2"})
     temp_path = Path(tempfile.gettempdir()) / f"b2-fetch-{job_id}.part"
     digest = hashlib.md5()
     with urlopen(request, timeout=60) as response:
@@ -1639,7 +1639,7 @@ def index():
     buckets = get_buckets()
     default = next((b for b in buckets if b["is_default"]), None)
     return jsonify({
-        "app": "b2-file-manager",
+        "app": "buckethub",
         "bucket": default["bucket_name"] if default else "",
         "default_prefix": default_prefix(),
         "bucket_private": BUCKET_PRIVATE,
@@ -2880,7 +2880,7 @@ def api_auth():
     beijing = next((b for b in buckets if b.get("legacy_key") == "beijing"), None)
     bucket2 = next((b for b in buckets if b.get("legacy_key") == "bucket2"), None)
     return jsonify({
-        "app": "b2-file-manager",
+        "app": "buckethub",
         "bucket": default["bucket_name"] if default else "",
         "default_prefix": default_prefix(),
         "bucket_private": BUCKET_PRIVATE,
@@ -3698,7 +3698,7 @@ def delete_script():
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="启动文件同步助手（开发模式）")
+    parser = argparse.ArgumentParser(description="启动 BucketHub（开发模式）")
     parser.add_argument(
         "--reload",
         action="store_true",
@@ -3715,7 +3715,7 @@ def main() -> int:
 
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5000"))
-    print(f"文件同步助手已启动: http://{host}:{port}/?apikey=<APP_API_KEY>")
+    print(f"BucketHub 已启动: http://{host}:{port}/?apikey=<APP_API_KEY>")
     socketio.run(app, host=host, port=port, use_reloader=args.reload)
     return 0
 

@@ -1,5 +1,5 @@
 {
-  "name": "b2-file-manager",
+  "name": "buckethub",
   "private": true,
   "scripts": {
     "build": "tailwindcss -i ./static/input.css -o ./static/style.css --minify",

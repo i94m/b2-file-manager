@@ -1,4 +1,4 @@
-# B2 File Manager API 文档
+# BucketHub API 文档
 
 > 供机器人 / 自动化系统 / 第三方集成调用。
 
@@ -553,7 +553,7 @@ GET /download?key=path/to/file.zip&bucket=3&apikey=YOUR_KEY
 
 ```json
 {
-  "app": "b2-file-manager", "bucket": "mybucket",
+  "app": "buckethub", "bucket": "mybucket",
   "default_prefix": "",
   "bucket2_enabled": false, "bucket2_bucket": "",
   "beijing_enabled": false, "beijing_bucket": "",

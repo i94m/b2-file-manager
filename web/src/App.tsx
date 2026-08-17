@@ -167,7 +167,7 @@ function AppShell() {
         {/* Header */}
         <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">文件同步助手</h1>
+            <h1 className="text-2xl font-bold tracking-tight">BucketHub</h1>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
               <BucketStatusBadges trailing={<ConnectionStatus />} />
             </div>
