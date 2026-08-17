@@ -52,10 +52,10 @@ function ReadOnlySyncCell({
   const job = active?.job ?? (file.job_id ? jobs[file.job_id] : undefined)
   const isMyJob = job && (target === "local"
     ? job.kind === "fetch" || job.kind === "download"
-    : job.kind === "upload" && job.bucket_id === target)
+    : (job.kind === "upload" || job.kind === "transfer") && job.bucket_id === target)
 
   if (isMyJob && job.status === "queued") {
-    return <StatusText tone="queued">{job.serial ? "排队中（串行）" : "排队中"}</StatusText>
+    return <StatusText tone="queued">排队中</StatusText>
   }
   if (isMyJob && job.status === "uploading") {
     return <JobProgressBadge file={file} job={job} />

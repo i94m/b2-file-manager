@@ -249,7 +249,7 @@ export async function urlUpload(
     downloadBucketId?: number
     /** 勾选的自动上传桶 id：录入即下载，落地后自动逐桶上传。 */
     autoUploadBuckets?: number[]
-    /** 下载与后续上传走串行道（排队执行）。 */
+    /** 历史兼容参数（队列固定逐个执行），可省略。 */
     serial?: boolean
   } = {},
 ): Promise<FormResult> {
@@ -268,7 +268,7 @@ export async function urlUpload(
   return handle<FormResult>(res)
 }
 
-/** POST /api/files/:id/upload — 上传服务器本地文件到指定桶（可指定自定义 key / 排队串行执行）。 */
+/** POST /api/files/:id/upload — 上传服务器本地文件到指定桶（可指定自定义 key；进上传队列逐个执行）。 */
 export async function uploadFileToBucket(
   fileId: number,
   bucket: BucketRef,
@@ -281,6 +281,23 @@ export async function uploadFileToBucket(
     body: JSON.stringify({
       bucket_id: bucket,
       ...(key ? { key } : {}),
+      ...(opts.serial ? { serial: true } : {}),
+    }),
+  })
+  return handle<FormResult>(res)
+}
+
+/** POST /api/files/:id/transfer — 从文件的下载源（桶/链接/本地路径）流式直传到目标桶，无需本地副本。 */
+export async function transferToBucket(
+  fileId: number,
+  bucket: BucketRef,
+  opts: { serial?: boolean } = {},
+): Promise<FormResult> {
+  const res = await fetch(`/api/files/${fileId}/transfer`, {
+    method: "POST",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      bucket_id: bucket,
       ...(opts.serial ? { serial: true } : {}),
     }),
   })
@@ -320,7 +337,7 @@ export async function resumeJob(
   return handle(res)
 }
 
-/** POST /api/files/:id/download-server — 下载对象到服务器（指定桶；缺省=默认桶/URL 兜底；可排队串行执行）。 */
+/** POST /api/files/:id/download-server — 下载对象到服务器（指定桶；缺省=默认桶/URL 兜底；进下载队列逐个执行）。 */
 export async function downloadServerFromBucket(
   fileId: number,
   bucket?: BucketRef,

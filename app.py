@@ -50,11 +50,12 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "tmp_uploads"
 MAX_JOBS_SHOWN = 50
 DEFAULT_REGION = "us-east-1"
-# 上传/下载两条并行队列：互不冲突（各自独立 worker 池，互不占用对方名额）
+# 上传/下载两条单并发 FIFO 队列：互不冲突（可同时各跑一个），
+# 但同一队列内严格按提交顺序逐个执行（同一时间最多一个上传 / 一个下载）。
+# serial 参数保留兼容（并入对应道，行为一致），不再单独成道。
 UPLOAD_QUEUE: queue.Queue[int] = queue.Queue()
 DOWNLOAD_QUEUE: queue.Queue[int] = queue.Queue()
-# 串行队列（「排队执行」）：同一时刻只跑一个、按提交顺序接续，可与并行道同时传输
-SERIAL_QUEUE: queue.Queue[int] = queue.Queue()
+SERIAL_QUEUE: queue.Queue[int] = queue.Queue()  # 已废弃，仅占位防外部引用报错
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "3"))
 # 并行道并发上限的可调最大值（顶部下拉框范围；每条道固定起这么多个 worker 线程）
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "8"))
@@ -94,9 +95,8 @@ class DynamicGate:
             return self._limit
 
 
-# 两条并行道的并发闸门（上限可在运行时通过 /api/concurrency 调整并持久化）
-UPLOAD_GATE = DynamicGate(MAX_WORKERS)
-DOWNLOAD_GATE = DynamicGate(MAX_WORKERS)
+# 两条道的并发闸门已退役：上传/下载各固定单并发（FIFO 排队）。
+# DynamicGate 类保留（无引用，将来若恢复可调并发可复用）。
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -106,6 +106,9 @@ TRANSFER_CONFIG = TransferConfig(
     max_concurrency=4,
     use_threads=True,
 )
+
+# 直传任务的分片大小（源流边读边传，不落盘）
+TRANSFER_PART_SIZE = 16 * 1024 * 1024
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
@@ -1035,6 +1038,70 @@ def verify_object(object_key: str, size: int, client=None, bucket_name: str | No
         raise OSError(f"上传校验失败：bucket 中 {actual} 字节，本地 {size} 字节")
 
 
+class _HashingReader:
+    """包装源流：read 时同步累计 md5 与总字节数（直传任务边传边算）。"""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.digest = hashlib.md5()
+        self.total = 0
+
+    def read(self, n=-1):
+        chunk = self.stream.read(n)
+        if chunk:
+            self.digest.update(chunk)
+            self.total += len(chunk)
+        return chunk
+
+
+def transfer_to_bucket(stream, object_key: str, job_id: int, size: int,
+                       client, bucket_name: str) -> tuple[int, str]:
+    """源数据流式直传到目标桶（手动分片 multipart，边读边传不落盘）。
+
+    返回（实际传输字节数, md5）。源流只需支持 read()，由调用方负责关闭。
+    零字节文件退化为 put_object；任何异常（含取消）都会 abort 分片上传。
+    """
+    reader = _HashingReader(stream)
+    callback = make_progress(job_id, size)
+    mpu = client.create_multipart_upload(Bucket=bucket_name, Key=object_key)
+    upload_id = mpu["UploadId"]
+    parts = []
+    part_number = 1
+    try:
+        while True:
+            chunk = reader.read(TRANSFER_PART_SIZE)
+            if not chunk:
+                break
+            resp = client.upload_part(
+                Bucket=bucket_name,
+                Key=object_key,
+                PartNumber=part_number,
+                UploadId=upload_id,
+                Body=chunk,
+            )
+            parts.append({"PartNumber": part_number, "ETag": resp["ETag"]})
+            part_number += 1
+            callback(len(chunk))
+        if parts:
+            client.complete_multipart_upload(
+                Bucket=bucket_name,
+                Key=object_key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
+            )
+        else:
+            # 空对象：multipart 不允许空分片列表，改为 put_object
+            client.abort_multipart_upload(Bucket=bucket_name, Key=object_key, UploadId=upload_id)
+            client.put_object(Bucket=bucket_name, Key=object_key, Body=b"")
+    except Exception:
+        try:
+            client.abort_multipart_upload(Bucket=bucket_name, Key=object_key, UploadId=upload_id)
+        except Exception:
+            pass
+        raise
+    return reader.total, reader.digest.hexdigest()
+
+
 def insert_file_pending(
     *,
     job_id: int | None = None,
@@ -1335,6 +1402,120 @@ def process_job(job_id: int) -> None:
                 sync_to_bucket(source_path, object_key, job_id, size, md5, filename,
                                client=entry["client"], bucket_name=entry["bucket_name"],
                                bucket_row=bucket_row)
+            elif kind == "transfer":
+                # 从文件的下载源（桶/链接/本地路径）流式直传到目标桶，无需本地副本
+                with get_db() as conn:
+                    frow = conn.execute(
+                        "SELECT * FROM files WHERE job_id=? LIMIT 1", (job_id,)
+                    ).fetchone()
+                if frow is None:
+                    raise ValueError("未找到关联的文件记录")
+                f = dict(frow)
+                target_row = resolve_bucket_ref(bucket_id)
+                target_entry = get_bucket_entry(target_row)
+                with get_db() as conn:
+                    uploaded_ids = {
+                        u["bucket_id"] for u in conn.execute(
+                            "SELECT bucket_id FROM file_uploads WHERE file_id=?", (f["id"],)
+                        ).fetchall()
+                    }
+                fk = f.get("download_kind")
+                src_bucket_row = None
+                stream = None
+                try:
+                    if fk == "bucket":
+                        if not f.get("download_bucket_id"):
+                            raise ValueError("下载源指定的桶不存在或已被删除")
+                        src_bucket_row = resolve_bucket_ref(f["download_bucket_id"])
+                    elif fk == "url":
+                        if not (f.get("source_url") or "").strip():
+                            raise ValueError("该文件下载源为下载链接，但没有来源链接")
+                    elif fk != "local":
+                        d = default_bucket()
+                        if d is not None and d["id"] in uploaded_ids:
+                            src_bucket_row = d
+
+                    if src_bucket_row is not None:
+                        if src_bucket_row["id"] == target_row["id"]:
+                            raise ValueError("下载源与目标为同一桶，无需直传")
+                        src_entry = get_bucket_entry(src_bucket_row)
+                        try:
+                            metadata = src_entry["client"].head_object(
+                                Bucket=src_entry["bucket_name"], Key=object_key
+                            )
+                            size = int(metadata["ContentLength"])
+                        except ClientError as exc:
+                            code = str(exc.response.get("Error", {}).get("Code", ""))
+                            if code in ("404", "NoSuchKey", "NotFound"):
+                                raise ValueError(
+                                    f"下载源桶{src_bucket_row['name']}中不存在对象: {object_key}"
+                                ) from exc
+                            raise
+                        with get_db() as conn:
+                            conn.execute("UPDATE jobs SET size=? WHERE id=?", (size, job_id))
+                        emit_job_update(job_id)
+                        stream = src_entry["client"].get_object(
+                            Bucket=src_entry["bucket_name"], Key=object_key
+                        )["Body"]
+                    elif fk == "local":
+                        raw_src = (f.get("source_url") or "").strip()
+                        if not raw_src:
+                            raise ValueError("该文件下载源为本地，但未填写服务器文件路径")
+                        src = Path(raw_src).expanduser()
+                        if not src.is_file():
+                            raise FileNotFoundError(f"本地文件不存在: {raw_src}")
+                        size = src.stat().st_size
+                        with get_db() as conn:
+                            conn.execute("UPDATE jobs SET size=? WHERE id=?", (size, job_id))
+                        emit_job_update(job_id)
+                        stream = open(src, "rb")
+                    else:
+                        url = (f.get("source_url") or "").strip()
+                        if not url:
+                            raise ValueError("无可直传来源（下载源未配置且没有来源链接）")
+                        response = urlopen(
+                            Request(url, headers={"User-Agent": "BucketHub/0.2"}), timeout=60
+                        )
+                        stream = response
+                        total = int(response.headers.get("Content-Length") or 0)
+                        if total > 0:
+                            size = total
+                            with get_db() as conn:
+                                conn.execute("UPDATE jobs SET size=? WHERE id=?", (size, job_id))
+                            emit_job_update(job_id)
+
+                    size, md5 = transfer_to_bucket(
+                        stream, object_key, job_id, size,
+                        client=target_entry["client"],
+                        bucket_name=target_entry["bucket_name"],
+                    )
+                finally:
+                    if stream is not None and hasattr(stream, "close"):
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+
+                verify_object(object_key, size,
+                              client=target_entry["client"],
+                              bucket_name=target_entry["bucket_name"])
+                now = time.time()
+                is_default = bool(target_row.get("is_default"))
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE files SET md5=?, size=?, status='synced', synced_at=?, updated_at=? "
+                        "WHERE job_id=?",
+                        (md5, size, now, now, job_id),
+                    )
+                    for r in conn.execute(
+                        "SELECT id FROM files WHERE job_id=?", (job_id,)
+                    ).fetchall():
+                        apply_upload_flag(conn, r["id"], target_row, True)
+                        if is_default:
+                            conn.execute(
+                                "UPDATE files SET bucket=? WHERE id=?",
+                                (target_row["bucket_name"], r["id"]),
+                            )
             else:
                 raise ValueError(f"未知任务类型: {kind}")
             final_size = size
@@ -1368,10 +1549,12 @@ def process_job(job_id: int) -> None:
 
 
 def enqueue_job(job_id: int, kind: str, serial: bool = False) -> None:
-    """按任务模式分流入队：serial → 串行道；否则 upload → 上传道，download/fetch → 下载道。"""
-    if serial:
-        SERIAL_QUEUE.put(job_id)
-    elif kind == "upload":
+    """按任务类型分流入队：upload/transfer → 上传道，download/fetch → 下载道。
+
+    两条道各自单并发 FIFO：同一时间最多一个上传 + 一个下载。
+    serial 参数仅为兼容旧调用保留（并入对应道，行为一致）。
+    """
+    if kind in ("upload", "transfer"):
         UPLOAD_QUEUE.put(job_id)
     else:
         DOWNLOAD_QUEUE.put(job_id)
@@ -1390,6 +1573,8 @@ def worker_loop(q: queue.Queue[int], gate: DynamicGate | None = None) -> None:
                     "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
                     (f"内部错误（{exc}），请重试", time.time(), job_id),
                 )
+            update_file_by_job(job_id, status="failed", error=f"内部错误（{exc}），请重试")
+            emit_job_update(job_id)
         finally:
             if gate is not None:
                 gate.release()
@@ -2215,11 +2400,7 @@ def _do_file_upload(file_id: int, bucket_param) -> tuple:
     emit_job_update(job_id)
     return jsonify({
         "status": "ok",
-        "message": (
-            f"「{filename}」上传到{bucket_row['name']}的任务已加入排队（串行执行）。"
-            if serial
-            else f"「{filename}」上传到{bucket_row['name']}的任务已加入队列。"
-        ),
+        "message": f"「{filename}」上传到{bucket_row['name']}的任务已加入队列（逐个执行）。",
         "job_id": job_id,
         "file_id": file_id,
     })
@@ -2239,6 +2420,107 @@ def api_file_upload(file_id: int):
 def api_file_upload_cloud(file_id: int):
     """旧路由包装：上传到默认桶（机器人兼容）。"""
     return _do_file_upload(file_id, "self")
+
+
+def _do_file_transfer(file_id: int, bucket_param) -> tuple:
+    """统一实现：从文件的下载源流式直传到目标桶，无需本地副本（kind=transfer）。
+
+    下载源按文件级配置解析（与 download-server 缺省逻辑一致）：
+      download_kind=bucket → 从该桶（可为其他平台）get_object 拉流；
+      =url → 从 source_url 抓取；=local → 读 source_url 指定的服务器本地路径；
+      未配置 → 默认桶已上传则从默认桶拉流，否则回退 source_url。
+    目标桶 bucket_param 支持桶 id / legacy 别名 / None(默认桶)。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    try:
+        bucket_row = resolve_bucket_ref(bucket_param)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+        already = None
+        if row is not None:
+            already = conn.execute(
+                "SELECT 1 FROM file_uploads WHERE file_id=? AND bucket_id=?",
+                (file_id, bucket_row["id"]),
+            ).fetchone()
+    if row is None:
+        return jsonify({"error": f"文件记录 {file_id} 不存在"}), 404
+    f = dict(row)
+    if already:
+        return jsonify({"error": f"该文件已上传到{bucket_row['name']}"}), 400
+
+    # 快速校验下载源可解析（worker 执行时按真实可读性再校验一次）
+    fk = f.get("download_kind")
+    source_desc = ""
+    if fk == "bucket":
+        if not f.get("download_bucket_id"):
+            return jsonify({"error": "下载源指定的桶不存在或已被删除"}), 400
+        if f["download_bucket_id"] == bucket_row["id"]:
+            return jsonify({"error": "下载源与目标为同一桶，无需直传"}), 400
+        source_desc = f"bucket:{f['download_bucket_id']}"
+    elif fk == "url":
+        if not (f.get("source_url") or "").strip():
+            return jsonify({"error": "该文件下载源为下载链接，但没有来源链接"}), 400
+        source_desc = f["source_url"]
+    elif fk == "local":
+        if not (f.get("source_url") or "").strip():
+            return jsonify({"error": "该文件下载源为本地，但未填写服务器文件路径"}), 400
+        source_desc = f["source_url"]
+    else:
+        with get_db() as conn:
+            uploaded_ids = {
+                u["bucket_id"] for u in conn.execute(
+                    "SELECT bucket_id FROM file_uploads WHERE file_id=?", (file_id,)
+                ).fetchall()
+            }
+        d = default_bucket()
+        if d is None or d["id"] not in uploaded_ids:
+            if not (f.get("source_url") or "").strip():
+                return jsonify({"error": "无可直传来源（下载源未配置且没有来源链接）"}), 400
+            source_desc = f["source_url"]
+        else:
+            if d["id"] == bucket_row["id"]:
+                return jsonify({"error": "下载源与目标为同一桶，无需直传"}), 400
+            source_desc = f"bucket:{d['id']}"
+
+    body = request.get_json(silent=True) or {}
+    serial = bool(body.get("serial"))
+    filename = f["filename"] or "download"
+    job_id = insert_job(
+        kind="transfer",
+        filename=filename,
+        object_key=f["object_key"],
+        size=f.get("size") or 0,
+        source=source_desc,
+        bucket_id=bucket_row["id"],
+        serial=serial,
+    )
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE files SET job_id=?, updated_at=? WHERE id=?",
+            (job_id, time.time(), file_id),
+        )
+    enqueue_job(job_id, "transfer", serial)
+    emit_job_update(job_id)
+    return jsonify({
+        "status": "ok",
+        "message": f"「{filename}」从下载源直传到{bucket_row['name']}的任务已加入队列。",
+        "job_id": job_id,
+        "file_id": file_id,
+    })
+
+
+@app.post("/api/files/<int:file_id>/transfer")
+def api_file_transfer(file_id: int):
+    """从文件的下载源（桶/链接/本地路径）流式直传到目标桶，无需本地副本。
+
+    请求体 JSON：{"bucket_id": <桶 id 或 legacy 别名，可选，默认桶>, "serial": <bool，可选>}。
+    """
+    body = request.get_json(silent=True) or {}
+    return _do_file_transfer(file_id, body.get("bucket_id"))
 
 
 @app.post("/api/files/<int:file_id>/upload-beijing")
@@ -2401,11 +2683,7 @@ def _do_file_download_server(file_id: int, bucket_param, serial: bool = False) -
     emit_job_update(job_id)
     return jsonify({
         "status": "ok",
-        "message": (
-            f"「{filename}」下载到服务器 {destination} 的任务已加入排队（串行执行）。"
-            if serial
-            else f"「{filename}」下载到服务器 {destination} 的任务已加入队列。"
-        ),
+        "message": f"「{filename}」下载到服务器 {destination} 的任务已加入队列（逐个执行）。",
         "job_id": job_id,
         "file_id": file_id,
     })
@@ -2658,8 +2936,8 @@ def api_submit():
 
     download 取值：
         "none"   只登记记录，不触发下载（默认；上传到桶由文件列表页手动触发）
-        "now"    立即下载到服务器本地（进入下载并行道，有空闲额度立刻开始）
-        "serial" 放入排队（串行道，与其他排队任务按提交顺序逐个传输）
+        "now"    立即下载到服务器本地（进入下载队列，按提交顺序逐个执行）
+        "serial" 与 "now" 行为一致（下载队列固定单并发，逐个执行）
 
     返回（200 或 400）：
     {
@@ -2945,16 +3223,17 @@ def api_job_resume(job_id: int):
 
 
 def concurrency_payload() -> dict:
+    """上传/下载道的当前并发（固定 1：单并发 FIFO，同类任务严格逐个执行）。"""
     return {
-        "upload": UPLOAD_GATE.limit,
-        "download": DOWNLOAD_GATE.limit,
-        "max": MAX_CONCURRENCY,
+        "upload": 1,
+        "download": 1,
+        "max": 1,
     }
 
 
 @app.get("/api/concurrency")
 def api_concurrency_get():
-    """查询上传/下载两条并行道的当前并发上限。"""
+    """查询上传/下载两条道的并发（兼容保留：固定单并发）。"""
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
     return jsonify(concurrency_payload())
@@ -2962,36 +3241,12 @@ def api_concurrency_get():
 
 @app.post("/api/concurrency")
 def api_concurrency_set():
-    """运行时调整上传/下载并行道的并发上限（立即生效，持久化到 settings 表）。
-
-    请求体 JSON：{"upload": 1~max, "download": 1~max}（至少一个字段）。
-    调小不影响已在传输的任务，只是新任务开始等待；串行道固定单并发，不受此参数控制。
-    """
+    """已退役：上传/下载固定单并发 FIFO，不再支持调整（保留端点兼容旧客户端）。"""
     if not apikey_ok():
         return jsonify({"error": "未授权"}), 401
-    body = request.get_json(silent=True) or {}
-    updates: dict[str, int] = {}
-    for lane in ("upload", "download"):
-        if body.get(lane) is None:
-            continue
-        try:
-            value = int(body[lane])
-        except (TypeError, ValueError):
-            return jsonify({"error": f"{lane} 必须是整数"}), 400
-        if not 1 <= value <= MAX_CONCURRENCY:
-            return jsonify({"error": f"{lane} 取值范围 1~{MAX_CONCURRENCY}"}), 400
-        updates[lane] = value
-    if not updates:
-        return jsonify({"error": "请提供 upload 或 download 字段"}), 400
-    if "upload" in updates:
-        UPLOAD_GATE.set_limit(updates["upload"])
-        set_setting("upload_workers", str(updates["upload"]))
-    if "download" in updates:
-        DOWNLOAD_GATE.set_limit(updates["download"])
-        set_setting("download_workers", str(updates["download"]))
     return jsonify({
         "status": "ok",
-        "message": f"并发已调整：上传 {UPLOAD_GATE.limit} · 下载 {DOWNLOAD_GATE.limit}",
+        "message": "上传/下载队列已固定为单并发（逐个执行），无需调整",
         **concurrency_payload(),
     })
 
@@ -3899,29 +4154,16 @@ def init_runtime() -> None:
             "⚠️ 未配置任何桶，请通过 POST /api/buckets（或页面「桶管理」）添加",
             file=sys.stderr,
         )
-    # 并发上限：优先读 settings 表（页面下拉框调整后持久化），缺省 MAX_WORKERS
-    def _limit_from_setting(key: str) -> int:
-        raw = get_setting(key)
-        try:
-            return max(1, min(int(raw), MAX_CONCURRENCY)) if raw else MAX_WORKERS
-        except (TypeError, ValueError):
-            return MAX_WORKERS
-
-    UPLOAD_GATE.set_limit(_limit_from_setting("upload_workers"))
-    DOWNLOAD_GATE.set_limit(_limit_from_setting("download_workers"))
-    # 上传/下载两条并行道：各起 MAX_CONCURRENCY 个 worker 线程，
-    # 实际并发由各自的闸门上限控制（运行时可通过 /api/concurrency 调整）
-    for i in range(MAX_CONCURRENCY):
-        threading.Thread(
-            target=worker_loop, args=(UPLOAD_QUEUE, UPLOAD_GATE),
-            name=f"upload-worker-{i}", daemon=True,
-        ).start()
-        threading.Thread(
-            target=worker_loop, args=(DOWNLOAD_QUEUE, DOWNLOAD_GATE),
-            name=f"download-worker-{i}", daemon=True,
-        ).start()
-    # 串行道 worker：单线程逐个处理排队任务（串行道活跃时总并发 = 上传上限 + 下载上限 + 1）
-    threading.Thread(target=worker_loop, args=(SERIAL_QUEUE, None), name="serial-worker", daemon=True).start()
+    # 上传/下载两条单并发 FIFO 道：各一个常驻 worker 线程，
+    # 同一道内严格按提交顺序逐个执行；上传与下载可同时进行。
+    threading.Thread(
+        target=worker_loop, args=(UPLOAD_QUEUE, None),
+        name="upload-worker", daemon=True,
+    ).start()
+    threading.Thread(
+        target=worker_loop, args=(DOWNLOAD_QUEUE, None),
+        name="download-worker", daemon=True,
+    ).start()
 
     global BUCKET_PRIVATE, BUCKET_PRIVATE_NOTE
     BUCKET_PRIVATE, BUCKET_PRIVATE_NOTE = check_bucket_private()

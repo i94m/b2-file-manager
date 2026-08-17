@@ -279,7 +279,7 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
             )}
             <p className="text-xs text-muted-foreground">
               {autoBuckets.size > 0
-                ? "录入后自动：下载到服务器 → 逐桶上传（串行排队执行，任务可在「上传管理」跟踪）。"
+                ? "录入后自动：下载到服务器 → 逐桶上传（按顺序逐个执行，任务可在「上传管理」跟踪）。"
                 : "不勾选则只登记，稍后在列表手动下载/上传。"}
             </p>
           </div>

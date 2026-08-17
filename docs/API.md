@@ -44,7 +44,7 @@ curl -X POST https://your-host/api/jobs/5/cancel -H "X-API-Key: YOUR_KEY"
 
 ### Job（任务）
 
-所有上传 / 下载操作都是异步任务。提交后立即返回 `job_id`，后台 worker 并行处理——上传与下载各走一条独立并行道（默认各 `MAX_WORKERS=3` 并发，顶部下拉框可调），互不冲突。
+所有上传 / 下载操作都是异步任务。提交后立即返回 `job_id`，后台 worker 处理——上传与下载各走一条独立的**单并发 FIFO 队列**：同一条队列内严格按提交顺序逐个执行（同一时间最多一个上传、一个下载），两条队列之间互不阻塞（一个上传和一个下载可同时进行）。
 
 **状态流转**：
 
@@ -54,7 +54,7 @@ queued → uploading → done
                    → cancelled
 ```
 
-- `queued`：排队中（等待空闲 worker）
+- `queued`：排队中（等待前一个任务完成）
 - `uploading`：传输中（含 fetch 下载阶段）
 - `done`：完成
 - `failed`：失败（`error` 字段含原因）
@@ -62,10 +62,7 @@ queued → uploading → done
 
 **暂停状态**：`paused=true` 可叠加在 `queued` 或 `uploading` 上。暂停的排队任务会被 worker 跳过；暂停的传输任务会阻塞在当前进度，恢复后继续。
 
-**排队执行（serial）**：提交任务时可传 `"serial": true`，任务进入独立的**串行队列**——
-排队任务之间严格按提交顺序逐个传输（同一时刻只跑一个，前一个完成后自动接续），
-但可与正在执行的并行任务同时传输（串行道活跃时总并发 = `MAX_WORKERS + 1`）。
-串行任务失败/取消不会阻塞后续串行任务；重启后串行任务按提交顺序恢复。
+**serial 参数**：历史兼容参数，现已无行为差异（队列本身固定单并发逐个执行），可省略。
 
 ### File（文件记录）
 
@@ -78,6 +75,7 @@ queued → uploading → done
 | `fetch` | 从 URL 下载 → 上传到 bucket（或下载到服务器） |
 | `upload` | 本地/服务器文件 → 指定桶（`bucket_id` 区分目标） |
 | `download` | 指定桶 → 服务器路径（`bucket_id` 区分来源） |
+| `transfer` | 下载源（桶/链接/本地路径）→ 指定桶，流式直传不落盘（`bucket_id` 区分目标） |
 
 > 历史任务中可能残留 `upload_beijing` / `upload_bucket2` / `download_beijing` / `download_bucket2` 等旧 kind，
 > 启动时已自动迁移为 `upload` / `download` + `bucket_id`。
@@ -143,7 +141,7 @@ X-API-Key: YOUR_KEY
 | `urls` | `string[]` | 是 | 1~50 个 URL，需 `http://` 或 `https://` 开头 |
 | `prefix` | `string` | 否 | 对象 key 前缀（默认读 `DEFAULT_PREFIX` 环境变量；若设置了 `BUCKET_PREFIX`，最终 key 还会前置该应用级前缀） |
 | `bucket` | `string` | 否 | 目标桶：桶 id 或 legacy 别名（缺省 = 默认桶，用于生成 object_key 与同名检测） |
-| `download` | `string` | 否 | 登记后的动作：`none`（默认，只登记不下载）/ `now`（立即下载到服务器本地，进入下载并行道）/ `serial`（放入排队，串行执行；`queue` 为同义别名） |
+| `download` | `string` | 否 | 登记后的动作：`none`（默认，只登记不下载）/ `now`（立即下载到服务器本地，进入下载队列排队执行）/ `serial`（与 `now` 行为一致，历史兼容；`queue` 为同义别名） |
 
 **响应** `200`：
 
@@ -298,7 +296,7 @@ X-API-Key: YOUR_KEY
 
 #### GET /api/concurrency
 
-查询上传/下载两条并行道的当前并发上限（页面顶部下拉框的数据源，`/api/auth` 的 `concurrency` 字段同构）。
+查询上传/下载两条队列的当前并发（兼容保留。队列已固定单并发：同一条队列内按提交顺序逐个执行）。
 
 ```http
 GET /api/concurrency
@@ -308,27 +306,12 @@ X-API-Key: YOUR_KEY
 **响应**：
 
 ```json
-{"upload": 3, "download": 3, "max": 8}
+{"upload": 1, "download": 1, "max": 1}
 ```
 
 #### POST /api/concurrency
 
-运行时调整并行道并发上限（立即生效，持久化到 `settings` 表，重启后仍生效）。
-
-```http
-POST /api/concurrency
-X-API-Key: YOUR_KEY
-Content-Type: application/json
-
-{"upload": 2, "download": 4}
-```
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `upload` | `number` | 否 | 上传并行道并发上限，1~`max` |
-| `download` | `number` | 否 | 下载并行道并发上限，1~`max`（至少传一个字段） |
-
-> 调小上限不打断已在传输的任务，只是新任务开始等待；串行（排队）道固定单并发，不受此参数控制。
+已退役：队列固定单并发 FIFO，不再支持调整（端点保留以兼容旧客户端，调用无害但无效果）。
 
 ---
 
@@ -405,9 +388,39 @@ Content-Type: application/json
 |------|------|------|------|
 | `bucket_id` | `number` 或 `string` | 否 | 桶 id 或 legacy 别名（缺省 = 默认桶） |
 | `key` | `string` | 否 | 自定义完整 object key |
-| `serial` | `boolean` | 否 | `true` = 进串行队列（排队执行，与其他串行任务按顺序逐个传输） |
+| `serial` | `boolean` | 否 | 历史兼容参数，无行为差异（队列固定逐个执行），可省略 |
 
-> 兼容旧路由：`/upload-cloud`、`/upload-bucket2`、`/upload-beijing`（无请求体或同上，固定转发到对应桶，始终走并行队列）。
+> 兼容旧路由：`/upload-cloud`、`/upload-bucket2`、`/upload-beijing`（无请求体或同上，固定转发到对应桶）。
+
+#### POST /api/files/:file_id/transfer
+
+从文件的下载源流式直传到目标桶（**无需本地副本**，源数据边读边传不落盘，跨平台桶间也可直传）。
+
+```http
+POST /api/files/3/transfer
+X-API-Key: YOUR_KEY
+Content-Type: application/json
+
+{"bucket_id": 3}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `bucket_id` | `number` 或 `string` | 否 | 目标桶 id 或 legacy 别名（缺省 = 默认桶） |
+| `serial` | `boolean` | 否 | 历史兼容参数，无行为差异，可省略 |
+
+下载源按文件级配置解析（与 `download-server` 缺省逻辑一致）：
+
+| download_kind | 直传来源 |
+|---------------|----------|
+| `bucket` | 从该桶（可为其他平台）流式拉取对象 |
+| `url` | 从 `source_url` 流式抓取 |
+| `local` | 读 `source_url` 指定的服务器本地路径 |
+| 未配置 | 默认桶已上传 → 从默认桶拉取；否则回退 `source_url` |
+
+- 目标桶已上传 / 源与目标为同一桶 / 无可用下载源时返回 400。
+- 任务 `kind=transfer`，走上传道队列，进度/取消/暂停与其他任务一致；成功后写入 `file_uploads` 标记目标桶（默认桶另置 `status=synced`）。
+- 源对象经 `head_object` 校验存在并取真实大小；传输完成后 `verify_object` 复核目标对象大小，md5 边传边算并回写 `files.md5`。
 
 #### POST /api/files/:file_id/download-server
 
@@ -424,9 +437,9 @@ Content-Type: application/json
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `bucket_id` | `number` 或 `string` | 否 | 桶 id 或 legacy 别名；缺省时优先默认桶，未上传过默认桶则回退 `source_url` 直接下载 |
-| `serial` | `boolean` | 否 | `true` = 进串行队列（排队执行；URL 回退的 `fetch` 任务同样支持） |
+| `serial` | `boolean` | 否 | 历史兼容参数，无行为差异，可省略 |
 
-> 兼容旧路由：`/download-server-bucket2`、`/download-server-beijing`（固定转发到对应桶，始终走并行队列）。
+> 兼容旧路由：`/download-server-bucket2`、`/download-server-beijing`（固定转发到对应桶）。
 
 #### POST /api/files/:file_id/check
 
@@ -708,22 +721,22 @@ socket.on("job_update", (job) => {
 ```typescript
 interface JobUpdate {
   id: number
-  kind: string           // fetch | upload | download
+  kind: string           // fetch | upload | download | transfer
   status: string         // queued | uploading | done | failed | cancelled
   filename: string
   object_key: string
   progress: number       // 已传输字节
   size: number           // 总字节
   error: string | null
-  source: string | null
-  bucket_id: number | null    // upload/download 任务的目标桶 id
+  source: string | null  // transfer 任务为下载源描述（URL / 本地路径 / bucket:<id>）
+  bucket_id: number | null    // upload/download/transfer 任务的目标桶 id
   bucket_name: string | null  // 目标桶显示名
   created_at: number     // Unix 时间戳（秒）
   started_at: number | null
   finished_at: number | null
   cancelled: boolean
   paused: boolean
-  serial: boolean          // true = 串行（排队执行）任务
+  serial: boolean          // 历史兼容字段（队列固定逐个执行，true/false 行为一致）
 }
 ```
 
@@ -760,20 +773,19 @@ interface JobUpdate {
 
 ## 并发模型
 
-上传与下载是**两条互不冲突的并行道**，外加一条串行（排队）道：
+上传与下载是**两条互不冲突的单并发 FIFO 队列**：
 
-| 道 | 任务 kind | 默认并发 | 说明 |
-|----|-----------|----------|------|
-| 上传并行道 | `upload` | `MAX_WORKERS`（3） | 与下载道各自独立 worker 池，互不占用对方名额 |
-| 下载并行道 | `download` / `fetch` | `MAX_WORKERS`（3） | 同上 |
-| 串行道 | 任意（`serial=true`） | 1 | 「排队执行」任务严格按提交顺序逐个接续，可与两条并行道同时传输 |
+| 队列 | 任务 kind | 并发 | 说明 |
+|------|-----------|------|------|
+| 上传队列 | `upload` / `transfer` | 1 | 同一时间最多一个上传任务，按提交顺序逐个执行 |
+| 下载队列 | `download` / `fetch` | 1 | 同一时间最多一个下载任务，按提交顺序逐个执行 |
 
-- **动态并发**：两条并行道的上限可在页面顶部下拉框（或 `POST /api/concurrency`）运行时调整，
-  范围 1~`MAX_CONCURRENCY`（默认 8，环境变量可改），持久化到 `settings` 表。
-  调小不打断进行中的任务；串行道活跃时总并发 = 上传上限 + 下载上限 + 1。
-- **暂停**：暂停的任务占用一个 worker 线程（阻塞在回调），不影响其它 worker 处理新任务。
+- **跨队列并行**：一个上传任务与一个下载任务可同时进行（总并发最多 2）。
+- **同类互斥**：同类任务（如两个上传）严格排队，前一个完成后自动接续下一个。
+- **serial 参数**：历史兼容参数，不改变入队行为（`serial=true` 与 `false` 进入同一条队列）。
+- **暂停**：暂停的传输任务阻塞在当前进度；暂停的排队任务被 worker 跳过（恢复时重新入队）。
 - **取消**：内存标志 + 回调检查，立即中止传输。排队中取消直接标记。
-- **恢复**：服务重启后排队任务按原道恢复（串行道按提交顺序）。
+- **恢复**：服务重启后排队任务按原队列恢复（按提交顺序）。
 
 ---
 

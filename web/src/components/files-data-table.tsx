@@ -6,7 +6,7 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Info, ListOrdered, Loader2, MoreVertical, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
+import { Check, ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Info, ArrowRightLeft, Loader2, MoreVertical, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { type Datasource, type FileItem } from "@/lib/types"
@@ -16,12 +16,14 @@ import {
   cancelJob,
   checkFileExists,
   deleteFile,
+  deleteObject,
   deleteServerFile,
   downloadServerFromBucket,
   getFile,
   pauseJob,
   renameObject,
   resumeJob,
+  transferToBucket,
   updateFile,
   uploadFileToBucket,
 } from "@/lib/api"
@@ -129,6 +131,37 @@ function CheckingText() {
   )
 }
 
+/** 已存在状态：绿色圆形填充对号图标，hover 显示说明。 */
+function ExistsBadge() {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          className="flex size-3.5 shrink-0 items-center justify-center rounded-full bg-green-500 text-white"
+          aria-label="已存在"
+        >
+          <Check className="size-2.5" strokeWidth={3.5} />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>已存在</TooltipContent>
+    </Tooltip>
+  )
+}
+
+/** 不存在状态：小号灰色实心圆点（与绿色实心对勾形成对照），失败时 hover 展示错误。 */
+function EmptyBadge({ label, error }: { label: string; error?: string | null }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="flex items-center" aria-label={label}>
+          <span className="size-2 shrink-0 rounded-full bg-muted-foreground/50" />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs break-all">{error ?? label}</TooltipContent>
+    </Tooltip>
+  )
+}
+
 /** 单元格内「更多操作」⋮ 菜单（一格有多个操作时收敛于此）。 */
 function CellMenu({
   items,
@@ -159,8 +192,9 @@ function CellMenu({
             onClick={it.onClick}
             disabled={it.busy}
             variant={it.destructive ? "destructive" : "default"}
+            className="px-2 py-1 text-xs"
           >
-            {it.busy ? <Loader2 className="size-3.5 animate-spin" /> : <it.icon className="size-3.5" />}
+            {it.busy ? <Loader2 className="size-3 animate-spin" /> : <it.icon className="size-3" />}
             {it.label}
           </DropdownMenuItem>
         ))}
@@ -245,18 +279,18 @@ function CancelJobBtn({ file }: { file: FileItem }) {
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start">
-          <DropdownMenuItem onClick={handlePauseResume} disabled={busy}>
+          <DropdownMenuItem onClick={handlePauseResume} disabled={busy} className="px-2 py-1 text-xs">
             {busy ? (
-              <Loader2 className="size-3.5 animate-spin" />
+              <Loader2 className="size-3 animate-spin" />
             ) : job.paused ? (
-              <Play className="size-3.5" />
+              <Play className="size-3" />
             ) : (
-              <Pause className="size-3.5" />
+              <Pause className="size-3" />
             )}
             {job.paused ? "继续" : "暂停"}
           </DropdownMenuItem>
-          <DropdownMenuItem variant="destructive" onClick={handleCancel} disabled={busy}>
-            <X className="size-3.5" />
+          <DropdownMenuItem variant="destructive" onClick={handleCancel} disabled={busy} className="px-2 py-1 text-xs">
+            <X className="size-3" />
             取消任务
           </DropdownMenuItem>
         </DropdownMenuContent>
@@ -294,28 +328,11 @@ function useCheckExist(
   return { busy, run }
 }
 
-/** 重新检测文件是否存在的图标按钮（本地 / 任意桶通用；共用单元格的检测状态，检测中时状态文字同步切换）。 */
-function CheckExistBtn({ check }: { check: ReturnType<typeof useCheckExist> }) {
-  return (
-    <button
-      type="button"
-      onClick={check.run}
-      disabled={check.busy}
-      className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
-      title="重新检测"
-    >
-      {check.busy ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
-    </button>
-  )
-}
-
-/** 排队中黄字 + 取消按钮；串行（排队执行）任务显示「排队中（串行）」。 */
+/** 排队中黄字 + 取消按钮。 */
 function QueuedLabel({ file }: { file: FileItem }) {
-  const { jobs } = useJobs()
-  const job = file.job_id ? jobs[file.job_id] : undefined
   return (
     <div className="flex items-center gap-0.5">
-      <StatusText tone="queued">{job?.serial ? "排队中（串行）" : "排队中"}</StatusText>
+      <StatusText tone="queued">排队中</StatusText>
       <CancelJobBtn file={file} />
     </div>
   )
@@ -427,7 +444,6 @@ function UploadKeyDialog({
   const [history] = React.useState(() => loadDirHistory())
   /** 初始 key = 文件记录的 object_key（严格模式，可编辑）。 */
   const [objectKey, setObjectKey] = React.useState(file.object_key)
-  const [serial, setSerial] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
 
   const keyError = validateKeyStrict(objectKey)
@@ -438,7 +454,7 @@ function UploadKeyDialog({
     const key = objectKey.trim().replace(/^\/+|\/+$/g, "")
     setBusy(true)
     try {
-      const r = await uploadFileToBucket(file.id, bucketId, key, { serial })
+      const r = await uploadFileToBucket(file.id, bucketId, key)
       toast.success(r.message)
       // 目录段（key 去掉最后一段）进历史，供下次快捷填充
       const dir = key.includes("/") ? key.slice(0, key.lastIndexOf("/")) : ""
@@ -506,14 +522,7 @@ function UploadKeyDialog({
               </div>
             </div>
           )}
-          <label className="flex cursor-pointer items-center gap-2 text-sm">
-            <Checkbox
-              checked={serial}
-              onCheckedChange={(v) => setSerial(v === true)}
-              aria-label="排队执行"
-            />
-            排队执行（与其他排队任务按顺序逐个传输）
-          </label>
+          <p className="text-xs text-muted-foreground">任务进入上传队列，与其它上传任务按顺序逐个执行。</p>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>
@@ -541,7 +550,7 @@ function refreshFileRow(
   }
 }
 
-/** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿字+菜单 / 否则→未下载+菜单。 */
+/** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿勾+菜单 / 否则→未下载+菜单。 */
 function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [busy, setBusy] = React.useState(false)
@@ -599,7 +608,7 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
 
   if (file.local_path) return (
     <div className="flex items-center gap-0.5">
-      {check.busy ? <CheckingText /> : <StatusText tone="active">已存在</StatusText>}
+      {check.busy ? <CheckingText /> : <ExistsBadge />}
       <CellMenu
         items={[
           { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
@@ -611,10 +620,10 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
     </div>
   )
 
-  const handleDownload = async (serial = false) => {
+  const handleDownload = async () => {
     setBusy(true)
     try {
-      const r = await downloadServerFromBucket(file.id, undefined, { serial })
+      const r = await downloadServerFromBucket(file.id, undefined)
       toast.success(r.message)
       refreshFileRow(file.id, onUpdated, onFileUpdated)
     } catch (e) {
@@ -630,12 +639,11 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
       {check.busy ? (
         <CheckingText />
       ) : (
-        <StatusText error={failed ? file.error : undefined}>未下载</StatusText>
+        <EmptyBadge label="未下载" error={failed ? file.error : undefined} />
       )}
       <CellMenu
         items={[
-          { icon: HardDriveDownload, label: "立即下载", onClick: () => handleDownload(), busy },
-          { icon: ListOrdered, label: "排队下载", onClick: () => handleDownload(true), busy },
+          { icon: HardDriveDownload, label: "下载到服务器", onClick: handleDownload, busy },
           { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
         ]}
       />
@@ -643,16 +651,19 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
   )
 }
 
-/** 桶列（通用）：排队→黄字 / 上传中→进度 / 已存在→绿字+菜单 / 有本地→未上传+菜单。 */
+/** 桶列（通用）：排队→黄字 / 上传中→进度 / 已存在→绿勾+菜单 / 否则→未上传+菜单（上传/从源直传）。 */
 function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem; bucket: Bucket; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [renameOpen, setRenameOpen] = React.useState(false)
   const [downloading, setDownloading] = React.useState(false)
+  const [transferring, setTransferring] = React.useState(false)
+  const [deleting, setDeleting] = React.useState(false)
+  const [confirm, confirmDialog] = useConfirm()
   const check = useCheckExist(file.id, bucket.id, onFileUpdated)
   const job = file.job_id ? jobs[file.job_id] : undefined
   const uploaded = file.uploaded_bucket_ids.includes(bucket.id)
-  const isMyJob = job && job.kind === "upload" && job.bucket_id === bucket.id
+  const isMyJob = job && (job.kind === "upload" || job.kind === "transfer") && job.bucket_id === bucket.id
 
   if (isMyJob && job!.status === "queued") return <QueuedLabel file={file} />
   if (isMyJob && job!.status === "uploading") return (
@@ -664,16 +675,51 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
 
   const failed = file.status === "failed" && !!file.local_path && !uploaded
 
-  const handleDownload = async (serial = false) => {
+  const handleDownload = async () => {
     setDownloading(true)
     try {
-      const r = await downloadServerFromBucket(file.id, bucket.id, { serial })
+      const r = await downloadServerFromBucket(file.id, bucket.id)
       toast.success(r.message)
       refreshFileRow(file.id, onUpdated, onFileUpdated)
     } catch (e) {
       toast.error("下载失败", { description: (e as Error).message })
     } finally {
       setDownloading(false)
+    }
+  }
+
+  /** 已上传 → 从桶中删除对象（按 object_key，删后状态回退未上传）。 */
+  const handleDeleteObject = async () => {
+    const ok = await confirm({
+      title: "从桶中删除",
+      description: `确认删除${bucket.name}中的对象「${file.object_key}」？桶内文件将被删除（不影响服务器本地副本），删除后本列状态回到未上传。`,
+      confirmText: "删除",
+      destructive: true,
+    })
+    if (!ok) return
+    setDeleting(true)
+    try {
+      await deleteObject(file.object_key, bucket.id)
+      toast.success(`已从${bucket.name}删除`)
+      refreshFileRow(file.id, onUpdated, onFileUpdated)
+    } catch (e) {
+      toast.error("删除失败", { description: (e as Error).message })
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  /** 无本地副本时：从文件的下载源（桶/链接/本地路径）流式直传到本桶。 */
+  const handleTransfer = async () => {
+    setTransferring(true)
+    try {
+      const r = await transferToBucket(file.id, bucket.id)
+      toast.success(r.message)
+      refreshFileRow(file.id, onUpdated, onFileUpdated)
+    } catch (e) {
+      toast.error("直传失败", { description: (e as Error).message })
+    } finally {
+      setTransferring(false)
     }
   }
 
@@ -687,13 +733,13 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
     return (
       <>
         <div className="flex items-center gap-0.5">
-          {check.busy ? <CheckingText /> : <StatusText tone="active">已存在</StatusText>}
+          {check.busy ? <CheckingText /> : <ExistsBadge />}
           <CellMenu
             items={[
-              { icon: Download, label: "立即下载", onClick: () => handleDownload(), busy: downloading },
-              { icon: ListOrdered, label: "排队下载", onClick: () => handleDownload(true), busy: downloading },
+              { icon: Download, label: "下载到服务器", onClick: handleDownload, busy: downloading },
               { icon: Pencil, label: "重命名", onClick: () => setRenameOpen(true) },
               { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
+              { icon: Trash2, label: "从桶中删除", onClick: handleDeleteObject, busy: deleting, destructive: true },
             ]}
           />
         </div>
@@ -706,6 +752,7 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
             onDone={handleRenameDone}
           />
         )}
+        {confirmDialog}
       </>
     )
   }
@@ -717,11 +764,12 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
           {check.busy ? (
             <CheckingText />
           ) : (
-            <StatusText error={failed ? file.error : undefined}>未上传</StatusText>
+            <EmptyBadge label="未上传" error={failed ? file.error : undefined} />
           )}
           <CellMenu
             items={[
               { icon: CloudUpload, label: "上传", onClick: () => setDialogOpen(true) },
+              { icon: ArrowRightLeft, label: "从源直传", onClick: handleTransfer, busy: transferring },
               { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
             ]}
           />
@@ -747,9 +795,14 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
       {check.busy ? (
         <CheckingText />
       ) : (
-        <StatusText error={failed ? file.error : undefined}>待上传</StatusText>
+        <EmptyBadge label="待上传" error={file.status === "failed" && !uploaded ? file.error : undefined} />
       )}
-      <CheckExistBtn check={check} />
+      <CellMenu
+        items={[
+          { icon: ArrowRightLeft, label: "从源直传", onClick: handleTransfer, busy: transferring },
+          { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
+        ]}
+      />
     </div>
   )
 }
@@ -984,7 +1037,6 @@ export function FilesDataTable({
   })
 
   const [batchBusy, setBatchBusy] = React.useState(false)
-  const [batchSerial, setBatchSerial] = React.useState(false)
 
   const batchDownload = async () => {
     if (!downloadable.length) {
@@ -993,10 +1045,10 @@ export function FilesDataTable({
     }
     setBatchBusy(true)
     const results = await Promise.allSettled(
-      downloadable.map((f) => downloadServerFromBucket(f.id, undefined, { serial: batchSerial })),
+      downloadable.map((f) => downloadServerFromBucket(f.id, undefined)),
     )
     const ok = results.filter((r) => r.status === "fulfilled").length
-    toast.success(`已入队 ${ok} 个下载任务${batchSerial ? "（串行执行）" : ""}`)
+    toast.success(`已入队 ${ok} 个下载任务（按顺序逐个执行）`)
     setRowSelection({})
     setBatchBusy(false)
     // 行级更新：只刷新受影响的行
@@ -1011,10 +1063,10 @@ export function FilesDataTable({
     }
     setBatchBusy(true)
     const results = await Promise.allSettled(
-      uploadable.map((f) => uploadFileToBucket(f.id, bucket.id, undefined, { serial: batchSerial })),
+      uploadable.map((f) => uploadFileToBucket(f.id, bucket.id)),
     )
     const ok = results.filter((r) => r.status === "fulfilled").length
-    toast.success(`已入队 ${ok} 个上传任务${batchSerial ? "（串行执行）" : ""}`)
+    toast.success(`已入队 ${ok} 个上传任务（按顺序逐个执行）`)
     setRowSelection({})
     setBatchBusy(false)
     // 行级更新：只刷新受影响的行
@@ -1025,24 +1077,13 @@ export function FilesDataTable({
 
   return (
     <div className="space-y-3">
-      {/* 批量操作栏 */}
+      {/* 批量操作栏（队列固定逐个执行，无需排队选项） */}
       {selectedFiles.length > 0 && (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/50 px-4 py-2">
           <span className="text-sm font-medium">已选 {selectedFiles.length} 项</span>
-          <label
-            className="flex cursor-pointer items-center gap-1.5 text-sm text-muted-foreground"
-            title="排队任务之间严格按提交顺序逐个传输，可与正在执行的并行任务同时进行"
-          >
-            <Checkbox
-              checked={batchSerial}
-              onCheckedChange={(v) => setBatchSerial(v === true)}
-              aria-label="排队执行"
-            />
-            排队执行
-          </label>
           <Button size="sm" variant="outline" onClick={batchDownload} disabled={batchBusy}>
             <HardDriveDownload className="size-3.5" />
-            批量下载到服务器{downloadable.length > 0 && `（${downloadable.length}）`}{batchSerial && "（排队）"}
+            批量下载到服务器{downloadable.length > 0 && `（${downloadable.length}）`}
           </Button>
           {enabledBuckets.map((bucket) => {
             const uploadable = uploadableByBucket.get(bucket.id) ?? []
@@ -1056,7 +1097,7 @@ export function FilesDataTable({
                 title={uploadable.length === 0 ? "需先下载到服务器" : undefined}
               >
                 <CloudUpload className="size-3.5" />
-                批量上传到{bucket.name}{uploadable.length > 0 && `（${uploadable.length}）`}{batchSerial && "（排队）"}
+                批量上传到{bucket.name}{uploadable.length > 0 && `（${uploadable.length}）`}
               </Button>
             )
           })}

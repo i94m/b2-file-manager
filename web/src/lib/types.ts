@@ -152,7 +152,7 @@ export interface JobUpdate {
   finished_at: number | null
   cancelled: boolean
   paused: boolean
-  /** 串行（排队执行）任务：与其他串行任务按提交顺序逐个传输。 */
+  /** 历史兼容字段（队列固定逐个执行，true/false 行为一致）。 */
   serial: boolean
   bucket_id: number | null
   bucket_name: string | null

@@ -51,16 +51,16 @@ const KIND_LABEL: Record<string, string> = {
   fetch: "下载",
   download: "下载",
   upload: "上传",
+  transfer: "直传",
 }
 
-/** 任务类型文案：上传/下载任务追加目标桶名（如「上传(北京桶)」）；串行任务追加「·排队」。 */
+/** 任务类型文案：上传/下载/直传任务追加目标桶名（如「上传(北京桶)」）。 */
 function jobKindLabel(job: JobUpdate): string {
   const base = KIND_LABEL[job.kind] ?? job.kind
-  const suffix = job.serial ? "·排队" : ""
-  if ((job.kind === "upload" || job.kind === "download") && job.bucket_name) {
-    return `${base}(${job.bucket_name})${suffix}`
+  if ((job.kind === "upload" || job.kind === "download" || job.kind === "transfer") && job.bucket_name) {
+    return `${base}(${job.bucket_name})`
   }
-  return `${base}${suffix}`
+  return base
 }
 
 /** 传输方向视觉样式：上传=蓝 / 下载=绿（fetch 归下载），彩色图标 + 淡淡的行底色一眼可辨。 */
@@ -88,16 +88,16 @@ export function JobsTable() {
 
   const all = Object.values(jobs)
   const uploads = all
-    .filter((j) => j.kind === "upload")
+    .filter((j) => j.kind === "upload" || j.kind === "transfer")
     .sort((a, b) => b.id - a.id)
     .slice(0, 15)
   const downloads = all
-    .filter((j) => j.kind !== "upload")
+    .filter((j) => j.kind !== "upload" && j.kind !== "transfer")
     .sort((a, b) => b.id - a.id)
     .slice(0, 15)
   // 角标只统计「正在进行」的任务数（基于全部任务，不受最近 15 条截断影响）
-  const activeUploads = all.filter((j) => j.kind === "upload" && isActiveJob(j)).length
-  const activeDownloads = all.filter((j) => j.kind !== "upload" && isActiveJob(j)).length
+  const activeUploads = all.filter((j) => (j.kind === "upload" || j.kind === "transfer") && isActiveJob(j)).length
+  const activeDownloads = all.filter((j) => j.kind !== "upload" && j.kind !== "transfer" && isActiveJob(j)).length
 
   if (uploads.length === 0 && downloads.length === 0) return null
 
@@ -206,6 +206,8 @@ function TransferTable({ direction, jobs }: { direction: keyof typeof DIRECTION_
                   <span className="text-destructive">失败</span>
                 ) : j.status === "cancelled" ? (
                   "已取消"
+                ) : j.status === "queued" ? (
+                  <span className="text-amber-500">排队中</span>
                 ) : j.paused ? (
                   <span className="text-amber-600 dark:text-amber-400">
                     已暂停 · {pct.toFixed(0)}%

@@ -100,7 +100,7 @@ function PublicPage() {
     for (const job of Object.values(jobs)) {
       if (job.status !== "queued" && job.status !== "uploading") continue
       const target: ActiveFileStatus["target"] =
-        job.kind === "upload" && job.bucket_id != null ? job.bucket_id : "local"
+        (job.kind === "upload" || job.kind === "transfer") && job.bucket_id != null ? job.bucket_id : "local"
       const prev = map.get(job.object_key)
       if (!prev || prev.job.id < job.id) {
         map.set(job.object_key, { job, target })
