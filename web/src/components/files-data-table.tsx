@@ -9,9 +9,10 @@ import {
 import { ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Info, ListOrdered, Loader2, MoreVertical, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 
-import { type BucketInfo, type Datasource, type FileItem } from "@/lib/types"
+import { type Datasource, type FileItem } from "@/lib/types"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
 import {
+  type Bucket,
   cancelJob,
   checkFileExists,
   deleteFile,
@@ -79,7 +80,7 @@ function skeletonWidths(bucketCount: number): string[] {
   const widths = [
     "w-4",    // select
     "w-16",   // 数据源
-    "w-28",   // 下载源
+    "w-28",   // 文件来源
     "w-28",   // 文件名称
     "w-32",   // ObjectKey
     "w-20",   // 大小（居中）
@@ -93,8 +94,8 @@ function skeletonWidths(bucketCount: number): string[] {
 interface FilesDataTableProps {
   data: FileItem[]
   scripts: Datasource[]
-  /** 全部桶（含禁用；顺序：sort_order → id，桶管理拖动排序），列按此动态生成。 */
-  buckets: BucketInfo[]
+  /** 全部桶（含禁用；顺序：sort_order → id，桶管理拖动排序）；仅启用桶生成列。 */
+  buckets: Bucket[]
   total: number
   page: number
   pageSize: number
@@ -348,24 +349,6 @@ function QueuedLabel({ file }: { file: FileItem }) {
   )
 }
 
-/** 校验目录输入（与后端 clean_prefix 规则一致：禁止 '..' 路径穿越）。 */
-function validateDir(value: string): string | null {
-  const trimmed = value.trim()
-  if (!trimmed) return null
-  const parts = trimmed.replace(/\\/g, "/").split("/")
-  if (parts.some((p) => p === "..")) return "目录不能包含 '..'"
-  return null
-}
-
-/** 校验文件名：非空、无路径分隔符、不能是 '.' 或 '..'。 */
-function validateFilename(value: string): string | null {
-  const trimmed = value.trim()
-  if (!trimmed) return "文件名不能为空"
-  if (/[/\\]/.test(trimmed)) return "文件名不能包含路径分隔符"
-  if (trimmed === "." || trimmed === "..") return "文件名无效"
-  return null
-}
-
 /** 校验完整 ObjectKey：非空、无 '..' 路径穿越、不以 / 开头结尾。 */
 function validateKeyStrict(value: string): string | null {
   const trimmed = value.trim()
@@ -455,7 +438,7 @@ function RenameKeyDialog({
   )
 }
 
-/** 上传到桶 Dialog：输入目录 + 文件名，下方有最近目录历史快捷填充。 */
+/** 上传到桶 Dialog：输入完整 ObjectKey（目录/文件名），支持编辑；最近目录快捷填充。 */
 function UploadKeyDialog({
   file,
   bucketId,
@@ -470,25 +453,24 @@ function UploadKeyDialog({
   onDone: () => void
 }) {
   const [history] = React.useState(() => loadDirHistory())
-  const [dir, setDir] = React.useState(history[0] ?? "")
-  const [filename, setFilename] = React.useState(file.filename ?? "")
+  /** 初始 key = 文件记录的 object_key（严格模式，可编辑）。 */
+  const [objectKey, setObjectKey] = React.useState(file.object_key)
   const [serial, setSerial] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
 
-  const dirError = validateDir(dir)
-  const nameError = validateFilename(filename)
-  const hasError = !!dirError || !!nameError
+  const keyError = validateKeyStrict(objectKey)
+  const hasError = !!keyError
 
   const submit = async () => {
     if (hasError) return
-    const cleanDir = dir.trim().replace(/^\/+|\/+$/g, "")
-    const cleanName = filename.trim()
-    const key = cleanDir ? `${cleanDir}/${cleanName}` : cleanName
+    const key = objectKey.trim().replace(/^\/+|\/+$/g, "")
     setBusy(true)
     try {
       const r = await uploadFileToBucket(file.id, bucketId, key, { serial })
       toast.success(r.message)
-      if (cleanDir) pushDirHistory(cleanDir)
+      // 目录段（key 去掉最后一段）进历史，供下次快捷填充
+      const dir = key.includes("/") ? key.slice(0, key.lastIndexOf("/")) : ""
+      if (dir) pushDirHistory(dir)
       onDone()
     } catch (e) {
       toast.error("上传失败", { description: (e as Error).message })
@@ -501,6 +483,14 @@ function UploadKeyDialog({
     if (e.key === "Enter" && !hasError) submit()
   }
 
+  /** 点击历史目录芯片：替换 key 的目录段，保留文件名。 */
+  const applyDir = (d: string) => {
+    const name = objectKey.includes("/")
+      ? objectKey.slice(objectKey.lastIndexOf("/") + 1)
+      : objectKey
+    setObjectKey(`${d}/${name}`)
+  }
+
   return (
     <Dialog open onOpenChange={(v) => { if (!v && !busy) onClose() }}>
       <DialogContent className="sm:max-w-lg">
@@ -509,42 +499,33 @@ function UploadKeyDialog({
         </DialogHeader>
         <div className="space-y-4 py-2">
           <div className="space-y-2">
-            <Label htmlFor="upload-dir">目录</Label>
+            <Label htmlFor="upload-key">ObjectKey（目录/文件名）</Label>
             <Input
-              id="upload-dir"
-              value={dir}
-              onChange={(e) => setDir(e.target.value)}
+              id="upload-key"
+              value={objectKey}
+              onChange={(e) => setObjectKey(e.target.value)}
               onKeyDown={onEnter}
-              placeholder="如 backups/2026"
-              className={cn("font-mono text-sm", dirError && "border-destructive focus-visible:ring-destructive")}
+              placeholder="如 opus5_delivery_20260812/a.zip"
+              className={cn("font-mono text-sm", keyError && "border-destructive focus-visible:ring-destructive")}
               autoFocus
             />
-            {dirError && (
-              <p className="text-xs text-destructive">{dirError}</p>
-            )}
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="upload-name">文件名</Label>
-            <Input
-              id="upload-name"
-              value={filename}
-              onChange={(e) => setFilename(e.target.value)}
-              onKeyDown={onEnter}
-              className={cn("font-mono text-sm", nameError && "border-destructive focus-visible:ring-destructive")}
-            />
-            {nameError && (
-              <p className="text-xs text-destructive">{nameError}</p>
+            {keyError ? (
+              <p className="text-xs text-destructive">{keyError}</p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                完整对象键，已预填当前记录的 ObjectKey，可编辑；上传成功后按该 key 存储。
+              </p>
             )}
           </div>
           {history.length > 0 && (
             <div className="space-y-1.5">
-              <span className="text-xs text-muted-foreground">最近目录（点击填充）</span>
+              <span className="text-xs text-muted-foreground">最近目录（点击替换目录段）</span>
               <div className="flex flex-wrap gap-1.5">
                 {history.map((d) => (
                   <button
                     key={d}
                     type="button"
-                    onClick={() => setDir(d)}
+                    onClick={() => applyDir(d)}
                     className="rounded bg-muted px-2 py-1 font-mono text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                   >
                     {d}
@@ -691,7 +672,7 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
 }
 
 /** 桶列（通用）：排队→黄字 / 上传中→进度 / 已存在→绿字+菜单 / 有本地→未上传+菜单。 */
-function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem; bucket: BucketInfo; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
+function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem; bucket: Bucket; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [renameOpen, setRenameOpen] = React.useState(false)
@@ -801,14 +782,14 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
   )
 }
 
-/** 下载源列：纯文本展示（hover tooltip 显示对应地址），编辑入口在「编辑文件」弹窗。 */
+/** 文件来源列：纯文本展示（hover tooltip 显示对应地址），编辑入口在「编辑文件」弹窗。 */
 function DownloadSourceCell({ file }: { file: FileItem }) {
   const bucketMissing = file.download_kind === "bucket" && file.download_bucket_id == null
 
-  /** 显示文本：下载链接 / 本地 / 桶名 / 未配置。 */
+  /** 显示文本：网络链接 / 服务器路径 / 桶名 / 未配置。 */
   const label =
     file.download_kind === "url"
-      ? "下载链接"
+      ? "网络链接"
       : file.download_kind === "local"
         ? "本地"
         : file.download_kind === "bucket"
@@ -817,12 +798,12 @@ function DownloadSourceCell({ file }: { file: FileItem }) {
 
   const copyValue = file.source_url ?? (file.download_kind === "bucket" ? file.object_key : null)
 
-  /** hover 提示：下载源对应的地址（链接 / 本地路径 / 桶内 ObjectKey）。 */
+  /** hover 提示：来源对应的地址（链接 / 服务器路径 / 桶内 ObjectKey）。 */
   const sourceTip = file.source_url
     ? file.source_url
     : file.download_kind === "bucket"
       ? `桶内 ObjectKey: ${file.object_key}`
-      : "未配置下载源"
+      : "未配置来源"
 
   return (
     <div className="flex items-center gap-1">
@@ -869,6 +850,12 @@ export function FilesDataTable({
     return map
   }, [scripts])
 
+  /** 只展示启用桶的列（停用桶不参与业务）。 */
+  const enabledBuckets = React.useMemo(
+    () => buckets.filter((b) => b.enabled),
+    [buckets],
+  )
+
   const [rowSelection, setRowSelection] = React.useState<Record<string, boolean>>({})
   const [editingFile, setEditingFile] = React.useState<FileItem | null>(null)
   const [detailsFile, setDetailsFile] = React.useState<FileItem | null>(null)
@@ -906,7 +893,7 @@ export function FilesDataTable({
         },
         {
           id: "download_source",
-          header: "下载源",
+          header: "文件来源",
           cell: ({ row }) => <DownloadSourceCell file={row.original} />,
         },
         {
@@ -963,7 +950,7 @@ export function FilesDataTable({
           cell: ({ row }) => <div className="flex justify-center"><LocalCell file={row.original} onUpdated={onDeleted} onFileUpdated={onFileUpdated} /></div>,
         },
       ]
-      buckets.forEach((bucket) => {
+      enabledBuckets.forEach((bucket) => {
         cols.push({
           id: `bucket-${bucket.id}`,
           header: () => <div className="min-w-[4rem] text-center">{bucket.name}</div>,
@@ -995,7 +982,7 @@ export function FilesDataTable({
       )
       return cols
     },
-    [datasourceName, onDeleted, onFileUpdated, buckets],
+    [datasourceName, onDeleted, onFileUpdated, enabledBuckets],
   )
 
   const table = useReactTable({
@@ -1015,9 +1002,9 @@ export function FilesDataTable({
 
   const selectedFiles = table.getSelectedRowModel().rows.map((r) => r.original)
   const downloadable = selectedFiles.filter((f) => !f.local_path)
-  /** 每个桶可批量上传的文件（有本地副本且尚未上传到该桶）。 */
+  /** 每个桶可批量上传的文件（有本地副本且尚未上传到该桶；仅启用桶）。 */
   const uploadableByBucket = new Map<number, FileItem[]>()
-  buckets.forEach((b) => {
+  enabledBuckets.forEach((b) => {
     uploadableByBucket.set(
       b.id,
       selectedFiles.filter((f) => f.local_path && !f.uploaded_bucket_ids.includes(b.id)),
@@ -1044,7 +1031,7 @@ export function FilesDataTable({
     downloadable.forEach((f) => refreshFileRow(f.id, onDeleted, onFileUpdated))
   }
 
-  const batchUploadTo = async (bucket: BucketInfo) => {
+  const batchUploadTo = async (bucket: Bucket) => {
     const uploadable = uploadableByBucket.get(bucket.id) ?? []
     if (!uploadable.length) {
       toast("没有可上传的文件（需先下载到服务器）")
@@ -1062,7 +1049,7 @@ export function FilesDataTable({
     uploadable.forEach((f) => refreshFileRow(f.id, onDeleted, onFileUpdated))
   }
 
-  const skelWidths = skeletonWidths(buckets.length)
+  const skelWidths = skeletonWidths(enabledBuckets.length)
 
   return (
     <div className="space-y-3">
@@ -1085,7 +1072,7 @@ export function FilesDataTable({
             <HardDriveDownload className="size-3.5" />
             批量下载到服务器{downloadable.length > 0 && `（${downloadable.length}）`}{batchSerial && "（排队）"}
           </Button>
-          {buckets.map((bucket) => {
+          {enabledBuckets.map((bucket) => {
             const uploadable = uploadableByBucket.get(bucket.id) ?? []
             return (
               <Button
@@ -1165,7 +1152,7 @@ export function FilesDataTable({
             ) : (
               <TableRow>
                 <TableCell colSpan={columns.length} className="h-32 text-center text-muted-foreground">
-                  文件库还没有文件，录入待处理文件或上传后自动登记。
+                  文件库还没有文件，新增文件或上传后自动登记。
                 </TableCell>
               </TableRow>
             )}
@@ -1309,7 +1296,7 @@ const STATUS_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "cancelled", label: "已取消" },
 ]
 
-/** 编辑文件记录 Modal（基础信息 + 文件级下载源；其余字段由列表内操作维护）。 */
+/** 编辑文件记录 Modal（基础信息 + 文件级来源；其余字段由列表内操作维护）。 */
 function EditFileDialog({
   file,
   scripts,
@@ -1328,7 +1315,7 @@ function EditFileDialog({
     status: file.status,
     datasource_id: file.datasource_id ? String(file.datasource_id) : "",
   })
-  /** 文件级下载源："none" 对应 NULL（未配置）。 */
+  /** 文件级来源："none" 对应 NULL（未配置）。 */
   const [downloadKind, setDownloadKind] = React.useState<"none" | "url" | "local" | "bucket">(
     file.download_kind === "url" || file.download_kind === "local" || file.download_kind === "bucket"
       ? file.download_kind
@@ -1470,15 +1457,15 @@ function EditFileDialog({
               </Select>
             </div>
             <div className="space-y-2">
-              <Label>下载源</Label>
+              <Label>文件来源</Label>
               <Select value={downloadValue} onValueChange={handleDownloadChange}>
                 <SelectTrigger className="w-full">
                   <SelectValue placeholder="未配置（默认）" />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="none">未配置（默认）</SelectItem>
-                  <SelectItem value="url">下载链接</SelectItem>
-                  <SelectItem value="local">本地（服务器路径）</SelectItem>
+                  <SelectItem value="url">网络链接（URL）</SelectItem>
+                  <SelectItem value="local">服务器路径</SelectItem>
                   {buckets.map((b) => (
                     <SelectItem key={b.id} value={`bucket:${b.id}`}>
                       {b.name}
@@ -1497,7 +1484,7 @@ function EditFileDialog({
           {(downloadKind === "url" || downloadKind === "local") && (
             <div className="space-y-2">
               <Label htmlFor="edit-source">
-                {downloadKind === "url" ? "下载链接" : "服务器文件路径"}
+                {downloadKind === "url" ? "网络链接（URL）" : "服务器文件路径"}
               </Label>
               <Input
                 id="edit-source"
@@ -1572,7 +1559,7 @@ function FileDetailsDialog({
 }: {
   file: FileItem
   scripts: Datasource[]
-  buckets: BucketInfo[]
+  buckets: Bucket[]
   onClose: () => void
 }) {
   const datasource = file.datasource_id
@@ -1611,11 +1598,11 @@ function FileDetailsDialog({
           <DetailRow label="数据源">
             {datasource ? datasource.name : <Dash />}
           </DetailRow>
-          <DetailRow label="下载源">
+          <DetailRow label="文件来源">
             {file.download_kind === "url" ? (
-              "下载链接"
+              "网络链接"
             ) : file.download_kind === "local" ? (
-              "本地（服务器路径）"
+              "服务器路径"
             ) : file.download_kind === "bucket" ? (
               downloadBucket ? (
                 `桶 · ${downloadBucket.name}`

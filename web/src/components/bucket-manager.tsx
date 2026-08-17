@@ -1,5 +1,5 @@
 import * as React from "react"
-import { Database, GripVertical, Loader2, MoreVertical, Pencil, Plus, Trash2, Zap } from "lucide-react"
+import { CircleCheck, CircleSlash, Database, GripVertical, Loader2, MoreVertical, Pencil, Plus, Trash2, Zap } from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -160,6 +160,26 @@ export function BucketManager() {
     }
   }
 
+  /** 启用/停用切换：停用的桶不参与业务（导航不显示、不可上传/下载）。 */
+  const [togglingId, setTogglingId] = React.useState<number | null>(null)
+  const handleToggleEnabled = async (b: Bucket) => {
+    // 默认桶不允许停用（大量缺省请求依赖它）
+    if (b.enabled && b.is_default) {
+      toast.error("默认桶不能停用，请先把其它桶设为默认")
+      return
+    }
+    setTogglingId(b.id)
+    try {
+      const r = await updateBucket(b.id, { enabled: !b.enabled })
+      toast.success(r.message)
+      refresh()
+    } catch (e) {
+      toast.error("操作失败", { description: (e as Error).message })
+    } finally {
+      setTogglingId(null)
+    }
+  }
+
   return (
     <Dialog
       open={open}
@@ -260,6 +280,23 @@ export function BucketManager() {
                             <DropdownMenuContent align="end">
                               <DropdownMenuItem onClick={() => setFormTarget({ id: b.id })}>
                                 <Pencil className="size-3.5" /> 编辑
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onClick={() => handleToggleEnabled(b)}
+                                disabled={togglingId !== null || (b.enabled && b.is_default)}
+                              >
+                                {togglingId === b.id ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : b.enabled ? (
+                                  <CircleSlash className="size-3.5" />
+                                ) : (
+                                  <CircleCheck className="size-3.5" />
+                                )}
+                                {b.enabled
+                                  ? b.is_default
+                                    ? "停用（默认桶不可停用）"
+                                    : "停用"
+                                  : "启用"}
                               </DropdownMenuItem>
                               <DropdownMenuItem
                                 onClick={() => handleTest(b)}

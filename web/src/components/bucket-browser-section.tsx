@@ -1,12 +1,18 @@
 import * as React from "react"
-import { ArrowRightLeft, ChevronLeft, ChevronRight, Cloud, Download, Loader2, MoreVertical, Pencil, Search, Trash2, Upload } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, ChevronRight, Cloud, Download, Info, Loader2, MoreVertical, Pencil, Search, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
-import { type BucketObject } from "@/lib/types"
+import { type BucketObject, type BucketHealthEntry } from "@/lib/types"
 import { deleteObject, getObjects, renameObject, serverDownload, uploadFile } from "@/lib/api"
 import { useConfirm } from "@/lib/use-confirm"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
+import { BucketHealthCard } from "@/components/bucket-health"
 import { Button } from "@/components/ui/button"
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "@/components/ui/hover-card"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -42,10 +48,17 @@ export function BucketBrowserSection({
   title,
   bucketId,
   defaultPrefix,
+  bucketName,
+  bucketKey,
+  health,
 }: {
   title: string
   bucketId: number
   defaultPrefix: string
+  /** 桶显示名与真实桶名（标题 hover 健康详情卡用）。 */
+  bucketName?: string
+  bucketKey?: string
+  health?: BucketHealthEntry
 }) {
   const [prefix, setPrefix] = React.useState(defaultPrefix)
   const [query, setQuery] = React.useState("")
@@ -132,6 +145,22 @@ export function BucketBrowserSection({
       <div className="flex items-center gap-2 border-b px-4 py-3">
         <Cloud className="size-4 text-muted-foreground" />
         <h2 className="text-base font-semibold">{title}</h2>
+        {bucketName && bucketKey && (
+          <HoverCard openDelay={250} closeDelay={100}>
+            <HoverCardTrigger asChild>
+              <button
+                type="button"
+                title="悬停查看桶连通性详情"
+                className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                <Info className="size-3.5" />
+              </button>
+            </HoverCardTrigger>
+            <HoverCardContent align="start" className="w-72">
+              <BucketHealthCard name={bucketName} bucketName={bucketKey} entry={health ?? null} />
+            </HoverCardContent>
+          </HoverCard>
+        )}
         {objects !== null && <Badge variant="secondary">共 {total} 个</Badge>}
         <Button
           size="sm"

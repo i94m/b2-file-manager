@@ -238,7 +238,7 @@ export async function uploadFile(
   return handle<FormResult>(res)
 }
 
-/** POST /url-upload — 录入链接，只登记不自动上传（可带文件级下载源配置；key=完整 ObjectKey）。 */
+/** POST /url-upload — 录入链接（可自动下载 + 逐桶上传；key=完整 ObjectKey）。 */
 export async function urlUpload(
   url: string,
   opts: {
@@ -247,6 +247,10 @@ export async function urlUpload(
     datasourceId?: number
     downloadKind?: "url" | "local" | "bucket"
     downloadBucketId?: number
+    /** 勾选的自动上传桶 id：录入即下载，落地后自动逐桶上传。 */
+    autoUploadBuckets?: number[]
+    /** 下载与后续上传走串行道（排队执行）。 */
+    serial?: boolean
   } = {},
 ): Promise<FormResult> {
   const form = new FormData()
@@ -256,6 +260,10 @@ export async function urlUpload(
   if (opts.datasourceId) form.append("datasource_id", String(opts.datasourceId))
   if (opts.downloadKind) form.append("download_kind", opts.downloadKind)
   if (opts.downloadBucketId) form.append("download_bucket_id", String(opts.downloadBucketId))
+  if (opts.autoUploadBuckets?.length) {
+    form.append("auto_upload_buckets", opts.autoUploadBuckets.join(","))
+  }
+  if (opts.serial) form.append("serial", "true")
   const res = await fetch("/url-upload", { method: "POST", headers: headers(true), body: form })
   return handle<FormResult>(res)
 }

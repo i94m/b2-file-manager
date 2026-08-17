@@ -3,9 +3,11 @@ import { ThemeProvider, useTheme } from "next-themes"
 import { JobsProvider, useJobs } from "@/lib/use-jobs"
 import { BucketsProvider, useBuckets } from "@/lib/use-buckets"
 import { AuthGuard } from "@/components/auth-guard"
-import { ArrowUpDown, Cloud, FolderOpen, HardDrive, RefreshCw, Search, Moon, Sun } from "lucide-react"
+import { ArrowUpDown, FolderOpen, HardDrive, RefreshCw, Search, Moon, Sun } from "lucide-react"
+import { getBucketHealth } from "@/lib/api"
+import { HealthDot } from "@/components/bucket-health"
 
-import { type Datasource, type FileItem } from "@/lib/types"
+import { type BucketHealthEntry, type Datasource, type FileItem } from "@/lib/types"
 import { getFile, getFiles, getScripts } from "@/lib/api"
 import { useAppInfo } from "@/components/auth-guard"
 import { Button } from "@/components/ui/button"
@@ -23,7 +25,6 @@ import { TooltipProvider } from "@/components/ui/tooltip"
 import { FilesDataTable } from "@/components/files-data-table"
 import { FetchUrlDialog } from "@/components/action-dialogs"
 import { ConnectionStatus, JobsTable } from "@/components/job-status-bar"
-import { BucketStatusBadges } from "@/components/bucket-status-badges"
 import { ServerFilesSection } from "@/components/server-files-section"
 import { BucketBrowserSection } from "@/components/bucket-browser-section"
 import { BucketManager } from "@/components/bucket-manager"
@@ -51,6 +52,24 @@ function AppShell() {
   const bucketPrivateNote = appInfo?.bucket_private_note ?? ""
   const bucketPrivate = appInfo?.bucket_private ?? null
 
+  // 桶连通性：导航菜单内状态点 + hover 详情共用
+  const [healthMap, setHealthMap] = React.useState<Record<number, BucketHealthEntry>>({})
+  const checkHealth = React.useCallback(async () => {
+    try {
+      const data = await getBucketHealth()
+      const map: Record<number, BucketHealthEntry> = {}
+      data.buckets.forEach((b) => {
+        map[b.id] = b.health
+      })
+      setHealthMap(map)
+    } catch {
+      /* 检测失败保持原状态 */
+    }
+  }, [])
+  React.useEffect(() => {
+    checkHealth()
+  }, [checkHealth])
+
   const [files, setFiles] = React.useState<FileItem[]>([])
 
   /** 单条文件记录更新（检测存在性等轻量操作，不触发全表重载）。 */
@@ -69,6 +88,15 @@ function AppShell() {
   const [refreshing, setRefreshing] = React.useState(false)
   /** 顶层模块切换：files=源文件管理 / transfers=上传管理 / local=本地文件 / bucket:<id>=各桶（动态）。 */
   const [section, setSection] = React.useState<string>("files")
+
+  // 当前选中的桶被停用/删除时，回退到源文件管理
+  React.useEffect(() => {
+    if (section.startsWith("bucket:")) {
+      const id = Number(section.slice("bucket:".length))
+      const stillEnabled = buckets.some((b) => b.id === id && b.enabled)
+      if (!stillEnabled) setSection("files")
+    }
+  }, [section, buckets])
 
   // 搜索防抖：q 变化后 400ms 才更新 debouncedQ（触发列表请求）
   React.useEffect(() => {
@@ -172,11 +200,9 @@ function AppShell() {
       <main className="mx-auto max-w-[1600px] px-4 py-8 sm:px-6">
         {/* Header */}
         <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight">BucketHub</h1>
-            <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
-              <BucketStatusBadges trailing={<ConnectionStatus />} />
-            </div>
+          <div className="flex items-center gap-3">
+            <h1 className="text-3xl font-bold tracking-tight">BucketHub</h1>
+            <ConnectionStatus />
           </div>
           <div className="flex items-center gap-2">
             <BucketManager />
@@ -192,77 +218,79 @@ function AppShell() {
           </div>
         )}
 
-        {/* 顶层模块切换：源文件管理 / 上传管理 / 桶文件 */}
-        <Tabs
-          value={section}
-          onValueChange={(v) => setSection(v as typeof section)}
-          className="mb-4"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-2">
+        {/* 顶层模块切换（Tabs 样式）：源文件管理 / 上传管理 / 本地文件 / 各桶（含连通性状态） */}
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+          <Tabs
+            value={section}
+            onValueChange={setSection}
+            className="min-w-0"
+          >
             <TabsList className="flex-wrap">
               <TabsTrigger value="files" className="gap-1.5">
-                <FolderOpen className="size-4" />
-                源文件管理
+                <FolderOpen className="size-4" /> 源文件管理
               </TabsTrigger>
               <TabsTrigger value="transfers" className="gap-1.5">
-                <ArrowUpDown className="size-4" />
-                上传管理
+                <ArrowUpDown className="size-4" /> 上传管理
                 {activeJobs > 0 && (
-                  <span className="text-[10px] tabular-nums text-muted-foreground">{activeJobs}</span>
+                  <span className="text-[10px] tabular-nums text-muted-foreground">
+                    {activeJobs}
+                  </span>
                 )}
               </TabsTrigger>
               <TabsTrigger value="local" className="gap-1.5">
-                <HardDrive className="size-4" />
-                本地文件
+                <HardDrive className="size-4" /> 本地文件
               </TabsTrigger>
-              {buckets.map((b) => (
+              {buckets.filter((b) => b.enabled).map((b) => (
                 <TabsTrigger
                   key={b.id}
                   value={`bucket:${b.id}`}
-                  title={b.bucket_name}
                   className="gap-1.5"
                 >
-                  <Cloud className="size-4" />
+                  <HealthDot entry={healthMap[b.id]} />
                   {b.name}
                 </TabsTrigger>
               ))}
             </TabsList>
+          </Tabs>
 
-            {/* 搜索 / 状态筛选只在源文件管理模块显示 */}
-            {section === "files" && (
-              <div className="flex flex-wrap items-center gap-2">
-                <FetchUrlDialog
-                  defaultPrefix={defaultPrefix}
-                  scripts={scripts}
-                  onDone={refresh}
+          {/* 搜索 / 状态筛选只在源文件管理模块显示 */}
+          {section === "files" && (
+            <div className="flex flex-wrap items-center gap-2">
+              <FetchUrlDialog
+                defaultPrefix={defaultPrefix}
+                scripts={scripts}
+                onDone={refresh}
+              />
+              <div className="relative">
+                <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  className="w-[28rem] pl-8"
+                  placeholder="文件名 / 链接 / 文件Key..."
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
                 />
-                <div className="relative">
-                  <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    className="w-[28rem] pl-8"
-                    placeholder="文件名 / 链接 / 文件Key..."
-                    value={q}
-                    onChange={(e) => setQ(e.target.value)}
-                  />
-                </div>
-                <Select value={status} onValueChange={(v) => { setStatus(v); setPage(1) }}>
-                  <SelectTrigger className="w-32">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">全部状态</SelectItem>
-                    <SelectItem value="synced">已上传</SelectItem>
-                    <SelectItem value="pending">待上传</SelectItem>
-                    <SelectItem value="failed">失败</SelectItem>
-                    <SelectItem value="deleted">已删除</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Button variant="ghost" size="icon" onClick={refresh} title="刷新" disabled={refreshing}>
-                  <RefreshCw className={refreshing ? "size-4 animate-spin" : "size-4"} />
-                </Button>
               </div>
-            )}
-          </div>
+              <Select value={status} onValueChange={(v) => { setStatus(v); setPage(1) }}>
+                <SelectTrigger className="w-32">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">全部状态</SelectItem>
+                  <SelectItem value="synced">已上传</SelectItem>
+                  <SelectItem value="pending">待上传</SelectItem>
+                  <SelectItem value="failed">失败</SelectItem>
+                  <SelectItem value="deleted">已删除</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button variant="ghost" size="icon" onClick={refresh} title="刷新" disabled={refreshing}>
+                <RefreshCw className={refreshing ? "size-4 animate-spin" : "size-4"} />
+              </Button>
+            </div>
+          )}
+        </div>
+
+        {/* 模块内容（section 驱动，Tabs 仅作受控容器复用挂载/卸载行为） */}
+        <Tabs value={section} onValueChange={setSection} className="mb-4">
 
           {/* 源文件管理：文件库表格 */}
           <TabsContent value="files">
@@ -301,6 +329,9 @@ function AppShell() {
                 title={`${b.name} · ${b.bucket_name}`}
                 bucketId={b.id}
                 defaultPrefix={defaultPrefix}
+                bucketName={b.name}
+                bucketKey={b.bucket_name}
+                health={healthMap[b.id]}
               />
             </TabsContent>
           ))}

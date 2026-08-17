@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import queue
 import secrets
@@ -539,6 +540,7 @@ def init_db() -> None:
                 download_kind VARCHAR(20),
                 download_bucket_id INT,
                 local_path VARCHAR(1024),
+                auto_upload_buckets TEXT,
                 created_at DOUBLE NOT NULL,
                 updated_at DOUBLE NOT NULL,
                 synced_at DOUBLE,
@@ -583,6 +585,7 @@ def init_db() -> None:
                 ("download_kind", "VARCHAR(20)"),
                 ("download_bucket_id", "INT"),
                 ("local_path", "VARCHAR(1024)"),
+                ("auto_upload_buckets", "TEXT"),
                 ("updated_at", "DOUBLE"),
             ):
                 if name not in file_columns:
@@ -1042,6 +1045,7 @@ def insert_file_pending(
     datasource_id: int | None = None,
     download_kind: str | None = None,
     download_bucket_id: int | None = None,
+    auto_upload_buckets: list[int] | None = None,
 ) -> int:
     """登记一条 pending 记录，后续由 worker 逐步更新。
 
@@ -1049,13 +1053,15 @@ def insert_file_pending(
     返回新插入的 file id。
     download_kind：文件级下载源 'url'（来源链接）/ 'local'（服务器本地路径）/
     'bucket'（指定桶，配 download_bucket_id）/ None 未配置。
+    auto_upload_buckets：勾选的自动上传桶 id 列表（JSON 存储）；
+    下载到服务器完成后由 worker 自动逐桶创建上传任务。
     """
     now = time.time()
     with get_db() as conn:
         cursor = conn.execute(
             "INSERT INTO files (job_id, object_key, filename, size, bucket, source_url, datasource_id, "
-            "download_kind, download_bucket_id, status, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            "download_kind, download_bucket_id, auto_upload_buckets, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
             (
                 job_id,
                 object_key,
@@ -1066,6 +1072,7 @@ def insert_file_pending(
                 datasource_id,
                 download_kind,
                 download_bucket_id,
+                json.dumps(auto_upload_buckets) if auto_upload_buckets else None,
                 now,
                 now,
             ),
@@ -1186,6 +1193,47 @@ def cleanup_job_temp(job_id: int, kind: str, destination: str | None = None) -> 
                 pass
 
 
+def schedule_auto_uploads(file_row: dict, local_path: str, size: int, serial: bool) -> None:
+    """下载完成后按 auto_upload_buckets 自动创建上传任务（文件级自动化链）。
+
+    local_path 为相对 SERVER_FILE_ROOT 的路径；对每个勾选桶建 kind=upload job 入队。
+    已上传过的桶跳过；某个桶已被删除时静默跳过。
+    """
+    raw = file_row.get("auto_upload_buckets")
+    if not raw:
+        return
+    try:
+        bucket_ids = [int(x) for x in json.loads(raw)]
+    except (TypeError, ValueError):
+        return
+    if not bucket_ids:
+        return
+    with get_db() as conn:
+        uploaded_ids = {
+            u["bucket_id"] for u in conn.execute(
+                "SELECT bucket_id FROM file_uploads WHERE file_id=?", (file_row["id"],)
+            ).fetchall()
+        }
+        for bid in bucket_ids:
+            if bid in uploaded_ids:
+                continue
+            b = conn.execute("SELECT * FROM buckets WHERE id=?", (bid,)).fetchone()
+            if b is None:
+                continue
+            job_id = insert_job(
+                kind="upload",
+                filename=file_row["filename"] or "download",
+                object_key=file_row["object_key"],
+                size=size,
+                source=str(server_root() / local_path),
+                bucket_id=bid,
+                serial=serial,
+            )
+            conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_row["id"]))
+            enqueue_job(job_id, "upload", serial)
+            emit_job_update(job_id)
+
+
 def process_job(job_id: int) -> None:
     with get_db() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -1267,6 +1315,13 @@ def process_job(job_id: int) -> None:
                     else:
                         rel = dest.name
                     update_file_by_job(job_id, local_path=rel)
+                    # 录入时勾选了自动上传桶 → 下载落地后自动链上传任务
+                    with get_db() as conn:
+                        frow = conn.execute(
+                            "SELECT * FROM files WHERE job_id=? LIMIT 1", (job_id,)
+                        ).fetchone()
+                    if frow is not None:
+                        schedule_auto_uploads(dict(frow), rel, size, bool(row.get("serial")))
                 else:
                     bucket_row = resolve_bucket_ref(bucket_id)  # 无 bucket_id 时取默认桶
                     sync_to_bucket(source_path, object_key, job_id, size, md5, filename, source,
@@ -1963,12 +2018,12 @@ def url_upload():
                     return respond("error", str(exc), apikey, "error", 400)
         elif download_kind == "url" and not url.lower().startswith(("http://", "https://")):
             return respond(
-                "error", "下载源为「下载链接」时，请填写以 http:// 或 https:// 开头的链接。",
+                "error", "文件来源为「网络链接」时，请填写以 http:// 或 https:// 开头的链接。",
                 apikey, "error", 400,
             )
         elif download_kind == "local" and not url.startswith("/"):
             return respond(
-                "error", "下载源为「本地」时，请填写服务器上的文件绝对路径（以 / 开头）。",
+                "error", "文件来源为「服务器路径」时，请填写服务器上的文件绝对路径（以 / 开头）。",
                 apikey, "error", 400,
             )
     else:
@@ -1980,6 +2035,24 @@ def url_upload():
     destination = None
     object_key = ""
     datasource_id = request.form.get("datasource_id", type=int)
+
+    # 自动上传桶（可选）：勾选的桶 id 列表，逗号分隔。
+    # 勾选后录入即自动入队下载（先落地服务器再自动逐桶上传，全自动链）。
+    auto_upload_buckets: list[int] = []
+    raw_auto = (request.form.get("auto_upload_buckets") or "").strip()
+    if raw_auto:
+        with get_db() as conn:
+            for part in raw_auto.split(","):
+                part = part.strip()
+                if not part.isdigit():
+                    return respond("error", "auto_upload_buckets 必须是桶 id 列表", apikey, "error", 400)
+                bid = int(part)
+                if conn.execute("SELECT 1 FROM buckets WHERE id=?", (bid,)).fetchone() is None:
+                    return respond("error", f"桶 {bid} 不存在", apikey, "error", 400)
+                if bid not in auto_upload_buckets:
+                    auto_upload_buckets.append(bid)
+
+    serial = request.form.get("serial") in ("1", "true", "on")
     if target == "server":
         raw_destination = (request.form.get("destination") or "").strip()
         try:
@@ -2029,8 +2102,10 @@ def url_upload():
             job_id=job_id, object_key=object_key, filename=filename,
         )
 
-    # 录入到 bucket：只登记一条 pending 记录，不自动下载/上传。
-    # 用户在列表点「上传」时才触发（POST /api/upload-file/<file_id>）。
+    # 录入到 bucket：登记 pending 记录。
+    # - 未勾选自动上传桶：只登记，用户稍后在列表手动触发。
+    # - 勾选了自动上传桶：立即入队下载（fetch 到 SERVER_FILE_ROOT），
+    #   下载落地后由 schedule_auto_uploads 自动逐桶创建上传任务（全自动链）。
     file_id = insert_file_pending(
         job_id=None,
         object_key=object_key,
@@ -2040,7 +2115,38 @@ def url_upload():
         datasource_id=datasource_id,
         download_kind=download_kind,
         download_bucket_id=download_bucket_id,
+        auto_upload_buckets=auto_upload_buckets or None,
     )
+    if auto_upload_buckets:
+        root = server_root()
+        if root is None:
+            return respond("error", "未配置 SERVER_FILE_ROOT，无法自动下载", apikey, "error", 400)
+        root.mkdir(parents=True, exist_ok=True)
+        destination_path = root / filename
+        job_id = insert_job(
+            kind="fetch",
+            filename=filename,
+            object_key=object_key,
+            size=0,
+            source=url,
+            destination=str(destination_path),
+            serial=serial,
+        )
+        with get_db() as conn:
+            conn.execute("UPDATE files SET job_id=? WHERE id=?", (job_id, file_id))
+        enqueue_job(job_id, "fetch", serial)
+        emit_job_update(job_id)
+        names = []
+        with get_db() as conn:
+            for bid in auto_upload_buckets:
+                r = conn.execute("SELECT name FROM buckets WHERE id=?", (bid,)).fetchone()
+                names.append(r["name"] if r else str(bid))
+        return respond(
+            "ok",
+            f"「{filename}」已登记并开始下载，完成后自动上传到：{'、'.join(names)}。",
+            apikey,
+            file_id=file_id, job_id=job_id, object_key=object_key, filename=filename,
+        )
     return respond(
         "ok", f"「{filename}」已登记。", apikey,
         file_id=file_id, object_key=object_key, filename=filename,

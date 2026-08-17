@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Checkbox } from "@/components/ui/checkbox"
 import { PrefixInput } from "@/components/prefix-input"
 import {
   Select,
@@ -53,7 +54,7 @@ function usePrefix(defaultPrefix: string) {
   return { prefix, setPrefix: onChange } as const
 }
 
-/** 录入待处理文件 Dialog（链接或任意标识，登记到文件库）。 */
+/** 新增文件记录 Dialog（登记网络链接 / 服务器路径 / 桶内对象到文件库）。 */
 export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone }: CommonProps) {
   const { buckets } = useBuckets()
   const [open, setOpen] = React.useState(false)
@@ -66,7 +67,7 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
   React.useEffect(() => {
     if (!datasourceId && scripts.length > 0) setDatasourceId(String(scripts[0].id))
   }, [datasourceId, scripts])
-  /** 文件级下载源：默认「下载链接」；桶选项值为 bucket:<id>。 */
+  /** 文件级来源：默认「网络链接」；桶选项值为 bucket:<id>。 */
   const [downloadKind, setDownloadKind] = React.useState<"url" | "local" | "bucket">("url")
   const [downloadBucketId, setDownloadBucketId] = React.useState("")
   const downloadValue =
@@ -81,6 +82,17 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
     }
   }
   const [busy, setBusy] = React.useState(false)
+  /** 自动上传桶（勾选即全自动：录入 → 下载到服务器 → 逐桶上传）。 */
+  const [autoBuckets, setAutoBuckets] = React.useState<Set<number>>(new Set())
+  const enabledBuckets = buckets.filter((b) => b.enabled)
+  const toggleAutoBucket = (id: number, checked: boolean) => {
+    setAutoBuckets((prev) => {
+      const next = new Set(prev)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
 
   const urlFilename = React.useMemo(() => {
     const t = url.trim()
@@ -116,12 +128,12 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
     downloadKind === "local"
       ? "服务器文件绝对路径，如 /data/spider/out/a.zip"
       : downloadKind === "url"
-        ? "下载链接（http/https）"
+        ? "网络链接（http/https）"
         : "桶内 ObjectKey"
 
-  /** 「下载链接」标签文案随下载源类型切换。 */
+  /** 来源输入框标签随来源类型切换。 */
   const urlLabel =
-    downloadKind === "local" ? "本地路径" : downloadKind === "bucket" ? "ObjectKey" : "下载链接"
+    downloadKind === "local" ? "服务器路径" : downloadKind === "bucket" ? "ObjectKey" : "网络链接（URL）"
 
   const submit = async () => {
     if (!url.trim() || !objectKey.trim()) return
@@ -133,6 +145,8 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
         datasourceId: datasourceId ? Number(datasourceId) : undefined,
         downloadKind,
         downloadBucketId: downloadKind === "bucket" ? Number(downloadBucketId) : undefined,
+        autoUploadBuckets: [...autoBuckets],
+        serial: true,
       })
       toast(r.message)
       // 目录段（key 去掉最后一段）进历史，供下次快捷填充
@@ -144,7 +158,7 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
       setOpen(false)
       onDone()
     } catch (e) {
-      toast.error("录入失败", { description: (e as Error).message })
+      toast.error("新增失败", { description: (e as Error).message })
     } finally {
       setBusy(false)
     }
@@ -167,27 +181,27 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
         <Button variant="default">
-          <Link2 className="size-4" /> 录入待处理文件
+          <Link2 className="size-4" /> 新增文件
         </Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>录入待处理文件</DialogTitle>
+          <DialogTitle>新增文件</DialogTitle>
           <DialogDescription>
-            登记下载链接或任意文件标识到文件库，稍后在列表手动触发上传。
+            登记网络链接 / 服务器路径 / 桶内对象到文件库；勾选桶即可自动下载并上传。
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-2">
-              <Label>下载源</Label>
+              <Label>文件来源</Label>
               <Select value={downloadValue} onValueChange={handleDownloadChange}>
                 <SelectTrigger className="w-full">
-                  <SelectValue placeholder="下载链接" />
+                  <SelectValue placeholder="网络链接（URL）" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="url">下载链接</SelectItem>
-                  <SelectItem value="local">本地（服务器路径）</SelectItem>
+                  <SelectItem value="url">网络链接（URL）</SelectItem>
+                  <SelectItem value="local">服务器路径</SelectItem>
                   {buckets.map((b) => (
                     <SelectItem key={b.id} value={`bucket:${b.id}`}>
                       {b.name}
@@ -241,6 +255,33 @@ export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone 
                 完整对象键 = 目录/文件名；已根据链接自动推断（目录段 = 文件名去掉随机后缀），可手动修改。
               </p>
             )}
+          </div>
+          <div className="space-y-2">
+            <Label>自动上传到桶（可选，勾选即全自动）</Label>
+            {enabledBuckets.length === 0 ? (
+              <p className="text-xs text-muted-foreground">暂无启用的桶</p>
+            ) : (
+              <div className="flex flex-wrap gap-x-4 gap-y-2 rounded-md border p-3">
+                {enabledBuckets.map((b) => (
+                  <label
+                    key={b.id}
+                    className="flex cursor-pointer items-center gap-1.5 text-sm"
+                    title={`下载完成后自动上传到 ${b.bucket_name}`}
+                  >
+                    <Checkbox
+                      checked={autoBuckets.has(b.id)}
+                      onCheckedChange={(v) => toggleAutoBucket(b.id, v === true)}
+                    />
+                    {b.name}
+                  </label>
+                ))}
+              </div>
+            )}
+            <p className="text-xs text-muted-foreground">
+              {autoBuckets.size > 0
+                ? "录入后自动：下载到服务器 → 逐桶上传（串行排队执行，任务可在「上传管理」跟踪）。"
+                : "不勾选则只登记，稍后在列表手动下载/上传。"}
+            </p>
           </div>
         </div>
         <DialogFooter>
