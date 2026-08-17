@@ -2238,6 +2238,7 @@ def url_upload():
                     auto_upload_buckets.append(bid)
 
     serial = request.form.get("serial") in ("1", "true", "on")
+    already_in_default = False
     if target == "server":
         raw_destination = (request.form.get("destination") or "").strip()
         try:
@@ -2260,13 +2261,13 @@ def url_upload():
             except argparse.ArgumentTypeError as exc:
                 return respond("error", str(exc), apikey, "error", 400)
             object_key = build_object_key(prefix, filename_from_url(url))
-        # 同名拒传：登记阶段就拒掉（默认桶），避免后续上传冲突
+        # 同名对象已在默认桶 → 照常登记，但直接标记该桶已上传（避免后续重复上传冲突）
         try:
-            entry = get_bucket_entry(resolve_bucket_ref(None))
+            _b = resolve_bucket_ref(None)
         except ValueError as exc:
             return respond("error", str(exc), apikey, "error", 400)
-        if object_exists(entry["client"], entry["bucket_name"], object_key):
-            return respond("error", f"同名文件已存在：{object_key}", apikey, "error", 400)
+        _entry = get_bucket_entry(_b)
+        already_in_default = object_exists(_entry["client"], _entry["bucket_name"], object_key)
 
     filename = filename_from_url(url)
 
@@ -2302,6 +2303,29 @@ def url_upload():
         download_bucket_id=download_bucket_id,
         auto_upload_buckets=auto_upload_buckets or None,
     )
+    if already_in_default:
+        # 默认桶已有同名对象：标记已上传、补 size，不再创建任何下载/上传任务
+        with get_db() as conn:
+            try:
+                head = _entry["client"].head_object(
+                    Bucket=_entry["bucket_name"], Key=object_key
+                )
+                fsize = int(head.get("ContentLength") or 0)
+            except ClientError:
+                fsize = 0
+            conn.execute(
+                "UPDATE files SET status='synced', size=?, synced_at=?, updated_at=? WHERE id=?",
+                (fsize, time.time(), time.time(), file_id),
+            )
+            apply_upload_flag(conn, file_id, _b, True)
+            conn.execute(
+                "UPDATE files SET bucket=? WHERE id=?",
+                (_b["bucket_name"], file_id),
+            )
+        return respond(
+            "ok", f"「{filename}」已登记（默认桶已有同名对象，标记为已同步）。", apikey,
+            file_id=file_id, object_key=object_key, filename=filename,
+        )
     if auto_upload_buckets:
         root = server_root()
         if root is None:
