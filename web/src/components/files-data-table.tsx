@@ -645,7 +645,7 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
   const handleDeleteObject = async () => {
     const ok = await confirm({
       title: "从桶中删除",
-      description: `删除「${file.object_key}」？不可恢复，本地副本保留。`,
+      description: `删除后不可恢复，本地副本保留。`,
       confirmText: "删除",
       destructive: true,
     })

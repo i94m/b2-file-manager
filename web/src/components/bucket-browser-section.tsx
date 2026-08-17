@@ -92,7 +92,7 @@ export function BucketBrowserSection({
   const handleDelete = async (obj: BucketObject) => {
     if (!await confirm({
       title: "删除桶对象",
-      description: `确认删除 ${obj.key}？此操作不可撤销。`,
+      description: `删除后不可恢复。`,
       confirmText: "删除",
       destructive: true,
     })) return
