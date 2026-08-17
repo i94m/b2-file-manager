@@ -1,5 +1,5 @@
 import * as React from "react"
-import { ArrowRightLeft, ChevronLeft, ChevronRight, Cloud, Download, Info, Loader2, MoreVertical, Pencil, Search, Trash2, Upload } from "lucide-react"
+import { ArrowRightLeft, Cloud, Download, Info, Loader2, MoreVertical, Pencil, Search, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { type BucketObject, type BucketHealthEntry } from "@/lib/types"
@@ -8,6 +8,7 @@ import { useConfirm } from "@/lib/use-confirm"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
 import { BucketHealthCard } from "@/components/bucket-health"
 import { Button } from "@/components/ui/button"
+import { NumberPagination } from "@/components/number-pagination"
 import {
   HoverCard,
   HoverCardContent,
@@ -137,8 +138,6 @@ export function BucketBrowserSection({
   }
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const hasPrev = page > 1
-  const hasNext = page < totalPages
 
   return (
     <section className="flex min-w-0 flex-1 flex-col rounded-xl border bg-card">
@@ -299,32 +298,15 @@ export function BucketBrowserSection({
         </Table>
       </div>
 
-      {/* 分页：上一页 / 下一页 */}
+      {/* 分页：数字分页条 */}
       {objects !== null && total > 0 && (
-        <div className="flex items-center justify-center gap-3 border-t px-4 py-2.5 text-sm text-muted-foreground">
-          <Button
-            variant="outline"
-            size="sm"
-            className="flex-1 sm:flex-none"
-            disabled={!hasPrev || loading}
-            onClick={() => fetchPage(page - 1)}
-          >
-            <ChevronLeft className="size-4" />
-            上一页
-          </Button>
-          <span className="tabular-nums">
-            {page} / {totalPages}
-          </span>
-          <Button
-            variant="outline"
-            size="sm"
-            className="flex-1 sm:flex-none"
-            disabled={!hasNext || loading}
-            onClick={() => fetchPage(page + 1)}
-          >
-            下一页
-            <ChevronRight className="size-4" />
-          </Button>
+        <div className="border-t px-4 py-2">
+          <NumberPagination
+            page={page}
+            pageCount={totalPages}
+            total={total}
+            onPageChange={(p) => fetchPage(p)}
+          />
         </div>
       )}
 

@@ -6,7 +6,7 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { Check, ChevronLeft, ChevronRight, CloudUpload, Download, HardDriveDownload, Info, ArrowRightLeft, Loader2, MoreVertical, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
+import { Check, CloudUpload, Download, HardDriveDownload, Info, ArrowRightLeft, Loader2, MoreVertical, Pause, Pencil, Play, RefreshCw, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { type Datasource, type FileItem } from "@/lib/types"
@@ -75,6 +75,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Skeleton } from "@/components/ui/skeleton"
+import { NumberPagination } from "@/components/number-pagination"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { CopyButton } from "@/components/ui/copy-button"
 
@@ -1126,33 +1127,13 @@ export function FilesDataTable({
         </Table>
       </div>
 
-      {/* 分页 */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <p className="text-sm text-muted-foreground">
-          共 <span className="font-medium text-foreground">{total}</span> 条 ·
-          第 {page} / {pageCount} 页
-        </p>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            className="flex-1 sm:flex-none"
-            onClick={() => onPageChange(page - 1)}
-            disabled={page <= 1}
-          >
-            <ChevronLeft className="size-4" /> 上一页
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="flex-1 sm:flex-none"
-            onClick={() => onPageChange(page + 1)}
-            disabled={page >= pageCount}
-          >
-            下一页 <ChevronRight className="size-4" />
-          </Button>
-        </div>
-      </div>
+      {/* 分页：统计与翻页按钮同行 */}
+      <NumberPagination
+        page={page}
+        pageCount={pageCount}
+        total={total}
+        onPageChange={onPageChange}
+      />
 
       {detailsFile && (
         <FileDetailsDialog

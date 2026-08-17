@@ -6,8 +6,6 @@ import {
   getPaginationRowModel,
   useReactTable,
 } from "@tanstack/react-table"
-import { ChevronLeft, ChevronRight } from "lucide-react"
-
 import { type Bucket } from "@/lib/api"
 import { type FileItem, type JobUpdate } from "@/lib/types"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
@@ -21,7 +19,6 @@ export interface ActiveFileStatus {
   /** 本地列（fetch/download）或某桶列（upload）。 */
   target: "local" | number
 }
-import { Button } from "@/components/ui/button"
 import {
   Table,
   TableBody,
@@ -31,6 +28,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Skeleton } from "@/components/ui/skeleton"
+import { NumberPagination } from "@/components/number-pagination"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { CopyButton } from "@/components/ui/copy-button"
 
@@ -297,32 +295,12 @@ export function PublicFilesTable({
       </div>
 
       {/* 分页 */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <p className="text-sm text-muted-foreground">
-          共 <span className="font-medium text-foreground">{total}</span> 条 ·
-          第 {page} / {pageCount} 页
-        </p>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            className="flex-1 sm:flex-none"
-            onClick={() => onPageChange(page - 1)}
-            disabled={page <= 1}
-          >
-            <ChevronLeft className="size-4" /> 上一页
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="flex-1 sm:flex-none"
-            onClick={() => onPageChange(page + 1)}
-            disabled={page >= pageCount}
-          >
-            下一页 <ChevronRight className="size-4" />
-          </Button>
-        </div>
-      </div>
+      <NumberPagination
+        page={page}
+        pageCount={pageCount}
+        total={total}
+        onPageChange={onPageChange}
+      />
     </div>
   )
 }
