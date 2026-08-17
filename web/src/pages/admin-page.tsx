@@ -197,7 +197,7 @@ function AdminPage() {
 
         {/* 顶部模块菜单（NavigationMenu）：源文件管理 / 上传管理 / 本地文件 / 桶（下拉） */}
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-          <NavigationMenu viewport={false} className="max-w-full justify-start">
+          <NavigationMenu className="max-w-full justify-start">
             <NavigationMenuList className="max-w-full flex-wrap justify-start gap-1 sm:flex-nowrap">
               <NavigationMenuItem>
                 <button
@@ -241,8 +241,8 @@ function AdminPage() {
                 >
                   <Cloud className="size-4" /> 存储桶
                 </NavigationMenuTrigger>
-                <NavigationMenuContent>
-                  <ul className="grid w-[11rem] gap-1 p-1">
+                <NavigationMenuContent className="w-[11rem] p-1">
+                  <ul className="grid gap-1">
                     {enabledBuckets.length === 0 && (
                       <li className="px-2 py-1.5 text-xs text-muted-foreground">
                         暂无启用的桶
