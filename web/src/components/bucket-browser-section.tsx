@@ -1,5 +1,5 @@
 import * as React from "react"
-import { ChevronLeft, ChevronRight, Cloud, Download, Loader2, MoreVertical, Pencil, Search, Trash2, Upload } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, ChevronRight, Cloud, Download, Loader2, MoreVertical, Pencil, Search, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { type BucketObject } from "@/lib/types"
@@ -57,6 +57,7 @@ export function BucketBrowserSection({
 
   const [renaming, setRenaming] = React.useState<BucketObject | null>(null)
   const [uploadOpen, setUploadOpen] = React.useState(false)
+  const [moveOpen, setMoveOpen] = React.useState(false)
   const [deletingKey, setDeletingKey] = React.useState<string | null>(null)
   const [busyDelete, setBusyDelete] = React.useState(false)
   const [downloadingKey, setDownloadingKey] = React.useState<string | null>(null)
@@ -136,6 +137,14 @@ export function BucketBrowserSection({
           size="sm"
           variant="outline"
           className="ml-auto"
+          onClick={() => setMoveOpen(true)}
+        >
+          <ArrowRightLeft className="size-3.5" />
+          移动文件
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
           onClick={() => setUploadOpen(true)}
         >
           <Upload className="size-3.5" />
@@ -315,6 +324,20 @@ export function BucketBrowserSection({
         />
       )}
 
+      {/* 移动文件 Dialog */}
+      {moveOpen && (
+        <MoveObjectDialog
+          bucketId={bucketId}
+          bucketLabel={title}
+          defaultPrefix={prefix}
+          onClose={() => setMoveOpen(false)}
+          onDone={() => {
+            setMoveOpen(false)
+            fetchPage(1)
+          }}
+        />
+      )}
+
       {confirmDialog}
     </section>
   )
@@ -402,6 +425,100 @@ function validateKey(value: string): string | null {
   const parts = trimmed.replace(/\\/g, "/").split("/")
   if (parts.some((p) => p === "..")) return "路径不能包含 '..'"
   return null
+}
+
+/** 移动文件 Dialog：输入原始 key 与新 key（copy + delete 实现，同桶内移动/改名）。 */
+function MoveObjectDialog({
+  bucketId,
+  bucketLabel,
+  defaultPrefix,
+  onClose,
+  onDone,
+}: {
+  bucketId: number
+  bucketLabel: string
+  defaultPrefix: string
+  onClose: () => void
+  onDone: () => void
+}) {
+  const cleanPrefix = defaultPrefix.replace(/^\/+|\/+$/g, "")
+  const [fromKey, setFromKey] = React.useState(cleanPrefix ? `${cleanPrefix}/` : "")
+  const [toKey, setToKey] = React.useState("")
+  const [busy, setBusy] = React.useState(false)
+
+  const fromError = validateKey(fromKey)
+  const toError = validateKey(toKey)
+  const sameError =
+    fromKey.trim() && toKey.trim() && fromKey.trim() === toKey.trim()
+      ? "新 key 与原始 key 相同"
+      : null
+  const hasError = !!fromError || !!toError || !!sameError
+
+  const submit = async () => {
+    if (hasError) return
+    const from = fromKey.trim().replace(/^\/+/, "")
+    const to = toKey.trim().replace(/^\/+/, "")
+    setBusy(true)
+    try {
+      await renameObject(from, to, bucketId)
+      toast.success("移动成功", { description: `${from} → ${to}` })
+      onDone()
+    } catch (e) {
+      toast.error("移动失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(v) => { if (!v && !busy) onClose() }}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>移动文件（{bucketLabel}）</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <div className="space-y-2">
+            <Label htmlFor="move-from">原始 Key</Label>
+            <Input
+              id="move-from"
+              placeholder="如 opus5/a.zip"
+              value={fromKey}
+              onChange={(e) => setFromKey(e.target.value)}
+              className={cn("font-mono text-sm", fromError && "border-destructive focus-visible:ring-destructive")}
+              autoFocus
+            />
+            {fromError && <p className="text-xs text-destructive">{fromError}</p>}
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="move-to">新 Key（目录 + 文件名）</Label>
+            <Input
+              id="move-to"
+              placeholder="如 fable/a.zip"
+              value={toKey}
+              onChange={(e) => setToKey(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !hasError && submit()}
+              className={cn("font-mono text-sm", (toError || sameError) && "border-destructive focus-visible:ring-destructive")}
+            />
+            {toError || sameError ? (
+              <p className="text-xs text-destructive">{toError ?? sameError}</p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                通过「复制 + 删除」实现移动，大文件可能耗时较长；新 key 可只改目录（移动）或同时改名。
+              </p>
+            )}
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={busy}>
+            取消
+          </Button>
+          <Button onClick={submit} disabled={busy || hasError}>
+            {busy ? "移动中…" : "移动"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 /** 上传到桶 Dialog：选择本地文件 + 输入桶内目标路径（可快捷填入 prefix）。 */

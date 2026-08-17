@@ -3,7 +3,7 @@ import { ThemeProvider, useTheme } from "next-themes"
 import { JobsProvider, useJobs } from "@/lib/use-jobs"
 import { BucketsProvider, useBuckets } from "@/lib/use-buckets"
 import { AuthGuard } from "@/components/auth-guard"
-import { RefreshCw, Search, Moon, Sun } from "lucide-react"
+import { ArrowUpDown, Cloud, FolderOpen, HardDrive, RefreshCw, Search, Moon, Sun } from "lucide-react"
 
 import { type Datasource, type FileItem } from "@/lib/types"
 import { getFile, getFiles, getScripts } from "@/lib/api"
@@ -67,6 +67,8 @@ function AppShell() {
   const [debouncedQ, setDebouncedQ] = React.useState("")
   const [status, setStatus] = React.useState("all")
   const [refreshing, setRefreshing] = React.useState(false)
+  /** 顶层模块切换：files=源文件管理 / transfers=上传管理 / local=本地文件 / bucket:<id>=各桶（动态）。 */
+  const [section, setSection] = React.useState<string>("files")
 
   // 搜索防抖：q 变化后 400ms 才更新 debouncedQ（触发列表请求）
   React.useEffect(() => {
@@ -135,6 +137,10 @@ function AppShell() {
 
   // 任务结束时只更新受影响的行（按 job_id 匹配当前页），不整表刷新
   const { jobs } = useJobs()
+  /** 进行中的任务数（上传管理 Tab 角标）。 */
+  const activeJobs = Object.values(jobs).filter(
+    (j) => j.status === "queued" || j.status === "uploading",
+  ).length
   const terminalRef = React.useRef<Set<number>>(new Set())
   const filesRef = React.useRef(files)
   filesRef.current = files
@@ -186,91 +192,119 @@ function AppShell() {
           </div>
         )}
 
-        {/* 工具栏 */}
-        <div className="mb-4 flex flex-wrap items-center gap-2">
-          <FetchUrlDialog
-            defaultPrefix={defaultPrefix}
-            scripts={scripts}
-            onDone={refresh}
-          />
-
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            <div className="relative">
-              <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                className="w-[28rem] pl-8"
-                placeholder="搜索文件名 / 原始链接"
-                value={q}
-                onChange={(e) => setQ(e.target.value)}
-              />
-            </div>
-            <Select value={status} onValueChange={(v) => { setStatus(v); setPage(1) }}>
-              <SelectTrigger className="w-32">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">全部状态</SelectItem>
-                <SelectItem value="synced">已上传</SelectItem>
-                <SelectItem value="pending">待上传</SelectItem>
-                <SelectItem value="failed">失败</SelectItem>
-                <SelectItem value="deleted">已删除</SelectItem>
-              </SelectContent>
-            </Select>
-            <Button variant="ghost" size="icon" onClick={refresh} title="刷新" disabled={refreshing}>
-              <RefreshCw className={refreshing ? "size-4 animate-spin" : "size-4"} />
-            </Button>
-          </div>
-        </div>
-
-        {/* 源文件管理 */}
-        <h2 className="mb-3 text-lg font-semibold">源文件管理</h2>
-        <FilesDataTable
-          data={files}
-          scripts={scripts}
-          buckets={buckets}
-          total={total}
-          page={page}
-          pageSize={pageSize}
-          loading={loading}
-          onPageChange={setPage}
-          onDeleted={loadFiles}
-          onFileUpdated={patchFile}
-        />
-
-        {/* 传输列表（左）与 桶文件管理（右）同行并列，宽度 6:4 */}
-        <div className="mt-6 flex flex-col gap-4 md:flex-row md:items-start">
-          {Object.keys(jobs).length > 0 && (
-            <div className="min-w-0 flex-[6]">
-              <JobsTable />
-            </div>
-          )}
-          <Tabs defaultValue="local" className="min-w-0 flex-[4]">
-            <TabsList>
-              <TabsTrigger value="local">本地文件</TabsTrigger>
+        {/* 顶层模块切换：源文件管理 / 上传管理 / 桶文件 */}
+        <Tabs
+          value={section}
+          onValueChange={(v) => setSection(v as typeof section)}
+          className="mb-4"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <TabsList className="flex-wrap">
+              <TabsTrigger value="files" className="gap-1.5">
+                <FolderOpen className="size-4" />
+                源文件管理
+              </TabsTrigger>
+              <TabsTrigger value="transfers" className="gap-1.5">
+                <ArrowUpDown className="size-4" />
+                上传管理
+                {activeJobs > 0 && (
+                  <span className="text-[10px] tabular-nums text-muted-foreground">{activeJobs}</span>
+                )}
+              </TabsTrigger>
+              <TabsTrigger value="local" className="gap-1.5">
+                <HardDrive className="size-4" />
+                本地文件
+              </TabsTrigger>
               {buckets.map((b) => (
-                <TabsTrigger key={b.id} value={String(b.id)} title={b.bucket_name}>
+                <TabsTrigger
+                  key={b.id}
+                  value={`bucket:${b.id}`}
+                  title={b.bucket_name}
+                  className="gap-1.5"
+                >
+                  <Cloud className="size-4" />
                   {b.name}
                 </TabsTrigger>
               ))}
             </TabsList>
-            <TabsContent value="local">
-              <ServerFilesSection
+
+            {/* 搜索 / 状态筛选只在源文件管理模块显示 */}
+            {section === "files" && (
+              <div className="flex flex-wrap items-center gap-2">
+                <FetchUrlDialog
+                  defaultPrefix={defaultPrefix}
+                  scripts={scripts}
+                  onDone={refresh}
+                />
+                <div className="relative">
+                  <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    className="w-[28rem] pl-8"
+                    placeholder="文件名 / 链接 / 文件Key..."
+                    value={q}
+                    onChange={(e) => setQ(e.target.value)}
+                  />
+                </div>
+                <Select value={status} onValueChange={(v) => { setStatus(v); setPage(1) }}>
+                  <SelectTrigger className="w-32">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">全部状态</SelectItem>
+                    <SelectItem value="synced">已上传</SelectItem>
+                    <SelectItem value="pending">待上传</SelectItem>
+                    <SelectItem value="failed">失败</SelectItem>
+                    <SelectItem value="deleted">已删除</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Button variant="ghost" size="icon" onClick={refresh} title="刷新" disabled={refreshing}>
+                  <RefreshCw className={refreshing ? "size-4 animate-spin" : "size-4"} />
+                </Button>
+              </div>
+            )}
+          </div>
+
+          {/* 源文件管理：文件库表格 */}
+          <TabsContent value="files">
+            <FilesDataTable
+              data={files}
+              scripts={scripts}
+              buckets={buckets}
+              total={total}
+              page={page}
+              pageSize={pageSize}
+              loading={loading}
+              onPageChange={setPage}
+              onDeleted={loadFiles}
+              onFileUpdated={patchFile}
+            />
+          </TabsContent>
+
+          {/* 上传管理：传输列表（上传/下载任务全宽） */}
+          <TabsContent value="transfers">
+            <JobsTable />
+          </TabsContent>
+
+          {/* 本地文件：服务器文件目录 */}
+          <TabsContent value="local">
+            <ServerFilesSection
+              defaultPrefix={defaultPrefix}
+              scripts={scripts}
+              onUploaded={refresh}
+            />
+          </TabsContent>
+
+          {/* 各桶：动态顶层 Tab（桶顺序沿用桶管理拖动排序） */}
+          {buckets.map((b) => (
+            <TabsContent key={b.id} value={`bucket:${b.id}`}>
+              <BucketBrowserSection
+                title={`${b.name} · ${b.bucket_name}`}
+                bucketId={b.id}
                 defaultPrefix={defaultPrefix}
-                scripts={scripts}
-                onUploaded={refresh}
               />
             </TabsContent>
-            {buckets.map((b) => (
-              <TabsContent key={b.id} value={String(b.id)}>
-                <BucketBrowserSection
-                  title={`${b.name} · ${b.bucket_name}`}
-                  bucketId={b.id}
-                  defaultPrefix={defaultPrefix}
-                />
-              </TabsContent>
-            ))}
-          </Tabs>
-        </div>
+          ))}
+        </Tabs>
       </main>
     </div>
   )

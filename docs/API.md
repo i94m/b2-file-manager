@@ -141,7 +141,7 @@ X-API-Key: YOUR_KEY
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `urls` | `string[]` | 是 | 1~50 个 URL，需 `http://` 或 `https://` 开头 |
-| `prefix` | `string` | 否 | 对象 key 前缀（默认读 `DEFAULT_PREFIX` 环境变量） |
+| `prefix` | `string` | 否 | 对象 key 前缀（默认读 `DEFAULT_PREFIX` 环境变量；若设置了 `BUCKET_PREFIX`，最终 key 还会前置该应用级前缀） |
 | `bucket` | `string` | 否 | 目标桶：桶 id 或 legacy 别名（缺省 = 默认桶，用于生成 object_key 与同名检测） |
 | `download` | `string` | 否 | 登记后的动作：`none`（默认，只登记不下载）/ `now`（立即下载到服务器本地，进入下载并行道）/ `serial`（放入排队，串行执行；`queue` 为同义别名） |
 
@@ -347,7 +347,7 @@ X-API-Key: YOUR_KEY
 |------|------|------|
 | `page` | 1 | 页码 |
 | `page_size` | 20 | 每页条数（max 200） |
-| `q` | — | 按 `filename` / `source_url` 模糊匹配 |
+| `q` | — | 按 `filename` / `source_url` / `object_key` 模糊匹配 |
 | `status` | — | `pending` / `synced` / `failed` / `deleted` / `cancelled` |
 
 **响应**：
@@ -588,7 +588,7 @@ GET /download?key=path/to/file.zip&bucket=3&apikey=YOUR_KEY
 
 #### GET /api/buckets
 
-桶列表（含禁用桶；按 默认优先 → `sort_order` → `id` 排序）。
+桶列表（含禁用桶；按 `sort_order` → `id` 排序，顺序由桶管理拖动排序 / `POST /api/buckets/reorder` 维护）。
 
 ```json
 [

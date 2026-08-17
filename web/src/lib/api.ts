@@ -193,6 +193,16 @@ export async function deleteBucket(bucketId: number): Promise<FormResult & { buc
   return handle(res)
 }
 
+/** POST /api/buckets/reorder — 拖动排序（按传入顺序整体重写 sort_order）。 */
+export async function reorderBuckets(bucketIds: number[]): Promise<FormResult> {
+  const res = await fetch("/api/buckets/reorder", {
+    method: "POST",
+    headers: { ...headers(), "Content-Type": "application/json" },
+    body: JSON.stringify({ bucket_ids: bucketIds }),
+  })
+  return handle(res)
+}
+
 /** POST /api/buckets/:id/test — 连通性测试（临时 client，不入注册表）。 */
 export async function testBucket(bucketId: number): Promise<BucketHealthEntry> {
   const res = await fetch(`/api/buckets/${bucketId}/test`, {
@@ -228,11 +238,12 @@ export async function uploadFile(
   return handle<FormResult>(res)
 }
 
-/** POST /url-upload — 录入链接，只登记不自动上传（可带文件级下载源配置）。 */
+/** POST /url-upload — 录入链接，只登记不自动上传（可带文件级下载源配置；key=完整 ObjectKey）。 */
 export async function urlUpload(
   url: string,
   opts: {
     prefix?: string
+    key?: string
     datasourceId?: number
     downloadKind?: "url" | "local" | "bucket"
     downloadBucketId?: number
@@ -240,6 +251,7 @@ export async function urlUpload(
 ): Promise<FormResult> {
   const form = new FormData()
   form.append("url", url)
+  if (opts.key) form.append("key", opts.key)
   if (opts.prefix) form.append("prefix", opts.prefix)
   if (opts.datasourceId) form.append("datasource_id", String(opts.datasourceId))
   if (opts.downloadKind) form.append("download_kind", opts.downloadKind)

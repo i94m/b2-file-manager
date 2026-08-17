@@ -1,10 +1,11 @@
 import * as React from "react"
-import { Database, Loader2, MoreVertical, Pencil, Plus, Trash2, Zap } from "lucide-react"
+import { Database, GripVertical, Loader2, MoreVertical, Pencil, Plus, Trash2, Zap } from "lucide-react"
 import { toast } from "sonner"
 
 import {
   createBucket,
   deleteBucket,
+  reorderBuckets,
   testBucket,
   updateBucket,
   type Bucket,
@@ -70,7 +71,7 @@ function TestState({ entry, testing }: { entry: BucketHealthEntry | undefined; t
   )
 }
 
-/** 桶管理入口：Dialog 内表格（列表/编辑切换）+ 连通性测试 + 删除。 */
+/** 桶管理入口：Dialog 内表格（列表/编辑切换）+ 拖动排序 + 连通性测试 + 删除。 */
 export function BucketManager() {
   const { buckets, refresh } = useBuckets()
   const [open, setOpen] = React.useState(false)
@@ -79,6 +80,45 @@ export function BucketManager() {
   const [testingId, setTestingId] = React.useState<number | null>(null)
   const [testResults, setTestResults] = React.useState<Record<number, BucketHealthEntry>>({})
   const [confirm, confirmDialog] = useConfirm()
+
+  // ── 拖动排序（HTML5 原生 DnD，拖完一次性持久化 sort_order）──
+  const [order, setOrder] = React.useState<Bucket[] | null>(null)
+  const dragId = React.useRef<number | null>(null)
+  const [dragOverId, setDragOverId] = React.useState<number | null>(null)
+  /** 展示顺序：拖动中的本地顺序优先，否则用服务端顺序。 */
+  const list = order ?? buckets
+
+  React.useEffect(() => {
+    // 弹窗打开/桶列表变更时，丢弃本地拖动顺序，回到服务端顺序
+    setOrder(null)
+  }, [open, buckets])
+
+  const persistOrder = async (next: Bucket[]) => {
+    setOrder(next)
+    try {
+      await reorderBuckets(next.map((b) => b.id))
+      toast.success("桶顺序已保存")
+      await refresh()
+      setOrder(null)
+    } catch (e) {
+      toast.error("排序保存失败", { description: (e as Error).message })
+      setOrder(null)
+    }
+  }
+
+  const handleDrop = (targetId: number) => {
+    const fromId = dragId.current
+    dragId.current = null
+    setDragOverId(null)
+    if (fromId == null || fromId === targetId) return
+    const current = [...list]
+    const from = current.findIndex((b) => b.id === fromId)
+    const to = current.findIndex((b) => b.id === targetId)
+    if (from < 0 || to < 0) return
+    const [moved] = current.splice(from, 1)
+    current.splice(to, 0, moved)
+    persistOrder(current)
+  }
 
   const nextSortOrder = buckets.reduce((m, b) => Math.max(m, b.sort_order), -1) + 1
 
@@ -137,7 +177,7 @@ export function BucketManager() {
         <DialogHeader>
           <DialogTitle>桶管理</DialogTitle>
           <DialogDescription>
-            桶配置存于数据库，新增/修改后立即生效；旧别名 self / bucket2 / beijing 仍可供机器人使用。
+            桶配置存于数据库，新增/修改后立即生效；拖动左侧把手可排序（页面各处桶列/列表按此顺序展示）；旧别名 self / bucket2 / beijing 仍可供机器人使用。
           </DialogDescription>
         </DialogHeader>
         {formTarget ? (
@@ -158,6 +198,7 @@ export function BucketManager() {
               <Table>
                 <TableHeader>
                   <TableRow>
+                    <TableHead className="w-10"></TableHead>
                     <TableHead>名称</TableHead>
                     <TableHead>桶名</TableHead>
                     <TableHead className="w-16 text-center">默认</TableHead>
@@ -167,8 +208,30 @@ export function BucketManager() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {buckets.map((b) => (
-                    <TableRow key={b.id}>
+                  {list.map((b) => (
+                    <TableRow
+                      key={b.id}
+                      onDragOver={(e) => {
+                        e.preventDefault()
+                        setDragOverId(b.id)
+                      }}
+                      onDrop={() => handleDrop(b.id)}
+                      className={dragOverId === b.id ? "bg-accent" : undefined}
+                    >
+                      <TableCell className="w-10">
+                        <span
+                          draggable
+                          onDragStart={() => (dragId.current = b.id)}
+                          onDragEnd={() => {
+                            dragId.current = null
+                            setDragOverId(null)
+                          }}
+                          title="拖动排序"
+                          className="inline-flex cursor-grab items-center text-muted-foreground hover:text-foreground active:cursor-grabbing"
+                        >
+                          <GripVertical className="size-4" />
+                        </span>
+                      </TableCell>
                       <TableCell className="font-medium">{b.name}</TableCell>
                       <TableCell className="font-mono text-xs">{b.bucket_name}</TableCell>
                       <TableCell className="text-center">{b.is_default ? "★" : ""}</TableCell>

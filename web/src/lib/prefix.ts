@@ -49,6 +49,19 @@ export function getLastPrefix(): string {
   return getPrefixHistory()[0] ?? ""
 }
 
+/**
+ * 从文件名推断存储目录：去掉扩展名后，去掉最后一个 "_片段"（随机短后缀）。
+ * 例：opus5_delivery_20260812_1HdRlE.zip → opus5_delivery_20260812；
+ *     fable_delivery_20260813_6vxPKH.zip → fable_delivery_20260813。
+ * 无 "_" 或去掉后为空（无法推断）时返回 null，调用方保持原值。
+ */
+export function dirnameFromFilename(filename: string): string | null {
+  const stem = filename.replace(/\.[^./\\]+$/, "")
+  const idx = stem.lastIndexOf("_")
+  if (idx <= 0) return null
+  return stem.slice(0, idx) || null
+}
+
 export function addPrefix(p: string): void {
   const value = p.trim()
   if (!value) return

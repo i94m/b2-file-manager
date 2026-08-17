@@ -5,7 +5,8 @@ import { toast } from "sonner"
 import { type Datasource } from "@/lib/types"
 import { uploadFile, urlUpload, serverDownload } from "@/lib/api"
 import { useBuckets } from "@/lib/use-buckets"
-import { addPrefix, getLastPrefix, validatePrefix } from "@/lib/prefix"
+import { addPrefix, dirnameFromFilename, getLastPrefix, validatePrefix } from "@/lib/prefix"
+import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -53,17 +54,20 @@ function usePrefix(defaultPrefix: string) {
 }
 
 /** 录入待处理文件 Dialog（链接或任意标识，登记到文件库）。 */
-export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) {
+export function FetchUrlDialog({ defaultPrefix: _defaultPrefix, scripts, onDone }: CommonProps) {
   const { buckets } = useBuckets()
   const [open, setOpen] = React.useState(false)
   const [url, setUrl] = React.useState("")
-  const { prefix, setPrefix } = usePrefix(defaultPrefix)
+  // ObjectKey（完整对象键 = 目录/文件名）：由链接推断目录段 + URL 文件名驱动，
+  // 推断不出目录 = 仅文件名；用户手动编辑后不再覆盖。
+  const [objectKey, setObjectKey] = React.useState("")
+  const keyDirty = React.useRef(false)
   const [datasourceId, setDatasourceId] = React.useState("")
   React.useEffect(() => {
     if (!datasourceId && scripts.length > 0) setDatasourceId(String(scripts[0].id))
   }, [datasourceId, scripts])
-  /** 文件级下载源："none" = 未配置（沿用数据源/默认桶→链接兜底）；桶选项值为 bucket:<id>。 */
-  const [downloadKind, setDownloadKind] = React.useState<"none" | "url" | "local" | "bucket">("none")
+  /** 文件级下载源：默认「下载链接」；桶选项值为 bucket:<id>。 */
+  const [downloadKind, setDownloadKind] = React.useState<"url" | "local" | "bucket">("url")
   const [downloadBucketId, setDownloadBucketId] = React.useState("")
   const downloadValue =
     downloadKind === "bucket" && downloadBucketId ? `bucket:${downloadBucketId}` : downloadKind
@@ -72,39 +76,70 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
       setDownloadKind("bucket")
       setDownloadBucketId(v.slice("bucket:".length))
     } else {
-      setDownloadKind(v as "none" | "url" | "local")
+      setDownloadKind(v as "url" | "local")
       setDownloadBucketId("")
     }
   }
   const [busy, setBusy] = React.useState(false)
 
-  const prefixValid = validatePrefix(prefix).valid
   const urlFilename = React.useMemo(() => {
     const t = url.trim()
     if (!t) return undefined
     return t.split(/[\\/]/).filter(Boolean).pop() ?? t
   }, [url])
 
+  // 链接变化时自动推断完整 ObjectKey = 目录段（去掉扩展名与最后一个 _ 随机段）/ URL 文件名；
+  // 推断不出目录段 = 仅文件名；链接为空 = 空。用户手动编辑过 key 后不再覆盖。
+  React.useEffect(() => {
+    if (keyDirty.current) return
+    if (!urlFilename) {
+      setObjectKey("")
+      return
+    }
+    const dirname = dirnameFromFilename(urlFilename)
+    setObjectKey(dirname ? `${dirname}/${urlFilename}` : urlFilename)
+  }, [urlFilename])
+
+  /** 完整 ObjectKey 校验：非空、无 '..'、无连续 /、不以 / 开头结尾。 */
+  const keyError = (() => {
+    const t = objectKey.trim()
+    if (!t) return "ObjectKey 不能为空"
+    if (/^\/|\/$/.test(t)) return "不能以 / 开头或结尾"
+    const parts = t.replace(/\\/g, "/").split("/")
+    if (parts.some((p) => p === "..")) return "路径不能包含 '..'"
+    if (parts.some((p) => p === "")) return "路径不能包含连续的 /"
+    return null
+  })()
+  const keyValid = !keyError
+
   const urlPlaceholder =
     downloadKind === "local"
       ? "服务器文件绝对路径，如 /data/spider/out/a.zip"
       : downloadKind === "url"
         ? "下载链接（http/https）"
-        : "下载链接、文件名或任意标识"
+        : "桶内 ObjectKey"
+
+  /** 「下载链接」标签文案随下载源类型切换。 */
+  const urlLabel =
+    downloadKind === "local" ? "本地路径" : downloadKind === "bucket" ? "ObjectKey" : "下载链接"
 
   const submit = async () => {
-    if (!url.trim()) return
-    const normalized = validatePrefix(prefix).normalized
+    if (!url.trim() || !objectKey.trim()) return
+    const normalizedKey = objectKey.trim().replace(/^\/+|\/+$/g, "")
     setBusy(true)
     try {
       const r = await urlUpload(url.trim(), {
-        prefix: normalized || undefined,
+        key: normalizedKey,
         datasourceId: datasourceId ? Number(datasourceId) : undefined,
-        downloadKind: downloadKind === "none" ? undefined : downloadKind,
+        downloadKind,
         downloadBucketId: downloadKind === "bucket" ? Number(downloadBucketId) : undefined,
       })
       toast(r.message)
-      if (normalized) addPrefix(normalized)
+      // 目录段（key 去掉最后一段）进历史，供下次快捷填充
+      const dir = normalizedKey.includes("/")
+        ? normalizedKey.slice(0, normalizedKey.lastIndexOf("/"))
+        : ""
+      if (dir) addPrefix(dir)
       setUrl("")
       setOpen(false)
       onDone()
@@ -115,6 +150,19 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
     }
   }
 
+  // 弹窗打开时重置：清空 key 与「用户已编辑」标记，由新一轮链接重新推断。
+  React.useEffect(() => {
+    if (open) {
+      keyDirty.current = false
+      setObjectKey("")
+    }
+  }, [open])
+
+  const handleKeyChange = (v: string) => {
+    keyDirty.current = true
+    setObjectKey(v)
+  }
+
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
@@ -122,7 +170,7 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
           <Link2 className="size-4" /> 录入待处理文件
         </Button>
       </DialogTrigger>
-      <DialogContent>
+      <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>录入待处理文件</DialogTitle>
           <DialogDescription>
@@ -130,15 +178,14 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
-          <div className="grid grid-cols-[200px_1fr] items-start gap-3">
+          <div className="grid grid-cols-2 gap-3">
             <div className="space-y-2">
               <Label>下载源</Label>
               <Select value={downloadValue} onValueChange={handleDownloadChange}>
                 <SelectTrigger className="w-full">
-                  <SelectValue placeholder="未配置（默认）" />
+                  <SelectValue placeholder="下载链接" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="none">未配置（默认）</SelectItem>
                   <SelectItem value="url">下载链接</SelectItem>
                   <SelectItem value="local">本地（服务器路径）</SelectItem>
                   {buckets.map((b) => (
@@ -151,44 +198,9 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
               </Select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="fetch-url">链接 / 标识</Label>
-              <Input
-                id="fetch-url"
-                placeholder={urlPlaceholder}
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && submit()}
-              />
-            </div>
-          </div>
-          {downloadKind === "url" && (
-            <p className="text-xs text-muted-foreground">
-              「下载到服务器」时直接抓取上方填写的下载链接。
-            </p>
-          )}
-          {downloadKind === "local" && (
-            <p className="text-xs text-muted-foreground">
-              「链接 / 标识」处填服务器上的文件绝对路径，下载到服务器时复制/硬链接到服务器文件目录，不走网络。
-            </p>
-          )}
-          {downloadKind === "bucket" && (
-            <p className="text-xs text-muted-foreground">
-              「下载到服务器」时直接从该桶拉取对象（无需上传记录）。
-            </p>
-          )}
-          <div className="grid grid-cols-[1fr_200px] items-start gap-3">
-            <div className="space-y-2">
-              <Label htmlFor="fetch-dir">目录（可选）</Label>
-              <PrefixInput
-                value={prefix}
-                onChange={setPrefix}
-                filename={urlFilename}
-              />
-            </div>
-            <div className="space-y-2">
               <Label>数据源（可选）</Label>
               <Select value={datasourceId} onValueChange={setDatasourceId}>
-                <SelectTrigger>
+                <SelectTrigger className="w-full">
                   <SelectValue placeholder="不关联" />
                 </SelectTrigger>
                 <SelectContent>
@@ -201,12 +213,41 @@ export function FetchUrlDialog({ defaultPrefix, scripts, onDone }: CommonProps) 
               </Select>
             </div>
           </div>
+          <div className="space-y-2">
+            <Label htmlFor="fetch-url">{urlLabel}</Label>
+            <Input
+              id="fetch-url"
+              placeholder={urlPlaceholder}
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="fetch-key">ObjectKey（目录/文件名）</Label>
+            <Input
+              id="fetch-key"
+              placeholder="如 opus5_delivery_20260812/a.zip，已按链接自动填入"
+              value={objectKey}
+              onChange={(e) => handleKeyChange(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()}
+              aria-invalid={!keyValid}
+              className={cn("font-mono text-sm", keyError && "border-destructive focus-visible:ring-destructive")}
+            />
+            {keyError ? (
+              <p className="text-xs text-destructive">{keyError}</p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                完整对象键 = 目录/文件名；已根据链接自动推断（目录段 = 文件名去掉随机后缀），可手动修改。
+              </p>
+            )}
+          </div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => setOpen(false)} disabled={busy}>
             取消
           </Button>
-          <Button onClick={submit} disabled={busy || !url.trim() || !prefixValid}>
+          <Button onClick={submit} disabled={busy || !url.trim() || !keyValid}>
             {busy ? "提交中…" : "录入"}
           </Button>
         </DialogFooter>

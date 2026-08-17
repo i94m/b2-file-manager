@@ -215,11 +215,11 @@ def invalidate_bucket_client(bucket_id: int) -> None:
 
 
 def get_buckets(enabled_only: bool = True) -> list[dict]:
-    """桶列表（默认桶优先，其次 sort_order、id）。"""
+    """桶列表（按 sort_order、id；顺序由桶管理拖动排序维护）。"""
     where = "WHERE enabled=1" if enabled_only else ""
     with get_db() as conn:
         rows = conn.execute(
-            f"SELECT * FROM buckets {where} ORDER BY is_default DESC, sort_order, id"
+            f"SELECT * FROM buckets {where} ORDER BY sort_order, id"
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -689,12 +689,12 @@ def insert_job(
 
 
 def bucket_prefix() -> str:
-    """读取并清洗 BUCKET_PREFIX，默认 files/。
+    """读取并清洗 BUCKET_PREFIX（可选的应用级隔离前缀）。
 
-    所有上传对象 key 都会前置该前缀，便于在同一个 bucket 中隔离本应用的数据。
-    变量缺省时用默认值 files/；显式设为空字符串则不添加前缀。
+    设置后所有上传对象 key 都会前置该前缀，便于在同一个 bucket 中隔离本应用的数据；
+    缺省或设为空字符串则不添加前缀，对象 key 直接为 <prefix>/<文件名>。
     """
-    return clean_prefix(os.environ.get("BUCKET_PREFIX", "files/"))
+    return clean_prefix(os.environ.get("BUCKET_PREFIX", ""))
 
 
 def default_prefix() -> str:
@@ -713,6 +713,11 @@ def build_object_key(prefix: str, filename: str) -> str:
     """生成 BUCKET_PREFIX/<prefix>/<原始文件名> 的对象 key，保留原始文件名。"""
     parts = [p for p in (bucket_prefix(), prefix, filename) if p]
     return "/".join(parts)
+
+
+def filename_from_url(url: str) -> str:
+    """从 URL 提取文件名（path 末段），无则 download。"""
+    return PurePosixPath(urlparse(url).path).name or "download"
 
 
 def object_exists(client, bucket_name: str, object_key: str) -> bool:
@@ -938,10 +943,13 @@ def fetch_url_to_temp(url: str, job_id: int) -> tuple[Path, int, str]:
     """从 URL 流式下载到系统临时目录（/tmp），返回（临时路径, 文件大小, md5）。
 
     上传到 bucket 后由 cleanup_job_temp 清理该临时文件。
+    Content-Length 已知时做大小校验：暂停导致连接中断、读到半截 EOF 时报错，
+    而不是把不完整的文件当作下载完成。
     """
     request = Request(url, headers={"User-Agent": "BucketHub/0.2"})
     temp_path = Path(tempfile.gettempdir()) / f"b2-fetch-{job_id}.part"
     digest = hashlib.md5()
+    total = 0
     with urlopen(request, timeout=60) as response:
         total = int(response.headers.get("Content-Length") or 0)
         if total > 0:
@@ -958,6 +966,10 @@ def fetch_url_to_temp(url: str, job_id: int) -> tuple[Path, int, str]:
                 digest.update(chunk)
                 callback(len(chunk))
     size = temp_path.stat().st_size
+    if total > 0 and size != total:
+        # 暂停/网络中断导致提前 EOF：删除半截文件并报错，防止被当作下载完成
+        temp_path.unlink(missing_ok=True)
+        raise OSError(f"下载不完整：预期 {total} 字节，实际 {size}（连接可能被中断）")
     with get_db() as conn:
         conn.execute("UPDATE jobs SET size=? WHERE id=?", (size, job_id))
     emit_job_update(job_id)
@@ -1977,12 +1989,19 @@ def url_upload():
         if destination.is_dir():
             return respond("error", "目标路径是已存在的目录，请填写完整的文件路径。", apikey, "error", 400)
     else:
-        try:
-            prefix = clean_prefix(request.form.get("prefix") or default_prefix())
-        except argparse.ArgumentTypeError as exc:
-            return respond("error", str(exc), apikey, "error", 400)
-        filename = PurePosixPath(urlparse(url).path).name or "download"
-        object_key = build_object_key(prefix, filename)
+        # key = 完整 object key（严格模式，优先）；否则回退 prefix + URL 文件名拼接
+        raw_key = (request.form.get("key") or "").strip().strip("/")
+        if raw_key:
+            try:
+                object_key = clean_prefix(raw_key)
+            except argparse.ArgumentTypeError as exc:
+                return respond("error", str(exc), apikey, "error", 400)
+        else:
+            try:
+                prefix = clean_prefix(request.form.get("prefix") or default_prefix())
+            except argparse.ArgumentTypeError as exc:
+                return respond("error", str(exc), apikey, "error", 400)
+            object_key = build_object_key(prefix, filename_from_url(url))
         # 同名拒传：登记阶段就拒掉（默认桶），避免后续上传冲突
         try:
             entry = get_bucket_entry(resolve_bucket_ref(None))
@@ -1991,7 +2010,7 @@ def url_upload():
         if object_exists(entry["client"], entry["bucket_name"], object_key):
             return respond("error", f"同名文件已存在：{object_key}", apikey, "error", 400)
 
-    filename = PurePosixPath(urlparse(url).path).name or "download"
+    filename = filename_from_url(url)
 
     if target == "server":
         # 下载到服务器路径：自动入队处理（保持原逻辑）
@@ -2801,6 +2820,12 @@ def api_job_resume(job_id: int):
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     if row is None:
         return jsonify({"error": f"任务 {job_id} 不存在"}), 404
+    job = dict(row)
+    if not job.get("paused"):
+        return jsonify({
+            "error": f"任务未处于暂停状态（当前 {job['status']}），无法继续",
+            "job": job_payload(job),
+        }), 400
 
     request_resume(job_id)
     with get_db() as conn:
@@ -2989,9 +3014,9 @@ def api_files():
     if q:
         like = f"%{q}%"
         conditions.append(
-            "(filename LIKE ? OR source_url LIKE ?)"
+            "(filename LIKE ? OR source_url LIKE ? OR object_key LIKE ?)"
         )
-        params.extend([like, like])
+        params.extend([like, like, like])
     if status:
         conditions.append("status = ?")
         params.append(status)
@@ -3282,6 +3307,32 @@ def api_update_bucket(bucket_id: int):
 
     invalidate_bucket_client(bucket_id)
     return jsonify({"status": "ok", "message": "桶配置已更新。", "bucket_id": bucket_id})
+
+
+@app.post("/api/buckets/reorder")
+def api_reorder_buckets():
+    """拖动排序：按传入的桶 id 顺序整体重写 sort_order（0..n-1）。
+
+    请求体 JSON：{"bucket_ids": [3, 1, 2]}。
+    必须包含全部桶 id（避免遗漏导致排序不一致）。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    body = request.get_json(silent=True) or {}
+    ids = body.get("bucket_ids")
+    if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+        return jsonify({"error": "bucket_ids 必须是整数数组"}), 400
+    with get_db() as conn:
+        existing = {r["id"] for r in conn.execute("SELECT id FROM buckets").fetchall()}
+    if set(ids) != existing or len(ids) != len(existing):
+        return jsonify({"error": "bucket_ids 必须与当前桶列表完全一致"}), 400
+    with get_db() as conn:
+        for idx, bucket_id in enumerate(ids):
+            conn.execute(
+                "UPDATE buckets SET sort_order=?, updated_at=? WHERE id=?",
+                (idx, time.time(), bucket_id),
+            )
+    return jsonify({"status": "ok", "message": "桶顺序已更新。", "bucket_ids": ids})
 
 
 @app.delete("/api/buckets/<int:bucket_id>")

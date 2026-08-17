@@ -15,13 +15,14 @@ import {
   cancelJob,
   checkFileExists,
   deleteFile,
+  deleteServerFile,
   downloadServerFromBucket,
   getFile,
   pauseJob,
+  renameObject,
   resumeJob,
   updateFile,
   uploadFileToBucket,
-  type FileUpdateData,
 } from "@/lib/api"
 import { useJobs } from "@/lib/use-jobs"
 import { useBuckets } from "@/lib/use-buckets"
@@ -79,8 +80,8 @@ function skeletonWidths(bucketCount: number): string[] {
     "w-4",    // select
     "w-16",   // 数据源
     "w-28",   // 下载源
-    "w-24",   // 目录
     "w-28",   // 文件名称
+    "w-32",   // ObjectKey
     "w-20",   // 大小（居中）
     "w-16",   // 本地
   ]
@@ -92,7 +93,7 @@ function skeletonWidths(bucketCount: number): string[] {
 interface FilesDataTableProps {
   data: FileItem[]
   scripts: Datasource[]
-  /** 全部桶（含禁用；顺序：默认优先 → sort_order → id），列按此动态生成。 */
+  /** 全部桶（含禁用；顺序：sort_order → id，桶管理拖动排序），列按此动态生成。 */
   buckets: BucketInfo[]
   total: number
   page: number
@@ -365,6 +366,95 @@ function validateFilename(value: string): string | null {
   return null
 }
 
+/** 校验完整 ObjectKey：非空、无 '..' 路径穿越、不以 / 开头结尾。 */
+function validateKeyStrict(value: string): string | null {
+  const trimmed = value.trim()
+  if (!trimmed) return "ObjectKey 不能为空"
+  if (/^\/|\/$/.test(trimmed)) return "不能以 / 开头或结尾"
+  const parts = trimmed.replace(/\\/g, "/").split("/")
+  if (parts.some((p) => p === "..")) return "路径不能包含 '..'"
+  if (parts.some((p) => p === "")) return "路径不能包含连续的 /"
+  return null
+}
+
+/** 重命名桶内对象 Dialog：修改完整 ObjectKey（copy + delete，后端同步 files 记录）。 */
+function RenameKeyDialog({
+  file,
+  bucketId,
+  bucketLabel,
+  onClose,
+  onDone,
+}: {
+  file: FileItem
+  bucketId: number
+  bucketLabel: string
+  onClose: () => void
+  onDone: () => void
+}) {
+  const [newKey, setNewKey] = React.useState(file.object_key)
+  const [busy, setBusy] = React.useState(false)
+
+  const keyError = validateKeyStrict(newKey)
+  const sameError =
+    newKey.trim() && newKey.trim() === file.object_key ? "新 ObjectKey 与原始相同" : null
+  const hasError = !!keyError || !!sameError
+
+  const submit = async () => {
+    if (hasError) return
+    const to = newKey.trim().replace(/^\/+|\/+$/g, "")
+    setBusy(true)
+    try {
+      await renameObject(file.object_key, to, bucketId)
+      toast.success("已重命名", { description: `${file.object_key} → ${to}` })
+      onDone()
+    } catch (e) {
+      toast.error("重命名失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(v) => { if (!v && !busy) onClose() }}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>重命名（{bucketLabel}）</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-2 py-2">
+          <Label htmlFor="rename-object-key">新 ObjectKey（目录/文件名）</Label>
+          <Input
+            id="rename-object-key"
+            value={newKey}
+            onChange={(e) => setNewKey(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && !hasError && submit()}
+            placeholder="如 opus5_delivery_20260812/a.zip"
+            className={cn(
+              "font-mono text-sm",
+              hasError && "border-destructive focus-visible:ring-destructive",
+            )}
+            autoFocus
+          />
+          {hasError ? (
+            <p className="text-xs text-destructive">{keyError ?? sameError}</p>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              通过「复制 + 删除」实现，大文件可能耗时较长；文件记录的 ObjectKey 会同步更新。
+            </p>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={busy}>
+            取消
+          </Button>
+          <Button onClick={submit} disabled={busy || hasError}>
+            {busy ? "重命名中…" : "确认"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 /** 上传到桶 Dialog：输入目录 + 文件名，下方有最近目录历史快捷填充。 */
 function UploadKeyDialog({
   file,
@@ -498,10 +588,11 @@ function refreshFileRow(
   }
 }
 
-/** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿字 / 否则→未下载+菜单。 */
+/** 本地列：排队→黄字 / 传输中→进度 / 已存在→绿字+菜单 / 否则→未下载+菜单。 */
 function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [busy, setBusy] = React.useState(false)
+  const [confirm, confirmDialog] = useConfirm()
   const check = useCheckExist(file.id, "local", onFileUpdated)
   const job = file.job_id ? jobs[file.job_id] : undefined
   const isMyJob = job && (job.kind === "fetch" || job.kind === "download")
@@ -514,10 +605,56 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
     </div>
   )
 
+  /** 已存在 → 标记为未下载（仅清 local_path 记录，不删服务器文件）。 */
+  const handleUnmark = async () => {
+    setBusy(true)
+    try {
+      const r = await updateFile(file.id, { local_path: null })
+      toast.success("已标记为未下载")
+      if (r.file && onFileUpdated) onFileUpdated(r.file)
+      else onUpdated()
+    } catch (e) {
+      toast.error("操作失败", { description: (e as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** 已存在 → 删除服务器上的本地文件（确认后删除，成功后记录自动回到未下载）。 */
+  const handleDeleteLocal = async () => {
+    if (!await confirm({
+      title: "删除本地文件",
+      description: `确认删除服务器上的「${file.local_path}」？该操作不可恢复（仅删本地文件，不影响桶内对象）。`,
+      confirmText: "删除",
+      destructive: true,
+    })) return
+    setBusy(true)
+    try {
+      await deleteServerFile(file.local_path!)
+      const r = await updateFile(file.id, { local_path: null })
+      toast.success("本地文件已删除")
+      if (r.file && onFileUpdated) onFileUpdated(r.file)
+      else onUpdated()
+    } catch (e) {
+      toast.error("删除失败", { description: (e as Error).message })
+      // 磁盘文件可能已被删但记录未清，刷新行以对齐真实状态
+      check.run()
+    } finally {
+      setBusy(false)
+    }
+  }
+
   if (file.local_path) return (
     <div className="flex items-center gap-0.5">
       {check.busy ? <CheckingText /> : <StatusText tone="active">已存在</StatusText>}
-      <CheckExistBtn check={check} />
+      <CellMenu
+        items={[
+          { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
+          { icon: HardDriveDownload, label: "标记为未下载", onClick: handleUnmark, busy },
+          { icon: Trash2, label: "删除本地文件", onClick: handleDeleteLocal, busy, destructive: true },
+        ]}
+      />
+      {confirmDialog}
     </div>
   )
 
@@ -557,6 +694,7 @@ function LocalCell({ file, onUpdated, onFileUpdated }: { file: FileItem; onUpdat
 function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem; bucket: BucketInfo; onUpdated: () => void; onFileUpdated?: (file: FileItem) => void }) {
   const { jobs } = useJobs()
   const [dialogOpen, setDialogOpen] = React.useState(false)
+  const [renameOpen, setRenameOpen] = React.useState(false)
   const [downloading, setDownloading] = React.useState(false)
   const check = useCheckExist(file.id, bucket.id, onFileUpdated)
   const job = file.job_id ? jobs[file.job_id] : undefined
@@ -586,18 +724,36 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
     }
   }
 
+  /** 已上传 → 重命名（改完整 ObjectKey，copy + delete，同步 files 记录）。 */
+  const handleRenameDone = () => {
+    setRenameOpen(false)
+    refreshFileRow(file.id, onUpdated, onFileUpdated)
+  }
+
   if (uploaded) {
     return (
-      <div className="flex items-center gap-0.5">
-        {check.busy ? <CheckingText /> : <StatusText tone="active">已存在</StatusText>}
-        <CellMenu
-          items={[
-            { icon: Download, label: "立即下载", onClick: () => handleDownload(), busy: downloading },
-            { icon: ListOrdered, label: "排队下载", onClick: () => handleDownload(true), busy: downloading },
-            { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
-          ]}
-        />
-      </div>
+      <>
+        <div className="flex items-center gap-0.5">
+          {check.busy ? <CheckingText /> : <StatusText tone="active">已存在</StatusText>}
+          <CellMenu
+            items={[
+              { icon: Download, label: "立即下载", onClick: () => handleDownload(), busy: downloading },
+              { icon: ListOrdered, label: "排队下载", onClick: () => handleDownload(true), busy: downloading },
+              { icon: Pencil, label: "重命名", onClick: () => setRenameOpen(true) },
+              { icon: RefreshCw, label: "重新检测", onClick: check.run, busy: check.busy },
+            ]}
+          />
+        </div>
+        {renameOpen && (
+          <RenameKeyDialog
+            file={file}
+            bucketId={bucket.id}
+            bucketLabel={bucket.name}
+            onClose={() => setRenameOpen(false)}
+            onDone={handleRenameDone}
+          />
+        )}
+      </>
     )
   }
 
@@ -645,76 +801,45 @@ function BucketCell({ file, bucket, onUpdated, onFileUpdated }: { file: FileItem
   )
 }
 
-/** 下载源列：行内 Select，选中即保存（PATCH /api/files/:id）并刷新本行。 */
-function DownloadSourceCell({
-  file,
-  buckets,
-  onUpdated,
-  onFileUpdated,
-}: {
-  file: FileItem
-  buckets: BucketInfo[]
-  onUpdated: () => void
-  onFileUpdated?: (file: FileItem) => void
-}) {
-  const [busy, setBusy] = React.useState(false)
-  const value =
-    file.download_kind === "bucket" && file.download_bucket_id != null
-      ? `bucket:${file.download_bucket_id}`
-      : (file.download_kind ?? "none")
-  const bucketMissing =
-    file.download_kind === "bucket" &&
-    (file.download_bucket_id == null ||
-      !buckets.some((b) => b.id === file.download_bucket_id))
+/** 下载源列：纯文本展示（hover tooltip 显示对应地址），编辑入口在「编辑文件」弹窗。 */
+function DownloadSourceCell({ file }: { file: FileItem }) {
+  const bucketMissing = file.download_kind === "bucket" && file.download_bucket_id == null
 
-  const handleChange = async (v: string) => {
-    let data: FileUpdateData
-    if (v.startsWith("bucket:")) {
-      data = {
-        download_kind: "bucket",
-        download_bucket_id: Number(v.slice("bucket:".length)),
-      }
-    } else if (v === "url" || v === "local") {
-      data = { download_kind: v }
-    } else {
-      data = { download_kind: "none" }
-    }
-    setBusy(true)
-    try {
-      await updateFile(file.id, data)
-      toast.success("已保存")
-      refreshFileRow(file.id, onUpdated, onFileUpdated)
-    } catch (e) {
-      toast.error("保存失败", { description: (e as Error).message })
-    } finally {
-      setBusy(false)
-    }
-  }
+  /** 显示文本：下载链接 / 本地 / 桶名 / 未配置。 */
+  const label =
+    file.download_kind === "url"
+      ? "下载链接"
+      : file.download_kind === "local"
+        ? "本地"
+        : file.download_kind === "bucket"
+          ? `桶 ${file.download_bucket_id ?? "?"}`
+          : "未配置"
 
   const copyValue = file.source_url ?? (file.download_kind === "bucket" ? file.object_key : null)
 
+  /** hover 提示：下载源对应的地址（链接 / 本地路径 / 桶内 ObjectKey）。 */
+  const sourceTip = file.source_url
+    ? file.source_url
+    : file.download_kind === "bucket"
+      ? `桶内 ObjectKey: ${file.object_key}`
+      : "未配置下载源"
+
   return (
     <div className="flex items-center gap-1">
-      <Select value={value} onValueChange={handleChange} disabled={busy}>
-        <SelectTrigger size="xs" className="w-[6.5rem]" title="下载源（修改后立即保存）">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="none">未配置</SelectItem>
-          <SelectItem value="url">下载链接</SelectItem>
-          <SelectItem value="local">本地</SelectItem>
-          {buckets.map((b) => (
-            <SelectItem key={b.id} value={`bucket:${b.id}`}>
-              {b.name}
-            </SelectItem>
-          ))}
-          {file.download_kind === "bucket" && file.download_bucket_id != null && bucketMissing && (
-            <SelectItem value={`bucket:${file.download_bucket_id}`}>
-              桶 #{file.download_bucket_id}（已删除）
-            </SelectItem>
-          )}
-        </SelectContent>
-      </Select>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span
+            className={cn(
+              "block max-w-[6rem] truncate text-xs",
+              file.download_kind ? "text-foreground" : "text-muted-foreground",
+              bucketMissing && "text-destructive",
+            )}
+          >
+            {label}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-sm break-all">{sourceTip}</TooltipContent>
+      </Tooltip>
       {copyValue && (
         <CopyButton
           value={copyValue}
@@ -782,30 +907,7 @@ export function FilesDataTable({
         {
           id: "download_source",
           header: "下载源",
-          cell: ({ row }) => (
-            <DownloadSourceCell
-              file={row.original}
-              buckets={buckets}
-              onUpdated={onDeleted}
-              onFileUpdated={onFileUpdated}
-            />
-          ),
-        },
-        {
-          id: "key_dir",
-          header: "目录",
-          cell: ({ row }) => {
-            const k = row.original.object_key
-            const i = k.lastIndexOf("/")
-            const dir = i >= 0 ? k.slice(0, i) : ""
-            return dir ? (
-              <span className="block max-w-[10rem] truncate font-mono text-xs text-muted-foreground">
-                {dir}
-              </span>
-            ) : (
-              <span className="text-xs text-muted-foreground">—</span>
-            )
-          },
+          cell: ({ row }) => <DownloadSourceCell file={row.original} />,
         },
         {
           accessorKey: "filename",
@@ -826,6 +928,25 @@ export function FilesDataTable({
               </div>
             )
           },
+        },
+        {
+          id: "object_key",
+          header: "ObjectKey",
+          cell: ({ row }) => (
+            <div className="flex items-center gap-1">
+              <span
+                className="block max-w-[10rem] truncate font-mono text-xs text-muted-foreground"
+                title={row.original.object_key}
+              >
+                {row.original.object_key}
+              </span>
+              <CopyButton
+                value={row.original.object_key}
+                title="复制 ObjectKey"
+                className="size-5 p-0.5 hover:bg-muted"
+              />
+            </div>
+          ),
         },
         {
           accessorKey: "size",
@@ -1219,11 +1340,8 @@ function EditFileDialog({
       : "",
   )
   const [sourceUrl, setSourceUrl] = React.useState(file.source_url ?? "")
-  /** 存储目录/前缀：取当前对象键最后一个 "/" 之前的部分（无则根目录）。 */
-  const [dir, setDir] = React.useState(() => {
-    const i = file.object_key.lastIndexOf("/")
-    return i >= 0 ? file.object_key.slice(0, i) : ""
-  })
+  /** 完整对象键（目录/文件名），直接编辑。 */
+  const [objectKey, setObjectKey] = React.useState(file.object_key)
   const [busy, setBusy] = React.useState(false)
 
   /** 桶选项值为 bucket:<id>；当前指向的桶已删除时追加占位项（保存会报桶不存在）。 */
@@ -1243,14 +1361,8 @@ function EditFileDialog({
     }
   }
   const bucketMissing = downloadKind === "bucket" && !downloadBucketId
-  const dirError = validateDir(dir)
-  const hasError = bucketMissing || !!dirError
-  /** 对象键 = 目录/文件名（文件名为空时保留原键的 basename）。 */
-  const keyBase = file.object_key.slice(file.object_key.lastIndexOf("/") + 1)
-  const cleanDir = dir.trim().replace(/^\/+|\/+$/g, "")
-  const nextKey = cleanDir
-    ? `${cleanDir}/${form.filename.trim() || keyBase}`
-    : form.filename.trim() || keyBase
+  const keyError = validateKeyStrict(objectKey)
+  const hasError = bucketMissing || !!keyError
 
   const set = (key: keyof typeof form, value: string) =>
     setForm((f) => ({ ...f, [key]: value }))
@@ -1260,7 +1372,7 @@ function EditFileDialog({
     setBusy(true)
     try {
       await updateFile(file.id, {
-        object_key: nextKey,
+        object_key: objectKey.trim().replace(/^\/+|\/+$/g, ""),
         filename: form.filename || null,
         size: Number(form.size) || 0,
         status: form.status,
@@ -1307,22 +1419,22 @@ function EditFileDialog({
             </div>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="edit-dir">目录（存储前缀）</Label>
+            <Label htmlFor="edit-key">ObjectKey（目录/文件名）</Label>
             <Input
-              id="edit-dir"
-              value={dir}
-              onChange={(e) => setDir(e.target.value)}
-              placeholder="如 backups/2026，留空 = 根目录"
+              id="edit-key"
+              value={objectKey}
+              onChange={(e) => setObjectKey(e.target.value)}
+              placeholder="如 opus5_delivery_20260812/a.zip"
               className={cn(
                 "font-mono text-sm",
-                dirError && "border-destructive focus-visible:ring-destructive",
+                keyError && "border-destructive focus-visible:ring-destructive",
               )}
             />
-            {dirError ? (
-              <p className="text-xs text-destructive">{dirError}</p>
+            {keyError ? (
+              <p className="text-xs text-destructive">{keyError}</p>
             ) : (
               <p className="text-xs text-muted-foreground">
-                对象键 = 目录/文件名（当前：{nextKey}）；桶中按该键匹配存在性，修改后已上传标记不会自动重算，可对各桶「重新检测」。
+                完整对象键；桶中按该键匹配存在性，修改后已上传标记不会自动重算，可对各桶「重新检测」。
               </p>
             )}
           </div>
@@ -1473,10 +1585,6 @@ function FileDetailsDialog({
   const uploadedNames = file.uploaded_bucket_ids
     .map((id) => buckets.find((b) => b.id === id)?.name ?? `#${id}`)
     .join("、")
-  /** 存储目录/前缀：对象键最后一个 "/" 之前的部分。 */
-  const keyDir = file.object_key.includes("/")
-    ? file.object_key.slice(0, file.object_key.lastIndexOf("/"))
-    : ""
 
   return (
     <Dialog open onOpenChange={(v) => { if (!v) onClose() }}>
@@ -1487,14 +1595,7 @@ function FileDetailsDialog({
         <div className="max-h-[65vh] overflow-y-auto py-2">
           <DetailRow label="ID">{file.id}</DetailRow>
           <DetailRow label="任务 ID">{file.job_id ?? <Dash />}</DetailRow>
-          <DetailRow label="目录" copyValue={keyDir || null}>
-            {keyDir ? (
-              <span className="font-mono text-xs">{keyDir}</span>
-            ) : (
-              <span className="text-muted-foreground">根目录</span>
-            )}
-          </DetailRow>
-          <DetailRow label="对象键" copyValue={file.object_key}>
+          <DetailRow label="ObjectKey" copyValue={file.object_key}>
             <span className="font-mono text-xs">{file.object_key}</span>
           </DetailRow>
           <DetailRow label="文件名" copyValue={file.filename}>

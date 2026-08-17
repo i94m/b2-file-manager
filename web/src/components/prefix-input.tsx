@@ -54,7 +54,7 @@ export function PrefixInput({
       {error && <p className="text-xs text-destructive">{error}</p>}
       {valid && (
         <p className="text-xs text-muted-foreground">
-          object key: <code className="font-mono">{normalized || "(根目录)"}/{filename ?? "文件名"}</code>
+          ObjectKey: <code className="font-mono">{normalized || "(根目录)"}/{filename ?? "文件名"}</code>
         </p>
       )}
     </div>
