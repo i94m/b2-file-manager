@@ -29,6 +29,7 @@ import { useJobs } from "@/lib/use-jobs"
 import { useBuckets } from "@/lib/use-buckets"
 import { useConfirm } from "@/lib/use-confirm"
 import { JobProgressBadge } from "@/components/progress-cell"
+import { StatusText } from "@/components/status-text"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import {
@@ -116,35 +117,6 @@ function Truncate({ value, className }: { value: string | null; className?: stri
       <TooltipContent className="max-w-sm break-all">{value}</TooltipContent>
     </Tooltip>
   )
-}
-
-/** 状态文字：active=绿 / muted=正常灰 / queued=黄。失败时 hover 展示错误。 */
-function StatusText({
-  children,
-  tone = "muted",
-  error,
-}: {
-  children: React.ReactNode
-  tone?: "active" | "muted" | "queued"
-  error?: string | null
-}) {
-  const color =
-    tone === "active"
-      ? "text-emerald-600"
-      : tone === "queued"
-        ? "text-amber-500"
-        : "text-muted-foreground"
-  if (error) {
-    return (
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className={cn("cursor-help text-xs font-medium", color)}>{children}</span>
-        </TooltipTrigger>
-        <TooltipContent className="max-w-xs break-all">{error}</TooltipContent>
-      </Tooltip>
-    )
-  }
-  return <span className={cn("text-xs font-medium", color)}>{children}</span>
 }
 
 /** 检测中状态：重新检测在 ⋮ 菜单里触发，菜单随即关闭，需在单元格内展示 loading。 */
