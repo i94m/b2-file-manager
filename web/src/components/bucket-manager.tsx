@@ -145,7 +145,7 @@ export function BucketManager() {
     if (
       !(await confirm({
         title: "删除桶",
-        description: `确认删除「${b.name}」？该桶的上传标记会被清除，进行中的任务将标记失败。此操作不可撤销。`,
+        description: `删除桶「${b.name}」？不可撤销，相关任务将标记失败。`,
         confirmText: "删除",
         destructive: true,
       }))
