@@ -162,7 +162,7 @@ function AdminPage() {
         {/* Header */}
         <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <h1 className="text-3xl font-bold tracking-tight">BucketHub</h1>
+            <h1 className="text-xl font-bold tracking-tight sm:text-3xl">BucketHub</h1>
             <ConnectionStatus />
           </div>
           <div className="flex items-center gap-2">
@@ -191,12 +191,12 @@ function AdminPage() {
             onValueChange={setSection}
             className="min-w-0"
           >
-            <TabsList className="flex-wrap">
+            <TabsList className="flex-wrap gap-1 sm:gap-0">
               <TabsTrigger value="files" className="gap-1.5">
-                <FolderOpen className="size-4" /> 源文件管理
+                <FolderOpen className="size-4" /> <span className="sm:inline">源文件</span>
               </TabsTrigger>
               <TabsTrigger value="transfers" className="gap-1.5">
-                <ArrowUpDown className="size-4" /> 上传管理
+                <ArrowUpDown className="size-4" /> <span className="sm:inline">上传管理</span>
                 {activeJobs > 0 && (
                   <span className="text-[10px] tabular-nums text-muted-foreground">
                     {activeJobs}
@@ -204,7 +204,7 @@ function AdminPage() {
                 )}
               </TabsTrigger>
               <TabsTrigger value="local" className="gap-1.5">
-                <HardDrive className="size-4" /> 本地文件
+                <HardDrive className="size-4" /> <span className="sm:inline">本地</span>
               </TabsTrigger>
               {buckets.filter((b) => b.enabled).map((b) => (
                 <TabsTrigger
@@ -221,23 +221,23 @@ function AdminPage() {
 
           {/* 搜索 / 状态筛选只在源文件管理模块显示 */}
           {section === "files" && (
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
               <FetchUrlDialog
                 defaultPrefix={defaultPrefix}
                 scripts={scripts}
                 onDone={refresh}
               />
-              <div className="relative">
+              <div className="relative min-w-0 flex-1 sm:flex-none">
                 <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
-                  className="w-[28rem] pl-8"
+                  className="w-full pl-8 sm:w-64 lg:w-[28rem]"
                   placeholder="搜索，多关键词空格分隔..."
                   value={q}
                   onChange={(e) => setQ(e.target.value)}
                 />
               </div>
               <Select value={status} onValueChange={(v) => { setStatus(v); setPage(1) }}>
-                <SelectTrigger className="w-32">
+                <SelectTrigger className="w-28">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>

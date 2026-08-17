@@ -160,7 +160,7 @@ export function PublicFilesTable({
             <div className="flex items-center gap-1">
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <span className="block max-w-[26rem] truncate font-mono text-xs">
+                  <span className="block max-w-[11rem] truncate font-mono text-xs sm:max-w-[26rem]">
                     {row.original.object_key}
                   </span>
                 </TooltipTrigger>
@@ -306,6 +306,7 @@ export function PublicFilesTable({
           <Button
             variant="outline"
             size="sm"
+            className="flex-1 sm:flex-none"
             onClick={() => onPageChange(page - 1)}
             disabled={page <= 1}
           >
@@ -314,6 +315,7 @@ export function PublicFilesTable({
           <Button
             variant="outline"
             size="sm"
+            className="flex-1 sm:flex-none"
             onClick={() => onPageChange(page + 1)}
             disabled={page >= pageCount}
           >

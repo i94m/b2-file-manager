@@ -114,7 +114,7 @@ function Truncate({ value, className }: { value: string | null; className?: stri
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className={cn("block max-w-[12rem] truncate cursor-default", className)}>{value}</span>
+        <span className={cn("block max-w-[12rem] truncate cursor-default sm:max-w-[24rem]", className)}>{value}</span>
       </TooltipTrigger>
       <TooltipContent className="max-w-sm break-all">{value}</TooltipContent>
     </Tooltip>
@@ -884,7 +884,7 @@ export function FilesDataTable({
             }
             return (
               <div className="flex items-center gap-1">
-                <span className="block max-w-[26rem] truncate">{f.filename}</span>
+                <span className="block max-w-[11rem] truncate sm:max-w-[26rem]">{f.filename}</span>
                 <CopyButton
                   value={f.filename}
                   title="复制文件名"
@@ -1136,6 +1136,7 @@ export function FilesDataTable({
           <Button
             variant="outline"
             size="sm"
+            className="flex-1 sm:flex-none"
             onClick={() => onPageChange(page - 1)}
             disabled={page <= 1}
           >
@@ -1144,6 +1145,7 @@ export function FilesDataTable({
           <Button
             variant="outline"
             size="sm"
+            className="flex-1 sm:flex-none"
             onClick={() => onPageChange(page + 1)}
             disabled={page >= pageCount}
           >

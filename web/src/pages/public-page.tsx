@@ -115,7 +115,7 @@ function PublicPage() {
         {/* Header */}
         <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <h1 className="text-3xl font-bold tracking-tight">BucketHub 文件同步</h1>
+            <h1 className="text-xl font-bold tracking-tight sm:text-3xl">BucketHub 文件同步</h1>
             <ConnectionStatus />
           </div>
           <ThemeToggle />
@@ -124,11 +124,11 @@ function PublicPage() {
         {/* 工具栏：链接录入 + 搜索 + 刷新 */}
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <FetchUrlDialog defaultPrefix="" scripts={scripts} onDone={refresh} />
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="relative">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2 sm:flex-none">
+            <div className="relative min-w-0 flex-1 sm:flex-none">
               <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
-                className="w-[28rem] pl-8"
+                className="w-full pl-8 sm:w-64 lg:w-[28rem]"
                 placeholder="搜索，多关键词空格分隔..."
                 value={q}
                 onChange={(e) => setQ(e.target.value)}

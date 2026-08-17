@@ -142,16 +142,16 @@ export function BucketBrowserSection({
 
   return (
     <section className="flex min-w-0 flex-1 flex-col rounded-xl border bg-card">
-      <div className="flex items-center gap-2 border-b px-4 py-3">
-        <Cloud className="size-4 text-muted-foreground" />
-        <h2 className="text-base font-semibold">{title}</h2>
+      <div className="flex flex-wrap items-center gap-2 border-b px-4 py-3">
+        <Cloud className="size-4 shrink-0 text-muted-foreground" />
+        <h2 className="min-w-0 truncate text-base font-semibold">{title}</h2>
         {bucketName && bucketKey && (
           <HoverCard openDelay={250} closeDelay={100}>
             <HoverCardTrigger asChild>
               <button
                 type="button"
                 title="悬停查看桶连通性详情"
-                className="inline-flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                className="inline-flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
               >
                 <Info className="size-3.5" />
               </button>
@@ -169,7 +169,7 @@ export function BucketBrowserSection({
           onClick={() => setMoveOpen(true)}
         >
           <ArrowRightLeft className="size-3.5" />
-          移动文件
+          <span className="hidden sm:inline">移动文件</span>
         </Button>
         <Button
           size="sm"
@@ -177,7 +177,7 @@ export function BucketBrowserSection({
           onClick={() => setUploadOpen(true)}
         >
           <Upload className="size-3.5" />
-          上传到桶
+          <span className="hidden sm:inline">上传到桶</span>
         </Button>
       </div>
 
@@ -187,17 +187,17 @@ export function BucketBrowserSection({
           value={prefix}
           onChange={(e) => setPrefix(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="输入目录/前缀..."
-          className="w-[10rem] font-mono text-sm"
+          placeholder="目录/前缀"
+          className="w-full font-mono text-sm sm:w-[10rem]"
         />
         <Input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={onKeyDown}
           placeholder="文件名筛选，空格分隔多词"
-          className="min-w-[14rem] flex-1 text-sm"
+          className="min-w-0 flex-1 text-sm"
         />
-        <Button size="sm" onClick={search} disabled={loading}>
+        <Button size="sm" onClick={search} disabled={loading} className="sm:ml-0">
           <Search className="size-3.5" />
           搜索
         </Button>
@@ -237,7 +237,7 @@ export function BucketBrowserSection({
                 <TableRow key={obj.key}>
                   <TableCell>
                     <span
-                      className="block max-w-[24rem] truncate font-mono text-xs"
+                      className="block max-w-[11rem] truncate font-mono text-xs sm:max-w-[24rem]"
                       title={obj.key}
                     >
                       {obj.key}
@@ -305,6 +305,7 @@ export function BucketBrowserSection({
           <Button
             variant="outline"
             size="sm"
+            className="flex-1 sm:flex-none"
             disabled={!hasPrev || loading}
             onClick={() => fetchPage(page - 1)}
           >
@@ -317,6 +318,7 @@ export function BucketBrowserSection({
           <Button
             variant="outline"
             size="sm"
+            className="flex-1 sm:flex-none"
             disabled={!hasNext || loading}
             onClick={() => fetchPage(page + 1)}
           >
