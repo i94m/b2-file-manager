@@ -3884,7 +3884,19 @@ def api_rename_object():
 
     source = {"Bucket": bucket_name, "Key": from_key}
     try:
-        client.copy_object(Bucket=bucket_name, Key=to_key, CopySource=source)
+        # 先取对象大小：>5GB 走 multipart 分段服务端复制（单次 copy_object 上限 5GB）
+        head = client.head_object(Bucket=bucket_name, Key=from_key)
+        size = int(head.get("ContentLength") or 0)
+        if size > 5 * 1024 * 1024 * 1024:
+            cfg = TransferConfig(
+                multipart_threshold=64 * 1024 * 1024,
+                multipart_chunksize=64 * 1024 * 1024,
+                max_concurrency=4,
+                use_threads=True,
+            )
+            client.copy(CopySource=source, Bucket=bucket_name, Key=to_key, Config=cfg)
+        else:
+            client.copy_object(Bucket=bucket_name, Key=to_key, CopySource=source)
         client.delete_object(Bucket=bucket_name, Key=from_key)
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
