@@ -33,7 +33,7 @@ export function ConnectionStatus() {
   const { connected } = useJobs()
   return (
     <span
-      className="inline-flex items-center gap-1.5 rounded-full border bg-card px-3 py-1 text-xs text-muted-foreground"
+      className="inline-flex w-fit items-center gap-1.5 rounded-full border bg-card px-2 py-0.5 text-[11px] text-muted-foreground"
       title={connected ? "任务进度实时推送通道：已连接" : "任务进度实时推送通道：连接中…"}
     >
       <span
@@ -42,7 +42,7 @@ export function ConnectionStatus() {
           connected ? "bg-emerald-500" : "bg-muted-foreground/40",
         )}
       />
-      {connected ? "实时推送·已连接" : "实时推送·连接中…"}
+      {connected ? "已连接" : "连接中…"}
     </span>
   )
 }

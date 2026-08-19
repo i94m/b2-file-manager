@@ -1,10 +1,8 @@
 import * as React from "react"
-import { Link } from "react-router-dom"
-import { ArrowLeft, ArrowUpDown, Cloud, FolderOpen, HardDrive, RefreshCw, Search } from "lucide-react"
+import { ArrowUpDown, Cloud, FolderOpen, HardDrive, RefreshCw, Search } from "lucide-react"
 
 import { type BucketHealthEntry, type Datasource, type FileItem } from "@/lib/types"
 import { getBucketHealth, getFiles, getScripts } from "@/lib/api"
-import { withApiKey } from "@/lib/link"
 import { useTerminalFileRefresh } from "@/lib/use-terminal-file-refresh"
 import { useAppInfo } from "@/components/auth-guard"
 import { useBuckets } from "@/lib/use-buckets"
@@ -172,16 +170,11 @@ function AdminPage() {
       <main className="mx-auto max-w-[1600px] px-4 py-8 sm:px-6">
         {/* Header */}
         <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-col gap-1">
             <h1 className="text-xl font-bold tracking-tight sm:text-3xl">BucketHub</h1>
             <ConnectionStatus />
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="ghost" size="sm" asChild>
-              <Link to={withApiKey("/")}>
-                <ArrowLeft className="size-4" /> 公开页
-              </Link>
-            </Button>
             <BucketManager />
             <DatasourceManager scripts={scripts} onChanged={loadScripts} />
             <ThemeToggle />
@@ -195,10 +188,11 @@ function AdminPage() {
           </div>
         )}
 
-        {/* 顶部模块菜单（NavigationMenu）：源文件管理 / 上传管理 / 本地文件 / 桶（下拉） */}
+        {/* 顶部模块菜单（NavigationMenu）：源文件管理 / 上传管理 / 本地文件 / 桶（下拉）；小屏单行横向滑动 */}
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-          <NavigationMenu className="max-w-full justify-start">
-            <NavigationMenuList className="max-w-full flex-wrap justify-start gap-1 sm:flex-nowrap">
+          <div className="-mx-4 overflow-x-auto px-4 pb-1 [scrollbar-width:none] sm:mx-0 sm:overflow-visible sm:px-0 sm:pb-0 [&::-webkit-scrollbar]:hidden">
+            <NavigationMenu viewport={false} className="max-w-none flex-none justify-start">
+              <NavigationMenuList className="max-w-none flex-nowrap justify-start gap-1">
               <NavigationMenuItem>
                 <button
                   type="button"
@@ -268,6 +262,7 @@ function AdminPage() {
               </NavigationMenuItem>
             </NavigationMenuList>
           </NavigationMenu>
+          </div>
 
           {/* 搜索 / 状态筛选只在源文件管理模块显示 */}
           {section === "files" && (
